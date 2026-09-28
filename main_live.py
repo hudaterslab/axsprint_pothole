@@ -722,6 +722,84 @@ class PersistentUploader:
         self.close()
 
 
+class PermanentUploadError(Exception):
+    """The server rejected this frame; sending the same request again cannot succeed."""
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    # urllib would repeat a redirected POST as a bodiless GET and report success.
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+class HttpUploader:
+    """POST one frame's JPG, JSON and PCAP to PORTHOLE_API_URL as multipart/form-data.
+
+    Parts are named jpg, json and pcap; X-Record-Id carries the JSON record_id so
+    the server can drop repeats, and PORTHOLE_API_TOKEN, if set, is sent as a
+    Bearer token. 2xx and 409 (already received) count as delivered. Malformed
+    requests (400, 413, 415, 422) are permanent; everything else, including
+    redirects, is retried.
+    """
+
+    CONTENT_TYPES = dict(jpg="image/jpeg", json="application/json",
+                         pcap="application/vnd.tcpdump.pcap")
+    PERMANENT_STATUS = frozenset((400, 413, 415, 422))
+
+    def __init__(self, options, timeout=60):
+        self.options, self.timeout = (options, timeout)
+        self.opener = urllib.request.build_opener(_RefuseRedirect)
+
+    def upload(self, source, manifest):
+        parts = {}
+        for name, info in manifest["files"].items():
+            data = (Path(source) / name).read_bytes()
+            if len(data) != info["bytes"] or hashlib.sha256(data).hexdigest() != info["sha256"]:
+                raise ValueError(f"Artifact changed after commit: {name}")
+            parts[Path(name).suffix.lstrip(".").lower()] = (name, data)
+        if set(parts) != set(self.CONTENT_TYPES):
+            raise PermanentUploadError("Upload needs exactly one JPG, JSON and PCAP")
+        record_id = json.loads(parts["json"][1])["record_id"]
+        boundary = uuid.uuid4().hex
+        body = bytearray()
+        for field, content_type in self.CONTENT_TYPES.items():
+            name, data = parts[field]
+            body += (
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; '
+                f'filename="{name}"\r\nContent-Type: {content_type}\r\n\r\n'
+            ).encode()
+            body += data + b"\r\n"
+        body += f"--{boundary}--\r\n".encode()
+        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}",
+                   "X-Record-Id": record_id}
+        if self.options.api_token:
+            headers["Authorization"] = f"Bearer {self.options.api_token}"
+        request = urllib.request.Request(
+            self.options.api_url, data=bytes(body), headers=headers, method="POST"
+        )
+        started = time.monotonic_ns()
+        try:
+            with self.opener.open(request, timeout=self.timeout) as response:
+                status, text = (response.status, response.read(MAX_HEADER))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read(512).decode(errors="replace")
+            if exc.code in self.PERMANENT_STATUS:
+                raise PermanentUploadError(f"HTTP {exc.code}: {detail}") from None
+            if exc.code != 409:
+                raise RuntimeError(f"API upload failed: HTTP {exc.code}: {detail}") from None
+            status, text = (409, b"already received")
+        return dict(
+            transport="http_multipart_v1", url=self.options.api_url, record_id=record_id,
+            http_status=status, response=text.decode(errors="replace")[:2000],
+            files=len(parts), bytes=len(body),
+            client_send_ms=(time.monotonic_ns() - started) / 1e6,
+            completed_epoch_ns=time.time_ns(),
+        )
+
+    def close(self):
+        pass
+
+
 class LiDAR2Camera:
     """Use JSON intrinsics and configured extrinsics to project sensor XYZ."""
 
@@ -1465,10 +1543,14 @@ ASOS_STATIONS_PATH = Path(__file__).with_name("asos_stations.csv")
 
 
 def _load_local_env(path: Optional[Path] = None) -> None:
-    """Load a sibling .env without overriding explicitly set environment values."""
+    """Load a sibling .env without overriding explicitly set environment values.
+
+    As in a shell, a later assignment in the file wins over an earlier one.
+    """
     env_path = Path(path) if path is not None else Path(__file__).with_name(".env")
     if not env_path.is_file():
         return
+    values = {}
     for raw_line in env_path.read_text(encoding="utf-8-sig").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -1480,6 +1562,8 @@ def _load_local_env(path: Optional[Path] = None) -> None:
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and (value[0] in "\"'"):
             value = value[1:-1]
+        values[key] = value
+    for key, value in values.items():
         os.environ.setdefault(key, value)
 
 
@@ -2289,9 +2373,19 @@ def matched_gps_metadata(streams, timestamp):
     return clean(data)
 
 
-def save_detection_frame(directory, source_image, image, row, timestamp, key, session_id,
-                         damage_detections, damage_payloads, models, gps, lidar):
-    """AI Hub-style frame envelope; transport remains the existing verified queue."""
+def terminal_id():
+    """Terminal name used in record_id (PORTHOLE_TERMINAL_ID, else the host name)."""
+    return os.getenv("PORTHOLE_TERMINAL_ID", "").strip() or socket.gethostname()
+
+
+def save_detection_frame(directory, source_image, image, row, timestamp, key,
+                         damage_detections, damage_payloads, gps, lidar):
+    """Frame JSON in the terminal-server data spec (단말기-서버 데이터 명세서, 2026-09-28).
+
+    Only record_id, categories, images, annotations, gps and lidar.pcap_files are
+    sent; missing measurements are null, not 0. The full per-damage details stay
+    in the frame's local result.json.
+    """
     if not damage_detections:
         return []
     if len(damage_detections) != len(damage_payloads):
@@ -2312,46 +2406,29 @@ def save_detection_frame(directory, source_image, image, row, timestamp, key, se
         raise IOError(f"Cannot save source image: {source_image}")
     annotations = []
     for d, old in zip(damage_detections, damage_payloads):
-        cls = int(d.class_id)
         x1, y1, x2, y2 = map(float, d.box_xyxy)
         polygons = [[c for point in polygon for c in (point["x"], point["y"])]
                     for polygon in mask_polygons(d.mask)]
-        annotation = dict(
-            id=len(annotations) + 1, image_id=index, category_id=cls,
-            model_id="damage", model_class_id=cls,
-            confidence=float(d.confidence), bbox=[x1, y1, x2 - x1, y2 - y1],
-            bbox_format="xywh", bbox_xyxy=[x1, y1, x2, y2],
-            coordinate_space="original_image_pixels", segmentation=polygons,
-            segmentation_status="available" if polygons else "unavailable",
-            area=None if d.mask is None else int(np.count_nonzero(d.mask)),
-            area_unit="pixel_squared", iscrowd=0,
-        )
-        annotation.update(
-            attributes=dict(task="road_damage", report_policy="first_confirmation_only"),
-            measurements=dict(size=old["size"], depth=old["depth"]),
-            lidar=old["lidar"], tracking=old.get("tracking"), damage=old,
-        )
-        annotations.append(annotation)
-    names_ko = {0: "크랙", 1: "포트홀"}
+        annotations.append(dict(
+            id=len(annotations) + 1, image_id=1, category_id=int(d.class_id),
+            confidence=float(d.confidence),
+            bbox=[round(x1), round(y1), round(x2 - x1), round(y2 - y1)],
+            segmentation=polygons,
+            measurements=dict(
+                size=dict(length_m=old["size"]["length_m"], width_m=old["size"]["width_m"],
+                          area_m2=old["size"]["area_m2"]),
+                depth=dict(median_cm=old["depth"]["median_cm"]),
+            ),
+        ))
+    captured = datetime.fromtimestamp(timestamp_ns // 1_000_000_000, timezone.utc)
     payload = dict(
-        data_kind="model_prediction",
-        record_id=f"{socket.gethostname()}/{key}/{index}", license=[],
-        info=dict(contributor="휴데이터스", date_created=datetime.now(timezone.utc).isoformat(),
-                  description="크랙·포트홀 탐지",
-                  bbox_format="xywh", area_unit="pixel_squared"),
-        categories=[dict(id=i, name=names_ko[i], name_en=name,
-                         supercategory="road_damage")
-                    for i, name in enumerate(model_infer__CLASS_NAMES)],
-        images=[dict(id=index, width=width, height=height, file_name=image_path.name,
-                     sha256=sha(image_path), bytes=image_path.stat().st_size,
-                     date_captured=datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
-                     timestamp_ns=str(timestamp_ns), timestamp_source=row.get("timestamp_source"),
-                     source_file_name=source_image.name, source_frame_id=row.get("source_frame_id"))],
-        annotations=annotations, models=models, gps=gps, lidar=lidar,
-        source=dict(device_id=socket.gethostname(), run=key, frame_index=index, live_session_id=session_id),
-        synchronization=dict(camera_epoch_sec=timestamp, camera_epoch_ns=str(timestamp_ns),
-                             camera_timestamp_source=row.get("timestamp_source"),
-                             ptp_clock_error_ns=None, ptp_clock_error_status="not_measured_by_analysis"),
+        record_id=f"{terminal_id()}/{Path(key).name}/{index}",
+        categories=[dict(id=i, name=name) for i, name in enumerate(model_infer__CLASS_NAMES)],
+        images=[dict(id=1, width=width, height=height, file_name=image_path.name,
+                     date_captured=captured.strftime("%Y-%m-%dT%H:%M:%SZ"))],
+        annotations=annotations,
+        gps=dict(latitude_deg=gps.get("latitude_deg"), longitude_deg=gps.get("longitude_deg")),
+        lidar=dict(pcap_files=[dict(name=f["name"]) for f in lidar.get("pcap_files", [])]),
     )
     atomic_json(json_path, clean(payload))
     return [image_path, json_path]
@@ -4023,8 +4100,7 @@ class LiveProcessor:
                 )
                 pair = save_detection_frame(
                     self.exporter.directory, image_path, image, row, timestamp, key,
-                    self.session_id, report_detections, damage_payloads,
-                    {"damage": self.detector.metadata},
+                    report_detections, damage_payloads,
                     matched_gps_metadata(self.exporter.gps_streams, timestamp),
                     lidar_metadata,
                 )
@@ -4056,6 +4132,7 @@ class LiveProcessor:
                 total_reported_count=len(report_detections),
                 damage_report_policy="first_confirmation_only",
                 objects=audit,
+                damage_details=damage_payloads,
                 tracks=tracked,
                 live_sequence=self.sequence,
                 live_session_id=self.session_id,
@@ -4096,24 +4173,38 @@ UPLOAD_SETTINGS = (
 
 
 def upload_options():
-    """Upload server settings come only from the environment or the sibling .env."""
+    """Upload settings come only from the environment or the sibling .env.
+
+    PORTHOLE_API_URL selects the HTTP API (JPG/JSON/PCAP per the terminal-server
+    data spec); without it the SSH receiver settings are used.
+    """
+    bw_kib = int(os.getenv("PORTHOLE_UPLOAD_BW_KIB", "24576"))
+    if bw_kib <= 0:
+        raise ValueError("PORTHOLE_UPLOAD_BW_KIB must be positive")
+    api_url = os.getenv("PORTHOLE_API_URL", "").strip()
+    if api_url:
+        return SimpleNamespace(
+            mode="api", api_url=api_url, api_token=os.getenv("PORTHOLE_API_TOKEN", "").strip(),
+            bw_kib=bw_kib,
+        )
     missing = [name for name in UPLOAD_SETTINGS if not os.getenv(name, "").strip()]
     if missing:
-        raise ValueError("upload is not configured; set " + ", ".join(missing) + " in .env")
-    options = SimpleNamespace(
+        raise ValueError(
+            "upload is not configured; set PORTHOLE_API_URL or " + ", ".join(missing) + " in .env"
+        )
+    return SimpleNamespace(
+        mode="ssh",
         host=os.environ["PORTHOLE_UPLOAD_HOST"].strip(),
         user=os.environ["PORTHOLE_UPLOAD_USER"].strip(),
         destination=os.environ["PORTHOLE_UPLOAD_DIR"].strip(),
         key=Path(os.environ["PORTHOLE_UPLOAD_KEY"].strip()).expanduser(),
-        bw_kib=int(os.getenv("PORTHOLE_UPLOAD_BW_KIB", "24576")),
+        bw_kib=bw_kib,
     )
-    if options.bw_kib <= 0:
-        raise ValueError("PORTHOLE_UPLOAD_BW_KIB must be positive")
-    return options
 
 
 class UploadWorker:
-    """Durable retry queue using the embedded byte/hash-verified SSH transport."""
+    """Durable retry queue: HTTP API when PORTHOLE_API_URL is set, else the
+    embedded byte/hash-verified SSH transport."""
 
     def __init__(self, output, timeout=30):
         self.output, self.timeout = (Path(output), timeout)
@@ -4133,6 +4224,8 @@ class UploadWorker:
                 self.error = str(exc)
                 self.stop_event.wait()
                 return
+            target = options.api_url if options.mode == "api" else f"{options.user}@{options.host}"
+            print(f"[UPLOAD] {options.mode} -> {target}", flush=True)
             while not self.stop_event.is_set():
                 jobs = sorted((self.output / "runs" / "outbox").glob("**/*.json"))
                 if not jobs:
@@ -4163,10 +4256,14 @@ class UploadWorker:
                         if key != active_key:
                             if uploader:
                                 uploader.close()
-                            uploader = PersistentUploader(
-                                options,
-                                Path(self.output.name) / key / "certifcate",
-                                timeout=self.timeout,
+                            uploader = (
+                                HttpUploader(options, timeout=self.timeout)
+                                if options.mode == "api"
+                                else PersistentUploader(
+                                    options,
+                                    Path(self.output.name) / key / "certifcate",
+                                    timeout=self.timeout,
+                                )
                             )
                             active_key = key
                         receipt = uploader.upload(folder / "certifcate", row["upload_manifest"])
@@ -4177,6 +4274,16 @@ class UploadWorker:
                             f"[UPLOAD] verified run={key} frame={row['frame_index']} files={receipt['files']}",
                             flush=True,
                         )
+                    except PermanentUploadError as exc:
+                        # Retrying cannot help and would block later frames; park it.
+                        failed = self.output / "runs" / "outbox_failed" / job.relative_to(
+                            self.output / "runs" / "outbox"
+                        )
+                        failed.parent.mkdir(parents=True, exist_ok=True)
+                        job.replace(failed)
+                        atomic_json(failed.with_suffix(".error.json"),
+                                    dict(failed_at=time.time(), error=str(exc)))
+                        print(f"[UPLOAD] rejected by server, moved to {failed}: {exc}", flush=True)
                     except Exception as exc:
                         self.error = str(exc)
                         atomic_json(

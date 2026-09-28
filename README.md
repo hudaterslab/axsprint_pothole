@@ -127,14 +127,15 @@ sudo reboot
   `/etc/ptp-pothole/device.json`에 기록합니다. `app/ptp.py`는 이 파일이 있으면 이 값을 씁니다.
 - 라이다 PTP: clock source를 PTP로 설정하고 1588v2·UDP/IPv4·도메인 0인지 확인
 - 수집기: 실행 도우미, sudoers, 라이다 수신 버퍼(sysctl), 수집 터미널 자동 실행, SDDM 자동 로그인
-- 업로드 설정: `.env`가 없으면 `.env.example`로 만들고, 업로드 서버 값이 비어 있으면 알려 줍니다
+- 업로드 설정: `.env`가 없으면 `.env.example`로 만들고, 업로드 설정 값이 비어 있으면 알려 줍니다
 - 저장: `/mnt/ssd` 자동 마운트(`/etc/fstab`)
 - 네트워크: 라이다 포트 `192.168.1.100/32`(`192.168.1.201` 경로 포함), 카메라 포트 `192.168.11.2/24`
 - 확인: PTP 기준 시계가 두 포트에서 MASTER인지, 두 센서가 이 단말기에 SLAVE로 동기화됐는지,
   라이다가 `Locked`인지, 저장 SSD가 잡히는지
 
 바꾸기 전 파일은 `~/ptp_pothole_archive/install_날짜_시간/`에 백업하며, 다시 실행해도 안전합니다.
-설치 후 `.env`에 업로드 서버(`PORTHOLE_UPLOAD_HOST`, `_USER`, `_DIR`, `_KEY`)를 채우세요.
+설치 후 `.env`에 업로드 설정을 채우세요. API 서버로 보내려면 `PORTHOLE_API_URL`(필요하면 `PORTHOLE_API_TOKEN`)을,
+SSH 수신 서버로 보내려면 `PORTHOLE_UPLOAD_HOST`, `_USER`, `_DIR`, `_KEY`를 채웁니다(아래 "서버 전송").
 값이 없으면 `main_live.py`는 분석은 계속하고 업로드만 하지 않습니다.
 필요하면 `.env`에 다음 선택 항목도 추가할 수 있습니다: `PORTHOLE_UPLOAD_BW_KIB`(업로드 속도 제한 KiB/s, 기본 24576),
 `KMA_SERVICE_KEY`·`KMA_ASOS_SERVICE_KEY`(기상청 날씨 API, 없으면 날씨 항목이 비어 있음),
@@ -156,7 +157,7 @@ sudo reboot
 ```
 
 - 확인: numpy·OpenCV, DEEPX 런타임(`dx_engine`, `/dev/dxrt*`, `dxrt.service`), 보정 파일,
-  `.env` 업로드 설정·SSH 키·서버 호스트 키
+  `.env` 업로드 설정(API 주소, 또는 SSH 키·서버 호스트 키)
 - 모델: `best_seg.dxnn`이 없으면 `download_models.sh`로 Hugging Face
   (`HudatersU/road_maintanance`)에서 받아 sha256을 확인합니다. 모델만 따로 받을 때도
   `./download_models.sh`를 실행하면 됩니다. Hugging Face의 모델을 바꾸면 스크립트의 sha256도 바꿔야 합니다.
@@ -172,6 +173,30 @@ GPS 속도가 없을 때 라이다 깊이를 쓰지 않으려면 `--motion requi
 `main_live.py`는 결과 폴더(`/mnt/ssd/porthole_live_analysis`)에 진행 기록을 남겨 재시작해도 이어서 분석합니다.
 코드·설정·모델·입력 폴더가 바뀌면 이전 결과 폴더를 `porthole_live_analysis_날짜_시간`으로 옮기고
 새 폴더에서 다시 시작합니다(가장 최근 기록과 이후 새 기록만 분석). 옮긴 폴더에 남은 업로드도 계속 보냅니다.
+
+## 서버 전송
+
+`main_live.py`는 추적 객체를 처음 확인한 프레임마다 같은 이름(`frame_<촬영 시각 ns>_<프레임 번호 8자리>`)의
+JPG·JSON·PCAP을 `/mnt/ssd/porthole_live_analysis/runs/<run>/frames/<번호>/certifcate/`에 만들고 서버로 보냅니다.
+JSON은 「크랙 포트홀 서버 전송 명세서」(2026-09-28) 형식입니다. `record_id`(`단말기/run 폴더/프레임 번호`),
+`categories`, `images`, `annotations`(bbox·segmentation·크기·깊이), `gps`, `lidar.pcap_files`만 담고,
+측정값이 없으면 0 대신 null입니다. 크랙은 깊이를 재지 않으므로 `depth.median_cm`이 null입니다.
+나머지 상세 기록은 같은 프레임 폴더의 `result.json`에 남습니다.
+단말기 이름은 `.env`의 `PORTHOLE_TERMINAL_ID`이며, 비어 있으면 호스트 이름을 씁니다.
+
+`.env`에 `PORTHOLE_API_URL`이 있으면 프레임마다 HTTP POST 한 번으로 보내고 SSH 설정은 쓰지 않습니다.
+
+- 요청: `multipart/form-data`, 파일 항목 이름 `jpg`·`json`·`pcap`
+- 헤더: `X-Record-Id`(JSON의 `record_id`), `PORTHOLE_API_TOKEN`이 있으면 `Authorization: Bearer <토큰>`
+- 응답: 2xx는 완료이고, 409는 서버가 이미 받은 것으로 보고 완료로 처리합니다.
+  400·413·415·422는 다시 보내도 받지 않으므로 그 작업을 `runs/outbox_failed/`로 옮기고(이유는 `.error.json`)
+  다음 프레임을 보냅니다. 그 밖의 응답, 연결 실패, 리다이렉트는 5초 뒤 다시 보냅니다.
+- 완료 기록: 프레임 폴더의 `upload_receipt.json`. 다시 보내려면 `outbox_failed`의 작업 파일(`.error.json` 제외)을
+  `runs/outbox/`의 같은 위치로 옮깁니다.
+
+`PORTHOLE_API_URL`이 비어 있으면 기존 SSH 수신 서버(`PORTHOLE_UPLOAD_*`)로 보냅니다.
+API 서버가 정해지면 위 요청 형식(항목 이름, 헤더, 응답 코드)이 서버와 맞는지 확인하세요.
+`.env`를 바꾼 뒤에는 `main_live.py`를 다시 시작해야 적용됩니다.
 
 ## 시험 자료 및 변경 전 파일
 

@@ -342,8 +342,8 @@ ensure_env_file() {
     act install -m 600 -o "$APP_USER" -g "$APP_USER" -- "$SRC_DIR/.env.example" "$env"
     CHANGED+=(".env from .env.example")
   fi
-  if ! grep -qE '^PORTHOLE_UPLOAD_HOST=[^[:space:]]' "$env" 2>/dev/null; then
-    warn "fill in the upload server in $env (PORTHOLE_UPLOAD_HOST, _USER, _DIR, _KEY); main_live.py does not upload until then"
+  if ! grep -qE '^(PORTHOLE_API_URL|PORTHOLE_UPLOAD_HOST)=[^[:space:]]' "$env" 2>/dev/null; then
+    warn "fill in the upload settings in $env (PORTHOLE_API_URL, or PORTHOLE_UPLOAD_HOST, _USER, _DIR, _KEY); main_live.py does not upload until then"
   fi
 }
 

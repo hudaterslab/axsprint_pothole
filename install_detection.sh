@@ -158,19 +158,25 @@ check_calibration() {
   done
 }
 
-# Uploads need .env values, the SSH key and the server's host key; without them
+# Uploads go to PORTHOLE_API_URL when it is set; otherwise over SSH, which needs
+# the .env values, the SSH key and the server's host key. Without them
 # main_live.py still analyses but does not upload.
 check_upload() {
-  local name missing=() host user key
+  local name missing=() host user key api
   if [[ ! -e "$APP_DIR/.env" ]]; then
-    warn "no $APP_DIR/.env; copy .env.example to .env and fill in the upload server"
+    warn "no $APP_DIR/.env; copy .env.example to .env and fill in the upload settings"
+    return 0
+  fi
+  api=$(env_value PORTHOLE_API_URL)
+  if [[ -n "$api" ]]; then
+    say "upload: .env sends to the API $api"
     return 0
   fi
   for name in "${UPLOAD_SETTINGS[@]}"; do
     [[ -n "$(env_value "$name")" ]] || missing+=("$name")
   done
   if (( ${#missing[@]} )); then
-    warn "set ${missing[*]} in $APP_DIR/.env; main_live.py does not upload until then"
+    warn "set PORTHOLE_API_URL, or ${missing[*]}, in $APP_DIR/.env; main_live.py does not upload until then"
     return 0
   fi
   host=$(env_value PORTHOLE_UPLOAD_HOST)
