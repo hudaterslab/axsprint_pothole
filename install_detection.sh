@@ -26,14 +26,7 @@ APP_HOME=/home/$APP_USER
 APP_DIR=$APP_HOME/Desktop/live_detection
 AUTOSTART=$APP_HOME/.config/autostart/porthole-analysis-terminal.desktop
 
-# Models are published on Hugging Face; override with MODEL_BASE_URL=... if moved.
-MODEL_BASE_URL=${MODEL_BASE_URL:-https://huggingface.co/hudaterslab/pothole-models/resolve/main}
-# sha256 of the models the first unit runs with.
-declare -A MODELS=(
-  [best_seg.dxnn]=602bb83a7cf612d4abc450a6cdfc85eda53d1278e8bddb012a0aeeb17fa59096
-  [pothole_best2.dxnn]=559bf8a7776ab373307ea1ce8b14a16c73f12ef075ae363aa806249a77160086
-)
-# main_live.py reads these next to itself (30-degree mounting).
+# main_live.py reads these next to itself (camera: 30-degree mounting).
 CALIBRATION=(camera_calib_best_effort_v30.json XT32_Angle_Correction_File.csv)
 UPLOAD_SETTINGS=(PORTHOLE_UPLOAD_HOST PORTHOLE_UPLOAD_USER PORTHOLE_UPLOAD_DIR PORTHOLE_UPLOAD_KEY)
 
@@ -103,8 +96,8 @@ preflight() {
     fi
   fi
   local file
-  for file in main_live.py launch_component_terminal.sh run_component_foreground.sh \
-    deploy/porthole-analysis-terminal.desktop; do
+  for file in main_live.py download_models.sh launch_component_terminal.sh \
+    run_component_foreground.sh deploy/porthole-analysis-terminal.desktop; do
     [[ -e "$SRC_DIR/$file" ]] || die "missing $SRC_DIR/$file"
   done
   if [[ ! -e "$APP_HOME/.config/autostart/porthole-collector-terminal.desktop" ]]; then
@@ -139,41 +132,19 @@ check_runtime() {
   fi
 }
 
-# Models are not in git; download missing ones from MODEL_BASE_URL and verify them.
+# Models are not in git; download_models.sh fetches and verifies them.
 check_models() {
-  local name want have tmp
-  for name in "${!MODELS[@]}"; do
-    want=${MODELS[$name]}
-    if [[ -e "$APP_DIR/$name" ]]; then
-      have=$(sha256sum -- "$APP_DIR/$name" | cut -d' ' -f1)
-      if [[ "$have" == "$want" ]]; then
-        say "model: $name present (same as the first unit)"
-      else
-        say "model: $name present (differs from the first unit's; kept)"
-      fi
-      continue
-    fi
-    say "model: download $name from $MODEL_BASE_URL"
-    if (( DRY_RUN )); then
-      printf '[dry-run] wget -O %s %s/%s\n' "$APP_DIR/$name" "$MODEL_BASE_URL" "$name"
-      CHANGED+=("model $name")
-      continue
-    fi
-    if ! command -v wget >/dev/null; then
-      warn "wget is missing; put $name into $APP_DIR yourself"
-      continue
-    fi
-    tmp=$APP_DIR/.$name.part
-    if as_user wget -q --show-progress -O "$tmp" "$MODEL_BASE_URL/$name" \
-      && [[ "$(sha256sum -- "$tmp" | cut -d' ' -f1)" == "$want" ]]; then
-      as_user mv -f -- "$tmp" "$APP_DIR/$name"
-      say "model: $name downloaded and verified"
-      CHANGED+=("model $name")
-    else
-      rm -f -- "$tmp"
-      warn "could not download a verified $name from $MODEL_BASE_URL; put it into $APP_DIR yourself"
-    fi
-  done
+  if as_user "$SRC_DIR/download_models.sh" --check; then
+    return 0
+  fi
+  if (( DRY_RUN )); then
+    printf '[dry-run] %s\n' "$SRC_DIR/download_models.sh"
+    CHANGED+=("models")
+  elif as_user "$SRC_DIR/download_models.sh"; then
+    CHANGED+=("models")
+  else
+    warn "model download failed; run ./download_models.sh again or put best_seg.dxnn into $APP_DIR"
+  fi
 }
 
 check_calibration() {

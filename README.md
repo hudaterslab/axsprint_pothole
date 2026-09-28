@@ -9,7 +9,8 @@ live_detection/
   camera_calib_best_effort.json       카메라 렌즈 보정값 (45도 장착)
   XT32_Angle_Correction_File.csv      라이다 채널 각도 (main_live.py가 읽음)
   XT32_Angle_Correction_File_v30.csv  라이다 채널 각도 (내용은 위와 같음, 현재 사용 안 함)
-  best_seg.dxnn, pothole_best2.dxnn   모델 (저장소에 넣지 않고 따로 받음)
+  best_seg.dxnn     main_live.py 모델 (저장소에 넣지 않음, ./download_models.sh로 받음)
+  download_models.sh   모델 다운로드 (Hugging Face HudatersU/road_maintanance, sha256 확인)
   .env.example      main_live.py 설정 예시 (.env로 복사해 채움, .env는 저장소 제외)
   collect_data.py   카메라·라이다·GPS 수집 실행 파일
   ptp_service.py    공통 PTP 기준 시계 실행 파일
@@ -135,6 +136,9 @@ sudo reboot
 바꾸기 전 파일은 `~/ptp_pothole_archive/install_날짜_시간/`에 백업하며, 다시 실행해도 안전합니다.
 설치 후 `.env`에 업로드 서버(`PORTHOLE_UPLOAD_HOST`, `_USER`, `_DIR`, `_KEY`)를 채우세요.
 값이 없으면 `main_live.py`는 분석은 계속하고 업로드만 하지 않습니다.
+필요하면 `.env`에 다음 선택 항목도 추가할 수 있습니다: `PORTHOLE_UPLOAD_BW_KIB`(업로드 속도 제한 KiB/s, 기본 24576),
+`KMA_SERVICE_KEY`·`KMA_ASOS_SERVICE_KEY`(기상청 날씨 API, 없으면 날씨 항목이 비어 있음),
+`DAMAGE_EXPORT_VEHICLE_TYPE`(결과에 기록할 차량 종류, 기본 현대 팰리세이드).
 센서를 연결하지 않은 채 실행했다면 연결한 뒤 다시 실행하세요.
 `config.yaml`의 `camera_forward_offset_deg`는 라이다와 카메라의 장착 각도이므로
 장착이 첫 단말기와 다르면 직접 맞춰야 합니다.
@@ -153,8 +157,9 @@ sudo reboot
 
 - 확인: numpy·OpenCV, DEEPX 런타임(`dx_engine`, `/dev/dxrt*`, `dxrt.service`), 보정 파일,
   `.env` 업로드 설정·SSH 키·서버 호스트 키
-- 모델: `best_seg.dxnn`, `pothole_best2.dxnn`이 없으면 Hugging Face에서 받아 sha256을 확인합니다
-  (주소는 `MODEL_BASE_URL`로 바꿀 수 있습니다)
+- 모델: `best_seg.dxnn`이 없으면 `download_models.sh`로 Hugging Face
+  (`HudatersU/road_maintanance`)에서 받아 sha256을 확인합니다. 모델만 따로 받을 때도
+  `./download_models.sh`를 실행하면 됩니다. Hugging Face의 모델을 바꾸면 스크립트의 sha256도 바꿔야 합니다.
 - 자동 실행: `~/.config/autostart/porthole-analysis-terminal.desktop`을 등록해 자동 로그인 후
   수집 터미널과 별도로 탐지 터미널이 열립니다. 창을 닫거나 Ctrl+C를 누르면 탐지만 종료합니다.
 - 끄기: `./install_detection.sh --disable`
