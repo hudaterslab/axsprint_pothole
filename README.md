@@ -1,0 +1,146 @@
+# PTP 수집기와 실시간 포트홀 탐지
+
+현재 운영에 필요한 실행 코드와 설정만 모아 둔 폴더입니다.
+
+```text
+live_detection/
+  main_live.py      실시간 포트홀 탐지 (카메라 탐지 + 라이다 깊이 측정)
+  camera_calib_best_effort_v30.json   카메라 렌즈 보정값 (30도 장착, main_live.py가 읽음)
+  camera_calib_best_effort.json       카메라 렌즈 보정값 (45도 장착)
+  XT32_Angle_Correction_File_v30.csv  라이다 채널 각도 (main_live.py가 읽음)
+  XT32_Angle_Correction_File.csv      라이다 채널 각도 (내용은 _v30과 같음)
+  best_seg.dxnn, pothole_best2.dxnn   모델 (저장소에 넣지 않고 따로 받음)
+  .env.example      main_live.py 설정 예시 (.env로 복사해 채움, .env는 저장소 제외)
+  collect_data.py   카메라·라이다·GPS 수집 실행 파일
+  ptp_service.py    공통 PTP 기준 시계 실행 파일
+  launch_component_terminal.sh   수집 터미널 열기
+  run_component_foreground.sh    수집 실행·로그·정상 종료 제어
+  attach_component_terminal.sh   원격 데스크톱에서 수집 터미널 연결
+  resolve_recording_storage.sh   외장 SSD와 저장 경로 확인
+  config.yaml      카메라, GPS, 저장 위치 등 수집 설정
+  install.sh       새 단말기 설치 (아래 "새 단말기 설치")
+  deploy/          install.sh가 설치하는 시스템 파일 원본
+  app/
+    collector.py   수집 루프·GPS·JPEG 저장·재연결·10분 폴더 전환
+    camera.py      하드웨어 카메라 디코딩·PTP 프레임 큐 (별도 worker 포함)
+    lidar.py       XT32 패킷 해석·진단·PCAP 저장
+    ptp.py         PTP 상태 검사·센서 제어·RTP/RTCP 시각 변환
+  var/             실행 중 생성되는 PTP 설정·상태·로그
+  runs/            /mnt/ssd/porthole_runs 바로가기
+  README.md
+```
+
+`app`은 4개 모듈이며 따로 실행할 필요가 없습니다. `collect_data.py`가 수집기를,
+`ptp_service.py`가 PTP 기준 시계를 실행합니다. 카메라 worker는 `camera.py --worker`로
+별도 프로세스에서 실행해 GStreamer/VAAPI와 사용자 OpenCV 라이브러리를 분리합니다.
+현재 사용하지 않는 LCZ·BIN 저장, 프레임별 LiDAR 잘라 저장하기, 비PTP 시각 추정,
+PyAV·OpenCV·FFmpeg 대체 수신 경로, 원본 영상 복사와 화면 표시 코드는 제거했습니다.
+PTP 기능을 기존 클래스에 실행 중 덮어씌우던 연결도 없애고 수집 코드에 직접 통합했습니다.
+Python이 만드는 `app/__pycache__`는 실행 캐시입니다.
+`var`가 없어도 시작 시 다시 만들며, 일반 사용자 수집기가 PID를 기록할 수 있도록
+PTP 서비스와 실행 도우미가 디렉터리 소유자를 `hudaters`로 확인합니다.
+
+## 사용
+
+단말기 부팅 시 PTP 기준 시계 서비스가 시작하고, 기존 LXQt 자동 로그인 후
+기존 수집 터미널이 열립니다. 수집 로그를 그 터미널에서 볼 수 있습니다.
+PTP 기준 시계도 기존 수집기처럼 최초 NTP 동기화를 최대 60초 기다립니다.
+NTP가 꺼져 있거나 시간 안에 응답하지 않으면 단말기 RTC 시각으로 시작합니다.
+기준 시계 준비 시에만 남은 NTP 시각 차이를 먼저 보정하고,
+카메라 SDK의 PTP 종료·시작 명령으로 카메라의 이전 동기화 상태를 초기화합니다.
+단말기 인터넷 시간 동기화는 `chrony.service`가 담당합니다. 설정은
+`/etc/chrony/chrony.conf`이며 시간 보정 속도를 5ppm으로 제한합니다.
+두 LAN 포트의 하드웨어 시계는 같은 단말기 시각을 따르며, `phc2sys`의
+보정 속도도 제한합니다. 포트 간 시계 차이는 하드웨어 동시 측정으로 검사합니다.
+터미널에서 Ctrl+C를 누르거나 창을 닫으면 수집 파일을 마감하고 수집만 종료합니다.
+PTP 기준 시계는 계속 동작합니다. 분석 프로세스 자동 실행은 꺼져 있습니다.
+
+수집 터미널을 다시 열려면 다음을 실행합니다.
+
+```bash
+/home/hudaters/Desktop/live_detection/launch_component_terminal.sh collector
+```
+
+터미널 로그는 기존처럼 `/tmp/porthole_collector_foreground_날짜_시간_PID.log`입니다.
+자동 실행 항목은 `~/.config/autostart/porthole-collector-terminal.desktop`입니다.
+자동 실행 항목은 이 폴더의 `launch_component_terminal.sh collector`를 실행합니다.
+터미널 실행, 수집 실행·종료 제어, 원격 터미널 연결, SSD 확인 스크립트를 모두
+이 폴더로 옮겼습니다. 현재 수집 실행에는 `porthole` 폴더의 코드가 필요하지 않습니다.
+이전 `porthole`의 같은 이름 4개는 호환용 심볼릭 링크이며 실제 코드는 이 폴더에만 있습니다.
+공유 스크립트의 수동 `analysis`·`uploader` 명령은 예전 프로그램 경로를 유지하지만,
+두 프로그램의 자동 실행은 계속 꺼져 있습니다.
+고정 실행 도우미 `/usr/local/sbin/ptp-pothole-collector-foreground`가
+일반 사용자 수집기에 PTP 패킷 확인에 필요한 네트워크 권한을 제공합니다.
+이 도우미와 systemd·sudoers·LXQt 자동 시작 등록은 운영체제의 표준 위치에 유지합니다.
+원본은 `deploy/`에 있으며 `install.sh`가 설치합니다.
+도우미는 PTP 서비스를 시작 요청한 다음 이 폴더의 `collect_data.py`를 실행합니다.
+`porthole-collector.service`는 중복 수집 방지를 위해 비활성화했습니다.
+기준 시계 상태는 `systemctl status ptp-pothole-master.service`로 확인합니다.
+
+수집은 `/mnt/ssd/porthole_runs/날짜/시간/` 아래 `frames / lidar / gps / meta`에 저장합니다.
+PCAP와 목록 파일은 `lidar/00000000.pcap`, `lidar/pcaps.jsonl`처럼 `lidar` 바로 아래에
+저장합니다. `lidar_pcap` 하위 폴더는 새로 만들지 않습니다. 변경 전 run의 파일은 기존 위치를 유지합니다.
+10분마다 새 run으로 전환합니다. 카메라 30fps, 라이다 20Hz 설정을 유지합니다.
+라이다는 내장 LAN `enp1s0`, 카메라는 `enp2s0`에 연결합니다.
+NetworkManager의 `ptp-pothole-lidar` 설정은 `enp1s0`/`48:21:0B:72:DC:48`,
+`porthole-camera` 설정은 `enp2s0`/`48:21:0B:72:DC:47`에 고정되어 있습니다(첫 단말기 기준이며,
+다른 단말기에서는 `install.sh`가 그 단말기의 MAC 주소로 만듭니다).
+재부팅 후에도 두 장비의 IP 설정이 서로 다른 포트에 적용되도록 유지해야 합니다.
+
+카메라 `frames.jsonl`의 `timestamp_ns`와 LiDAR PCAP header는 모두 UTC입니다.
+LiDAR 패킷 내부 tail은 원본 PTP/TAI이며 기록된 UTC offset(현재 37초)을 한 번 빼야 합니다.
+이미 UTC인 PCAP header에는 다시 빼지 않습니다. 기존 offset 추정값을 추가 적용하지 마세요.
+PTP는 시계를 맞추며, 카메라 노출 시작과 LiDAR 회전 위상 자체를 일치시키지는 않습니다.
+시작 직후에는 PTP 잠금과 카메라 RTCP 시각 정보가 확인될 때까지 잠시 저장을 기다립니다.
+시작 시 동기화 검사는 5초 연속 통과해야 합니다. 준비 시간의 기준은
+운영체제 부팅 시간이 아닌 `collect_data.py` 프로세스 시작 시각입니다.
+계속 0으로 남는 경우 `meta/ptp_status.jsonl`의 `qualification`과 `sensors` 오류를 확인합니다.
+`meta/ptp_status.jsonl`의 `master_clock.port_skew_ns`는 두 LAN 포트 간 시계 차이입니다.
+수집기는 하드웨어 시계를 읽기만 하며, 시스템 시각을 변경할 권한은 없습니다.
+`[CONNECTION] LIDAR`는 실제 UDP 수신 여부이고 `[PTP] READY/WAITING`은
+시계 검증 상태입니다. PTP 오차 0.1ms 기준을 초과한 데이터를 정상으로 처리하지 않습니다.
+
+## 새 단말기 설치
+
+Ubuntu 22.04 Lubuntu(LXQt), 사용자 `hudaters`, 라이다 포트 `enp1s0`(`/dev/ptp0`)와
+카메라 포트 `enp2s0`(`/dev/ptp1`)가 하드웨어 타임스탬프를 지원하는 NUC에서 실행합니다.
+라이다, 카메라, 라벨이 `porthole`인 ext4 USB SSD를 연결한 뒤 실행하세요.
+
+```bash
+git clone -b live_detection https://github.com/hudaterslab/pothole.git ~/Desktop/live_detection
+cd ~/Desktop/live_detection
+sudo ./install.sh --dry-run   # 바뀔 내용만 확인
+sudo ./install.sh
+sudo reboot
+```
+
+`install.sh`가 하는 일은 다음과 같습니다.
+
+- 패키지: linuxptp·chrony·GStreamer/VAAPI 등 apt 패키지와 numpy·opencv-python(pip)
+- 사용자 그룹: `dialout`(GPS), `video`·`render`(하드웨어 디코딩)
+- PTP: `/dev/ptp0`·`/dev/ptp1` 읽기 권한(udev), 보정 속도를 제한한 chrony,
+  `systemd-timesyncd` 중지, `ptp-pothole-master.service` 설치·시작
+  (ptp4l 설정과 phc2sys 실행은 `ptp_service.py`가 합니다)
+- PTP 식별자: 이 단말기 라이다 포트와 두 센서의 MAC 주소로 만든 clock identity를
+  `/etc/ptp-pothole/device.json`에 기록합니다. `app/ptp.py`는 이 파일이 있으면 이 값을 씁니다.
+- 라이다 PTP: clock source를 PTP로 설정하고 1588v2·UDP/IPv4·도메인 0인지 확인
+- 수집기: 실행 도우미, sudoers, 라이다 수신 버퍼(sysctl), 수집 터미널 자동 실행, SDDM 자동 로그인
+- 업로드 설정: `.env`가 없으면 `.env.example`로 만들고, 업로드 서버 값이 비어 있으면 알려 줍니다
+- 저장: `/mnt/ssd` 자동 마운트(`/etc/fstab`)
+- 네트워크: 라이다 포트 `192.168.1.100/32`(`192.168.1.201` 경로 포함), 카메라 포트 `192.168.11.2/24`
+- 확인: PTP 기준 시계가 두 포트에서 MASTER인지, 두 센서가 이 단말기에 SLAVE로 동기화됐는지,
+  라이다가 `Locked`인지, 저장 SSD가 잡히는지
+
+바꾸기 전 파일은 `~/ptp_pothole_archive/install_날짜_시간/`에 백업하며, 다시 실행해도 안전합니다.
+설치 후 `.env`에 업로드 서버(`PORTHOLE_UPLOAD_HOST`, `_USER`, `_DIR`, `_KEY`)를 채우세요.
+값이 없으면 `main_live.py`는 분석은 계속하고 업로드만 하지 않습니다.
+센서를 연결하지 않은 채 실행했다면 연결한 뒤 다시 실행하세요.
+`config.yaml`의 `camera_forward_offset_deg`는 라이다와 카메라의 장착 각도이므로
+장착이 첫 단말기와 다르면 직접 맞춰야 합니다.
+
+## 시험 자료 및 변경 전 파일
+
+시험용 수집기·검증 스크립트·검증 결과·이전 백업·미사용 보조 파일은
+`/home/hudaters/ptp_pothole_archive/` 아래 정리 날짜 폴더로 옮겼습니다.
+실제 systemd 서비스 설정은 `/etc/systemd/system/`에 유지합니다.
+SSD의 수집 데이터는 `runs` 바로가기 대상 경로에 그대로 있습니다.

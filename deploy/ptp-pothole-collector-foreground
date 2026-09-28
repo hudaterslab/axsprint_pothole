@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+[ "$#" -eq 0 ] || exit 2
+/usr/bin/install -d -o hudaters -g hudaters -m 0755 /home/hudaters/Desktop/live_detection/var
+/usr/bin/systemctl start ptp-pothole-master.service
+/usr/bin/mountpoint -q /mnt/ssd || /usr/bin/mount /mnt/ssd
+cd /home/hudaters/Desktop/live_detection
+exec /usr/bin/setpriv --reuid=hudaters --regid=hudaters --init-groups \
+  --inh-caps=+net_raw,+net_bind_service --ambient-caps=+net_raw,+net_bind_service \
+  --bounding-set=-all,+net_raw,+net_bind_service --reset-env \
+  /bin/sh -e -c 'printf "%s\n" "$$" > /home/hudaters/Desktop/live_detection/var/foreground.pid; exec /usr/bin/python3 -u /home/hudaters/Desktop/live_detection/collect_data.py'

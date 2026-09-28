@@ -1,0 +1,1 @@
+hudaters ALL=(root) NOPASSWD: /usr/local/sbin/ptp-pothole-collector-foreground ""

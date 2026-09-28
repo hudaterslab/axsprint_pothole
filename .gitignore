@@ -1,0 +1,9 @@
+# Runtime state and logs written by ptp_service.py and the collector.
+var/
+runs
+__pycache__/
+*.pyc
+# Models are downloaded separately, not committed.
+*.dxnn
+# Per-unit settings (upload server, API keys); see .env.example.
+.env

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Porthole Collector Terminal
+Comment=Collect camera, LiDAR and GPS; closing this terminal stops only collection
+Exec=/home/hudaters/Desktop/live_detection/launch_component_terminal.sh collector
+OnlyShowIn=LXQt;
+Terminal=false
+StartupNotify=false
+Hidden=false
+X-GNOME-Autostart-enabled=true

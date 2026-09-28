@@ -1,0 +1,1 @@
+SUBSYSTEM=="ptp", KERNEL=="ptp[01]", GROUP="hudaters", MODE="0640"
