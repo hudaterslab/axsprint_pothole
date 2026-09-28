@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Porthole Live Detection Terminal
+Comment=Run main_live.py in its own terminal; closing this terminal stops only live detection
+Exec=/home/hudaters/Desktop/live_detection/launch_component_terminal.sh analysis
+OnlyShowIn=LXQt;
+Terminal=false
+StartupNotify=false
+Hidden=false
+X-GNOME-Autostart-enabled=true

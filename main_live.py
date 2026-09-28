@@ -5,8 +5,9 @@ Input: /mnt/ssd/porthole_runs/YYYYMMDD/run/{frames,lidar,gps,meta}
 Every committed frame is processed in FIFO order; checkpoints and upload retries
 survive restarts. No other project Python file is imported or executed.
 Model/calibration files and installed NumPy/OpenCV/DEEPX runtime are data/runtime
-dependencies. PTP synchronizes clocks; valid GPS speed is separately required by
-the default motion-compensation policy. --motion auto is an explicit fallback.
+dependencies. PTP synchronizes clocks; GPS speed, when available, compensates
+vehicle motion between LiDAR packets and the image (--motion auto, the default).
+--motion required drops LiDAR depth without GPS speed; --motion off never compensates.
 """
 
 from __future__ import annotations
@@ -85,7 +86,7 @@ CAMERA_SPATIAL_CALIBRATION = {
     "t_cam": [-0.028875, 0.139125, -0.11437500000000003],
 }
 
-LIDAR_CALIBRATION = PROJECT / "XT32_Angle_Correction_File_v30.csv"
+LIDAR_CALIBRATION = PROJECT / "XT32_Angle_Correction_File.csv"
 
 SAVE_IMAGES = True
 
@@ -4124,7 +4125,14 @@ class UploadWorker:
     def run(self):
         uploader, active_key = (None, None)
         try:
-            options = upload_options()
+            try:
+                options = upload_options()
+            except ValueError as exc:
+                # Not configured: keep analysing and keep the outbox until .env
+                # is filled in and main_live.py restarts.
+                self.error = str(exc)
+                self.stop_event.wait()
+                return
             while not self.stop_event.is_set():
                 jobs = sorted((self.output / "runs" / "outbox").glob("**/*.json"))
                 if not jobs:
@@ -4405,6 +4413,10 @@ def analysis_signature(options):
     )
 
 
+class OutputSettingsChanged(ValueError):
+    """The output checkpoint was written by other code, settings or input."""
+
+
 def prepare_run_metadata(output, signature):
     """Move old metadata under runs, preserving frame paths and queue positions.
 
@@ -4435,7 +4447,9 @@ def prepare_run_metadata(output, signature):
         elif candidate.get("schema_version") != 7:
             raise ValueError(f"Unsupported live checkpoint: {path}")
         if candidate.get("configuration") != expected:
-            raise ValueError("Live output has different source/settings; choose a new --output")
+            raise OutputSettingsChanged(
+                "Live output has different source/settings; choose a new --output"
+            )
         if state is not None and candidate != state:
             raise ValueError("Conflicting root and runs checkpoints; no files were moved")
         state = candidate
@@ -4510,7 +4524,31 @@ def run_service(options, processor_factory=LiveProcessor):
         for sig in (signal.SIGINT, signal.SIGTERM):
             previous = signal.signal(sig, stop)
             resources.callback(signal.signal, sig, previous)
-        state = prepare_run_metadata(output, signature)
+        previous_output = previous_uploader = None
+        try:
+            state = prepare_run_metadata(output, signature)
+        except OutputSettingsChanged:
+            # main_live.py, its settings, input or model changed since this output
+            # was written. Keep those results in a dated folder (the old lock stays
+            # held) and start a fresh output, as a new --output would.
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            previous_output = output.with_name(f"{output.name}_{stamp}")
+            suffix = 1
+            while previous_output.exists():
+                previous_output = output.with_name(f"{output.name}_{stamp}_{suffix}")
+                suffix += 1
+            output.rename(previous_output)
+            output.mkdir()
+            lock = resources.enter_context((output / "worker.lock").open("a"))
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            print(
+                f"[LIVE] analysis code/settings changed; previous output moved to {previous_output}",
+                flush=True,
+            )
+            state = None
+            # Uploads still queued there keep going from the moved folder.
+            if options.upload and any((previous_output / "runs" / "outbox").glob("**/*.json")):
+                previous_uploader = UploadWorker(previous_output)
         if state is None:
             paths = (
                 [options.run.resolve()] if options.run else discover(root, options.timestamp_mode)
@@ -4730,6 +4768,8 @@ def run_service(options, processor_factory=LiveProcessor):
                 processor.close()
             if uploader:
                 uploader.close(options.drain_seconds)
+            if previous_uploader:
+                previous_uploader.close(options.drain_seconds)
             atomic_json(
                 output / "runs" / "status.json",
                 dict(
@@ -4765,7 +4805,7 @@ def parse_args(argv=None):
     p.add_argument("--upload", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--timestamp-mode", choices=["ptp", "recorded"], default="ptp")
     p.add_argument("--offset-sec", type=float, default=0.0)
-    p.add_argument("--motion", choices=["auto", "required", "off"], default="required")
+    p.add_argument("--motion", choices=["auto", "required", "off"], default="auto")
     p.add_argument("--batch-size", type=int, default=6)
     p.add_argument("--poll-seconds", type=float, default=0.5)
     p.add_argument("--min-free-gb", type=float, default=10)

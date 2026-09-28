@@ -7,8 +7,8 @@ live_detection/
   main_live.py      실시간 포트홀 탐지 (카메라 탐지 + 라이다 깊이 측정)
   camera_calib_best_effort_v30.json   카메라 렌즈 보정값 (30도 장착, main_live.py가 읽음)
   camera_calib_best_effort.json       카메라 렌즈 보정값 (45도 장착)
-  XT32_Angle_Correction_File_v30.csv  라이다 채널 각도 (main_live.py가 읽음)
-  XT32_Angle_Correction_File.csv      라이다 채널 각도 (내용은 _v30과 같음)
+  XT32_Angle_Correction_File.csv      라이다 채널 각도 (main_live.py가 읽음)
+  XT32_Angle_Correction_File_v30.csv  라이다 채널 각도 (내용은 위와 같음, 현재 사용 안 함)
   best_seg.dxnn, pothole_best2.dxnn   모델 (저장소에 넣지 않고 따로 받음)
   .env.example      main_live.py 설정 예시 (.env로 복사해 채움, .env는 저장소 제외)
   collect_data.py   카메라·라이다·GPS 수집 실행 파일
@@ -19,6 +19,7 @@ live_detection/
   resolve_recording_storage.sh   외장 SSD와 저장 경로 확인
   config.yaml      카메라, GPS, 저장 위치 등 수집 설정
   install.sh       새 단말기 설치 (아래 "새 단말기 설치")
+  install_detection.sh   main_live.py 부팅 시 자동 실행 (아래 "실시간 탐지 자동 실행")
   deploy/          install.sh가 설치하는 시스템 파일 원본
   app/
     collector.py   수집 루프·GPS·JPEG 저장·재연결·10분 폴더 전환
@@ -137,6 +138,35 @@ sudo reboot
 센서를 연결하지 않은 채 실행했다면 연결한 뒤 다시 실행하세요.
 `config.yaml`의 `camera_forward_offset_deg`는 라이다와 카메라의 장착 각도이므로
 장착이 첫 단말기와 다르면 직접 맞춰야 합니다.
+
+## 실시간 탐지 자동 실행
+
+`install.sh`는 수집기만 자동 실행으로 등록합니다. `main_live.py`도 부팅 시 자동으로
+돌리려면 `install.sh` 다음에 `install_detection.sh`를 따로 실행합니다(sudo 불필요).
+
+```bash
+cd ~/Desktop/live_detection
+./install_detection.sh --dry-run   # 바뀔 내용만 확인
+./install_detection.sh
+sudo reboot
+```
+
+- 확인: numpy·OpenCV, DEEPX 런타임(`dx_engine`, `/dev/dxrt*`, `dxrt.service`), 보정 파일,
+  `.env` 업로드 설정·SSH 키·서버 호스트 키
+- 모델: `best_seg.dxnn`, `pothole_best2.dxnn`이 없으면 Hugging Face에서 받아 sha256을 확인합니다
+  (주소는 `MODEL_BASE_URL`로 바꿀 수 있습니다)
+- 자동 실행: `~/.config/autostart/porthole-analysis-terminal.desktop`을 등록해 자동 로그인 후
+  수집 터미널과 별도로 탐지 터미널이 열립니다. 창을 닫거나 Ctrl+C를 누르면 탐지만 종료합니다.
+- 끄기: `./install_detection.sh --disable`
+
+DEEPX 런타임은 이 스크립트가 설치하지 않습니다. NPU 카드와 DEEPX 런타임(dx-runtime)을 먼저 설치하세요.
+`main_live.py`는 기본값(`--motion auto`)에서 GPS 속도가 있으면 주행 중 라이다 점의 어긋남을 보정하고,
+GPS 속도가 없으면(실내 등) 보정 없이 깊이를 측정합니다. 정지·저속에서는 보정 없이도 오차가 작습니다.
+GPS 속도가 없을 때 라이다 깊이를 쓰지 않으려면 `--motion required`로 실행합니다.
+
+`main_live.py`는 결과 폴더(`/mnt/ssd/porthole_live_analysis`)에 진행 기록을 남겨 재시작해도 이어서 분석합니다.
+코드·설정·모델·입력 폴더가 바뀌면 이전 결과 폴더를 `porthole_live_analysis_날짜_시간`으로 옮기고
+새 폴더에서 다시 시작합니다(가장 최근 기록과 이후 새 기록만 분석). 옮긴 폴더에 남은 업로드도 계속 보냅니다.
 
 ## 시험 자료 및 변경 전 파일
 
