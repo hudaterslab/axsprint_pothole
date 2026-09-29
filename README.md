@@ -16,6 +16,7 @@ live_detection/
   ptp_service.py    공통 PTP 기준 시계 실행 파일
   launch_component_terminal.sh   수집 터미널 열기
   run_component_foreground.sh    수집 실행·로그·정상 종료 제어
+  run_main_live.sh               main_live.py 실행, 오류로 끝나면 자동 재시작 (분석 터미널이 사용)
   attach_component_terminal.sh   원격 데스크톱에서 수집 터미널 연결
   resolve_recording_storage.sh   외장 SSD와 저장 경로 확인
   config.yaml      카메라, GPS, 저장 위치 등 수집 설정
@@ -163,6 +164,9 @@ sudo reboot
   `./download_models.sh`를 실행하면 됩니다. Hugging Face의 모델을 바꾸면 스크립트의 sha256도 바꿔야 합니다.
 - 자동 실행: `~/.config/autostart/porthole-analysis-terminal.desktop`을 등록해 자동 로그인 후
   수집 터미널과 별도로 탐지 터미널이 열립니다. 창을 닫거나 Ctrl+C를 누르면 탐지만 종료합니다.
+- 자동 재시작: `main_live.py`가 오류로 끝나면 10초 뒤 다시 시작합니다(계속 실패하면 최대 60초 간격).
+  NPU 장치가 리셋되면 DEEPX 런타임이 프로그램을 직접 종료하고, DEEPX 서비스가 다시 뜨는 동안에는
+  시작할 수 없기 때문입니다. 저장된 진행 위치부터 이어서 분석하므로 빠지는 프레임은 없습니다.
 - 끄기: `./install_detection.sh --disable`
 
 DEEPX 런타임은 이 스크립트가 설치하지 않습니다. NPU 카드와 DEEPX 런타임(dx-runtime)을 먼저 설치하세요.

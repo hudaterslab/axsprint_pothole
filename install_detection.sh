@@ -96,7 +96,7 @@ preflight() {
     fi
   fi
   local file
-  for file in main_live.py download_models.sh launch_component_terminal.sh \
+  for file in main_live.py run_main_live.sh download_models.sh launch_component_terminal.sh \
     run_component_foreground.sh deploy/porthole-analysis-terminal.desktop; do
     [[ -e "$SRC_DIR/$file" ]] || die "missing $SRC_DIR/$file"
   done

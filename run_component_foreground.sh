@@ -268,8 +268,9 @@ EOF
     rm -f -- "$ptp_pid_file"
     /usr/bin/sudo -n /usr/local/sbin/ptp-pothole-collector-foreground &
   elif [[ "$COMPONENT" == "analysis" ]]; then
+    # run_main_live.sh restarts main_live.py after an error exit (e.g. an NPU reset).
     (cd "$SCRIPT_DIR" && exec /usr/bin/env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-      /usr/bin/nice -n 15 /usr/bin/ionice -c 3 /usr/bin/python3 -u "$SCRIPT_DIR/main_live.py") &
+      /usr/bin/nice -n 15 /usr/bin/ionice -c 3 "$SCRIPT_DIR/run_main_live.sh") &
   else
     "$LEGACY_COMPONENT_DIR/upload_runs_to_171.sh" --watch &
   fi
