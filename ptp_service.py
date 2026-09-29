@@ -4,7 +4,6 @@ No system clock writes. Both PHCs use the same CLOCK_REALTIME reference.
 Requires linuxptp 3.1.1+, root, and exclusive ownership of these PTP interfaces.
 """
 
-import argparse
 import fcntl
 import json
 import os
@@ -18,11 +17,11 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent / "app"))
 from ptp import enable_sensors, camera_command
 
+# TAI - UTC in seconds, advertised in every Announce; changes only with a leap second.
+UTC_OFFSET = 37
+
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--utc-offset", type=int, default=37)
-    a = p.parse_args()
     base = Path(__file__).resolve().parent
     if os.geteuid() != 0:
         raise SystemExit("Run with sudo")
@@ -137,7 +136,7 @@ logging_level 6
                     "-c",
                     "/dev/" + phc,
                     "-O",
-                    str(a.utc_offset),
+                    str(UTC_OFFSET),
                     "-P",
                     "0.1",
                     "-I",
@@ -167,7 +166,7 @@ logging_level 6
             return
         setting = (
             "SET GRANDMASTER_SETTINGS_NP clockClass 248 clockAccuracy 0xfe offsetScaledLogVariance 0xffff "
-            f"currentUtcOffset {a.utc_offset} leap61 0 leap59 0 currentUtcOffsetValid 1 "
+            f"currentUtcOffset {UTC_OFFSET} leap61 0 leap59 0 currentUtcOffsetValid 1 "
             "ptpTimescale 1 timeTraceable 0 frequencyTraceable 0 timeSource 0x50"
         )
         result = subprocess.run(
@@ -206,7 +205,7 @@ logging_level 6
                 dict(
                     started_utc_ns=time.time_ns(),
                     grandmaster_reference="common CLOCK_REALTIME; bounded hardware discipline",
-                    utc_offset=a.utc_offset,
+                    utc_offset=UTC_OFFSET,
                     port_clock_validation="PTP_SYS_OFFSET_PRECISE",
                     max_phc_frequency_ppb=200000,
                     interfaces=["enp1s0", "enp2s0"],

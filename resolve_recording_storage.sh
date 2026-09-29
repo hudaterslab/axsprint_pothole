@@ -5,10 +5,10 @@ set -euo pipefail
 # have a different UUID every time, but it must be an ext4 USB partition whose
 # filesystem label is "porthole".  Never fall back to the internal system disk.
 
-STORAGE_LABEL="${PORTHOLE_STORAGE_LABEL:-porthole}"
-DEFAULT_MOUNT="${PORTHOLE_SAVE_MOUNT:-/mnt/ssd}"
-RUNS_SUBDIR="${PORTHOLE_RUNS_SUBDIR:-porthole_runs}"
-WAIT_SEC="${PORTHOLE_STORAGE_WAIT_SEC:-90}"
+STORAGE_LABEL="porthole"
+DEFAULT_MOUNT="/mnt/ssd"
+RUNS_SUBDIR="porthole_runs"
+WAIT_SEC=90
 
 fail() {
   echo "[storage] ERROR: $*" >&2

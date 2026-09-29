@@ -11,11 +11,9 @@ import signal
 import shutil
 import socket
 import struct
-import subprocess
 import threading
 import time
 from glob import glob
-from collections import deque
 from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime
@@ -23,11 +21,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict
 
-os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
-os.environ.setdefault("OPENCV_FFMPEG_DEBUG", "0")
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;3000000")
-
-import cv2
 import yaml
 
 import lidar as xt32_packet
@@ -35,13 +28,11 @@ from camera import CameraCapture
 from ptp import GUARD, NS, native_to_utc
 from lidar import LinkHeaderBuilder, PcapLidarWriter, xt32_clock
 
-CONFIG_PATH = os.environ.get(
-    "CONFIG_PATH", str(Path(__file__).resolve().parents[1] / "config.yaml")
-)
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
 
-def load_config(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
+def load_config(path: Path) -> Dict[str, Any]:
+    if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
 
     with open(path, "r", encoding="utf-8") as file:
@@ -66,52 +57,7 @@ def config_bool(key: str, default: bool) -> bool:
 
 config = load_config(CONFIG_PATH)
 
-# This runtime deliberately supports only the deployed PTP/PCAP pipeline.
-for key, expected in {
-    "camera_read_mode": "gstreamer_vaapi",
-    "camera_manifest_timestamp": "capture",
-    "lidar_save_mode": "continuous",
-    "lidar_storage_format": "pcap",
-    "save_raw_video_copy": False,
-    "camera_decode_enabled": True,
-    "show_window": False,
-    "drop_bad_frames": False,
-    "lidar_pcap_gzip": False,
-    "lidar_camera_offset_sec": 0.0,
-}.items():
-    if config.get(key, expected) != expected:
-        raise ValueError(f"{key} must be {expected!r} for PTP collection")
-
-
-def resolve_save_dir(
-    settings: Dict[str, Any],
-    config_path: str | Path = CONFIG_PATH,
-) -> Path:
-    """Resolve save_dir consistently relative to the configuration file."""
-    # The foreground supervisor resolves the one safe external USB drive at
-    # startup.  Its environment override takes precedence over the static
-    # config path; direct/manual runs keep using config.yaml unchanged.
-    raw_value = os.environ.get("PORTHOLE_SAVE_DIR")
-    if raw_value is None:
-        raw_value = settings.get("save_dir", settings.get("runs_dir", "runs"))
-    value = str(raw_value or "").strip()
-    if not value:
-        raise ValueError("save_dir must not be empty")
-    path = Path(os.path.expandvars(value)).expanduser()
-    if not path.is_absolute():
-        path = Path(config_path).expanduser().resolve().parent / path
-    return path.resolve()
-
-
-RTSP_PROFILE = str(config.get("rtsp_profile", "main")).strip().lower()
-if RTSP_PROFILE in {"low", "sub", "substream"}:
-    RTSP_URL = (
-        config.get("rtsp_url_low") or config.get("rtsp_substream_url") or config.get("rtsp_url")
-    )
-else:
-    RTSP_URL = config.get("rtsp_url_main") or config.get("rtsp_url")
-CAMERA_READ_MODE = str(config.get("camera_read_mode", "gstreamer_vaapi")).lower()
-CAMERA_LATEST_FRAME_ENABLED = config_bool("camera_latest_frame_enabled", True)
+RTSP_URL = config.get("rtsp_url")
 CAMERA_FRAME_BUFFER_SIZE = max(1, int(config.get("camera_frame_buffer_size", 8)))
 CAMERA_WATCHDOG_SEC = float(config.get("camera_watchdog_sec", 30.0))
 CAMERA_CONNECTION_TIMEOUT_SEC = float(config.get("camera_connection_timeout_sec", 1.0))
@@ -122,17 +68,8 @@ JPEG_QUALITY = int(config.get("jpeg_quality", 80))
 # false keeps OpenCV CPU encoding in the collector.
 CAMERA_GPU_JPEG = config_bool("camera_gpu_jpeg", True)
 FRAME_SAVE_FPS = float(config.get("frame_save_fps", 5.0))
-CAMERA_ASYNC_WRITE = config_bool("camera_async_write", True)
 CAMERA_WRITE_QUEUE_SIZE = int(config.get("camera_write_queue_size", 128))
-SHOW_WINDOW = bool(config.get("show_window", False))
-CAMERA_DECODE_ENABLED = bool(config.get("camera_decode_enabled", True))
-SAVE_RAW_VIDEO_COPY = bool(config.get("save_raw_video_copy", config.get("save_raw_video", False)))
-BBOX_FLIP_X = config_bool("bbox_flip_x", False)
-DISPLAY_FLIP_X = config_bool("display_flip_x", False)
-BBOX_SOURCE_SIZE = str(config.get("bbox_source_size", "") or "")
-BBOX_LETTERBOX_SIZE = str(config.get("bbox_letterbox_size", "") or "")
 
-LIDAR_ENABLED = bool(config.get("lidar_enabled", True))
 LIDAR_BIND_IP = config.get("lidar_bind_ip", "0.0.0.0")
 LIDAR_UDP_PORT = int(config.get("lidar_udp_port", 2368))
 LIDAR_LOG_INTERVAL_SEC = float(config.get("lidar_log_interval_sec", 5))
@@ -143,17 +80,9 @@ LIDAR_SOCKET_RCVBUF_BYTES = int(config.get("lidar_socket_rcvbuf_bytes", 4 * 1024
 LIDAR_FOV_FILTER_ENABLED = bool(config.get("lidar_fov_filter_enabled", False))
 LIDAR_CAMERA_FORWARD_OFFSET_DEG = float(config.get("camera_forward_offset_deg", 0.0))
 LIDAR_H_MARGIN_DEG = float(config.get("lidar_h_margin_deg", 55.0))
-LIDAR_SAVE_MODE = str(config.get("lidar_save_mode", "continuous")).lower()
-LIDAR_CAMERA_OFFSET_SEC = float(config.get("lidar_camera_offset_sec", 0.0))
-LIDAR_STORAGE_FORMAT = str(config.get("lidar_storage_format", "pcap")).lower()
 LIDAR_PCAP_SECONDS = float(config.get("lidar_pcap_seconds", 10.0))
-LIDAR_PCAP_GZIP = config_bool("lidar_pcap_gzip", False)
 LIDAR_PCAP_QUEUE_SIZE = int(config.get("lidar_pcap_queue_size", 8))
-# SO_TIMESTAMPNS puts the kernel's receive time on each datagram, which removes
-# the Python scheduling delay between the packet arriving and recvfrom returning.
-LIDAR_KERNEL_TIMESTAMP = config_bool("lidar_kernel_timestamp", True)
 
-GPS_ENABLED = config_bool("gps_enabled", False)
 GPS_DEVICE = str(config.get("gps_device", "/dev/ttyUSB0")).strip()
 GPS_PREFERRED_DEVICE = str(config.get("gps_preferred_device", "")).strip()
 GPS_BAUDRATE = int(config.get("gps_baudrate", 115200))
@@ -161,19 +90,7 @@ GPS_CONNECTION_TIMEOUT_SEC = float(config.get("gps_connection_timeout_sec", 3.0)
 GPS_RECONNECT_INITIAL_SEC = float(config.get("gps_reconnect_initial_sec", 1.0))
 GPS_RECONNECT_MAX_SEC = float(config.get("gps_reconnect_max_sec", 30.0))
 
-# --- camera capture clock ------------------------------------------------
-# The RTSP presentation timestamp is the camera's own sampling clock.  Host
-# arrival time is that plus a delay which varies by hundreds of milliseconds,
-# so PTS is the only field that preserves the spacing between frames.
-CAMERA_PTS_ENABLED = config_bool("camera_pts_enabled", True)
-# How fast the offset floor may rise. Covers camera-vs-host crystal drift
-# (measured 0.23 ms/h) without letting sampling luck move the estimate.
-CAMERA_DURABLE_WRITES = config_bool("camera_durable_writes", True)
-# "capture" puts the PTS-derived time in the manifest's `timestamp`; "arrival"
-# keeps the old host-arrival meaning.  Both values are always recorded.
-CAMERA_MANIFEST_TIMESTAMP = str(config.get("camera_manifest_timestamp", "capture")).strip().lower()
-
-# 0 disables rotation and keeps one folder per power-on (the old behaviour).
+# Folders rotate on calendar-aligned boundaries of this many minutes.
 RUN_ROTATION_MINUTES = float(config.get("run_rotation_minutes", 60.0))
 
 # How early the next folder is created and handed to the writers.  It only has
@@ -188,19 +105,15 @@ CAMERA_HANDOVER_GRACE_SEC = float(config.get("camera_handover_grace_sec", 5.0))
 STORAGE_PREFLIGHT_MIB = int(config.get("storage_preflight_mib", 4))
 STORAGE_MIN_WRITE_MIBS = float(config.get("storage_min_write_mibs", 15.0))
 
-RECORD_ENABLED = bool(config.get("record_enabled", True))
-SAVE_DIR = resolve_save_dir(config)
-# 이전 도구가 참조하는 이름을 깨지 않기 위한 호환 alias.
-RUNS_DIR = SAVE_DIR
-SAVE_FRAMES = bool(config.get("save_frames", True))
-SAVE_LIDAR_RAW = bool(config.get("save_lidar_raw", True))
+# The foreground launcher runs the collector with a clean environment, so the
+# recording location comes from config.yaml only.
+SAVE_DIR = Path(config["save_dir"]).resolve()
 
 MIN_FREE_GB = float(config.get("min_free_gb", 5.0))
 DISK_CHECK_INTERVAL_SEC = float(config.get("disk_check_interval_sec", 30.0))
 HEALTH_LOG_INTERVAL_SEC = float(config.get("health_log_interval_sec", 60.0))
 HEALTH_WARN_CPU_TEMP_C = float(config.get("health_warn_cpu_temp_c", 80.0))
 CAMERA_WARMUP_SEC = float(config.get("camera_warmup_sec", 1.5))
-DROP_BAD_FRAMES = bool(config.get("drop_bad_frames", True))
 
 if not RTSP_URL:
     raise ValueError("config.yaml is missing rtsp_url")
@@ -231,15 +144,13 @@ if (
     or GPS_RECONNECT_MAX_SEC < GPS_RECONNECT_INITIAL_SEC
 ):
     raise ValueError("sensor reconnect delays are invalid")
-if GPS_ENABLED and (not GPS_DEVICE or GPS_BAUDRATE <= 0):
+if not GPS_DEVICE or GPS_BAUDRATE <= 0:
     raise ValueError("gps_device/gps_baudrate settings are invalid")
 
 
 if LIDAR_PCAP_SECONDS <= 0:
     raise ValueError("lidar_pcap_seconds must be greater than 0")
-if RUN_ROTATION_MINUTES < 0:
-    raise ValueError("run_rotation_minutes must be 0 (off) or positive")
-if RUN_ROTATION_MINUTES > 0 and 1440 % RUN_ROTATION_MINUTES != 0:
+if RUN_ROTATION_MINUTES <= 0 or 1440 % RUN_ROTATION_MINUTES != 0:
     # Boundaries are aligned to the calendar day so folder names stay
     # predictable; a period that does not divide a day would drift.
     raise ValueError("run_rotation_minutes must divide 1440 evenly (e.g. 1, 5, 15, 30, 60)")
@@ -252,23 +163,18 @@ def rotation_period_sec() -> float:
 def run_id_for(timestamp: float) -> str:
     """Folder name for the rotation slot a timestamp belongs to.
 
-    Rotation off keeps the historical power-on name.  Hourly rotation names the
-    folder after the hour it covers, so 20260818_15 always means 15:00-16:00
-    local time no matter when the collector started.
+    Hourly rotation names the folder after the hour it covers, so 20260818_15
+    always means 15:00-16:00 local time no matter when the collector started.
     """
     moment = datetime.fromtimestamp(timestamp)
-    if RUN_ROTATION_MINUTES <= 0:
-        return moment.strftime("%Y%m%d_%H%M%S")
     if RUN_ROTATION_MINUTES >= 60:
         return moment.strftime("%Y%m%d_%H")
     slot = (moment.minute // int(RUN_ROTATION_MINUTES)) * int(RUN_ROTATION_MINUTES)
     return f"{moment:%Y%m%d_%H}{slot:02d}"
 
 
-def next_rotation_time(timestamp: float) -> float | None:
+def next_rotation_time(timestamp: float) -> float:
     """Wall-clock instant when the current folder stops accepting data."""
-    if RUN_ROTATION_MINUTES <= 0:
-        return None
     moment = datetime.fromtimestamp(timestamp)
     midnight = moment.replace(hour=0, minute=0, second=0, microsecond=0)
     period = rotation_period_sec()
@@ -278,19 +184,9 @@ def next_rotation_time(timestamp: float) -> float | None:
 
 def acquire_collector_lock():
     """Hold a host-wide lock so two collectors cannot share sensors/run files."""
-    try:
-        import fcntl
-    except ImportError as error:
-        raise RuntimeError(
-            "collect_data.py single-instance locking requires Linux fcntl"
-        ) from error
+    import fcntl
 
-    lock_path = Path(
-        os.environ.get(
-            "PORTHOLE_COLLECTOR_LOCK",
-            "/tmp/porthole_collect_data.lock",
-        )
-    )
+    lock_path = Path("/tmp/porthole_collect_data.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+", encoding="ascii")
     try:
@@ -396,25 +292,6 @@ def read_cpu_temperature_c() -> float | None:
     return max(temperatures) if temperatures else None
 
 
-def read_cpu_throttled_status() -> str | None:
-    """Return Raspberry Pi/CM throttling flags when vcgencmd is available."""
-    executable = shutil.which("vcgencmd")
-    if not executable:
-        return None
-    try:
-        result = subprocess.run(
-            [executable, "get_throttled"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    output = (result.stdout or "").strip()
-    return output or None
-
-
 class SystemMetricsSampler:
     """Collect potentially slow OS/firmware metrics away from the capture loop."""
 
@@ -439,7 +316,6 @@ class SystemMetricsSampler:
                 "process_rss_mib": read_process_rss_mib(),
                 "load_average": load_average,
                 "cpu_temperature_c": read_cpu_temperature_c(),
-                "cpu_throttled_status": read_cpu_throttled_status(),
             }
             with self.lock:
                 self.values = sample
@@ -455,14 +331,12 @@ class SystemMetricsSampler:
 
 
 def fsync_directory(path: Path) -> None:
-    """Persist a rename/directory entry when the platform supports it."""
-    if os.name == "nt":
-        return
+    """Persist a rename/directory entry (best effort)."""
     descriptor = None
     try:
-        descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        descriptor = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
         os.fsync(descriptor)
-    except (OSError, AttributeError):
+    except OSError:
         pass
     finally:
         if descriptor is not None:
@@ -671,7 +545,7 @@ class GpsNmeaRecorder:
         self,
         device: str,
         baudrate: int,
-        recorder: "RunRecorder | None",
+        recorder: "RunRecorder",
         preferred_device: str = "",
     ):
         self.device = str(device)
@@ -692,9 +566,6 @@ class GpsNmeaRecorder:
         self.last_sentence_timestamp = None
         self.last_valid_fix_timestamp = None
         self.latest_valid_fix = None
-        # A bounded history lets a consumer pick the fix that existed at a
-        # given moment rather than the newest one.
-        self.valid_fix_history = deque(maxlen=2048)
         self.transport_errors = []
         self.storage_errors = []
         self.storage_disabled = False
@@ -709,23 +580,21 @@ class GpsNmeaRecorder:
         )
         self.thread.start()
 
-    def rebind_recorder(self, recorder: "RunRecorder", boundary: float | None = None):
+    def rebind_recorder(self, recorder: "RunRecorder", boundary: float):
         """Ask the reader thread to reopen its log in a new run folder.
 
-        With a boundary, the switch waits until a sentence's own receive time
-        crosses it, so a sentence received just before the hour is not filed
-        under the next one.  The switch happens in the reader thread between
+        The switch waits until a sentence's own receive time crosses the
+        boundary, so a sentence received just before it is not filed under the
+        next folder.  The switch happens in the reader thread between
         sentences, so no partially written line is split across two files.
         """
         with self.lock:
             self.pending_recorder = recorder
-            self.pending_boundary = None if boundary is None else float(boundary)
+            self.pending_boundary = float(boundary)
 
     def _configure_serial(self, fd: int):
-        try:
-            import termios
-        except ImportError as exc:
-            raise RuntimeError("GPS serial input requires Linux termios") from exc
+        import termios
+
         speed_name = f"B{self.baudrate}"
         speed = getattr(termios, speed_name, None)
         if speed is None:
@@ -833,7 +702,7 @@ class GpsNmeaRecorder:
         with self.lock:
             pending = self.pending_recorder
             boundary = self.pending_boundary
-        if pending is not None and (boundary is None or received_timestamp >= boundary):
+        if pending is not None and received_timestamp >= boundary:
             with self.lock:
                 self.pending_recorder = None
                 self.pending_boundary = None
@@ -854,23 +723,17 @@ class GpsNmeaRecorder:
                 self.valid_fix_count += 1
                 self.last_valid_fix_timestamp = received_timestamp
                 self.latest_valid_fix = dict(record)
-                self.valid_fix_history.append(dict(record))
         return self._record(record, handle)
 
     def _run(self):
         handle = None
-        if self.recorder is not None:
-            try:
-                handle = self.recorder.gps_jsonl.open(
-                    "a",
-                    encoding="utf-8",
-                    buffering=1,
-                )
-            except OSError as exc:
-                with self.lock:
-                    self.storage_errors.append(f"{type(exc).__name__}: {exc}")
-                    self.storage_disabled = True
-                print(f"[GPS WARN] cannot open GPS log: {exc}", flush=True)
+        try:
+            handle = self.recorder.gps_jsonl.open("a", encoding="utf-8", buffering=1)
+        except OSError as exc:
+            with self.lock:
+                self.storage_errors.append(f"{type(exc).__name__}: {exc}")
+                self.storage_disabled = True
+            print(f"[GPS WARN] cannot open GPS log: {exc}", flush=True)
 
         buffer = bytearray()
         reconnect_attempt = 0
@@ -937,18 +800,6 @@ class GpsNmeaRecorder:
             opened = self.fd is not None
         return bool(opened and device and os.path.exists(device))
 
-    def latest_sentence_time(self) -> float:
-        with self.lock:
-            return float(self.last_sentence_timestamp or 0.0)
-
-    def valid_fix_at_or_before(self, timestamp: float) -> dict | None:
-        target = float(timestamp)
-        with self.lock:
-            for fix in reversed(self.valid_fix_history):
-                if float(fix.get("timestamp") or 0.0) <= target:
-                    return dict(fix)
-        return None
-
     def stats(self) -> dict:
         with self.lock:
             latest_fix = None if self.latest_valid_fix is None else dict(self.latest_valid_fix)
@@ -987,7 +838,7 @@ def normalize_angle_deg(angle: float) -> float:
 # Linux SO_TIMESTAMPNS: the kernel attaches a struct timespec to each datagram.
 SO_TIMESTAMPNS = getattr(socket, "SO_TIMESTAMPNS", 35)
 _TIMESPEC = struct.Struct("qq")
-CMSG_TIMESTAMP_SPACE = socket.CMSG_SPACE(_TIMESPEC.size) if hasattr(socket, "CMSG_SPACE") else 64
+CMSG_TIMESTAMP_SPACE = socket.CMSG_SPACE(_TIMESPEC.size)
 
 
 def _kernel_receive_time(ancdata) -> float | None:
@@ -1029,22 +880,12 @@ def lidar_payload_within_fov(
     live traffic, the old block-level crop kept 44,606 of 100,006 datagrams at
     an average of 1077 of 1080 bytes.  Dropping by datagram gives the same
     saving and leaves every stored packet intact.
+
+    payload is a full 1080-byte datagram: xt32_clock() rejects anything else.
     """
-    if len(payload) == xt32_packet.FULL_PACKET_SIZE:
-        # Same test as the loop below, looked up per raw azimuth word.
-        inside = _fov_table(forward_offset_deg, h_margin_deg)
-        for azimuth in _BLOCK_AZIMUTHS.unpack_from(payload, xt32_packet.PACKET_HEADER_SIZE):
-            if inside[azimuth]:
-                return True
-        return False
-    header_size = xt32_packet.PACKET_HEADER_SIZE
-    block_size = xt32_packet.BLOCK_SIZE
-    body_end = len(payload)
-    if xt32_packet.has_tail(payload):
-        body_end -= xt32_packet.TAIL_SIZE
-    for offset in range(header_size, body_end - block_size + 1, block_size):
-        azimuth_deg = struct.unpack_from("<H", payload, offset)[0] / 100.0
-        if abs(normalize_angle_deg(azimuth_deg - forward_offset_deg)) <= h_margin_deg:
+    inside = _fov_table(forward_offset_deg, h_margin_deg)
+    for azimuth in _BLOCK_AZIMUTHS.unpack_from(payload, xt32_packet.PACKET_HEADER_SIZE):
+        if inside[azimuth]:
             return True
     return False
 
@@ -1137,19 +978,13 @@ class RunRecorder:
                 "camera_gop_size": config.get("camera_gop_size"),
                 "camera_rc_type": config.get("camera_rc_type"),
                 "camera_h264_profile": config.get("camera_h264_profile"),
-                "camera_latest_frame_enabled": CAMERA_LATEST_FRAME_ENABLED,
                 "camera_frame_buffer_size": CAMERA_FRAME_BUFFER_SIZE,
                 "camera_connection_timeout_sec": CAMERA_CONNECTION_TIMEOUT_SEC,
                 "camera_watchdog_sec": CAMERA_WATCHDOG_SEC,
                 "camera_reconnect_initial_sec": CAMERA_RECONNECT_INITIAL_SEC,
                 "camera_reconnect_max_sec": CAMERA_RECONNECT_MAX_SEC,
                 "frame_save_fps": FRAME_SAVE_FPS,
-                "camera_async_write": CAMERA_ASYNC_WRITE,
                 "camera_write_queue_size": CAMERA_WRITE_QUEUE_SIZE,
-                "bbox_flip_x": BBOX_FLIP_X,
-                "display_flip_x": DISPLAY_FLIP_X,
-                "bbox_source_size": BBOX_SOURCE_SIZE,
-                "bbox_letterbox_size": BBOX_LETTERBOX_SIZE,
                 "lidar_udp": f"{LIDAR_BIND_IP}:{LIDAR_UDP_PORT}",
                 "lidar_socket_rcvbuf_requested_bytes": LIDAR_SOCKET_RCVBUF_BYTES,
                 "lidar_connection_timeout_sec": LIDAR_CONNECTION_TIMEOUT_SEC,
@@ -1158,18 +993,8 @@ class RunRecorder:
                 "lidar_fov_filter_enabled": LIDAR_FOV_FILTER_ENABLED,
                 "camera_forward_offset_deg": LIDAR_CAMERA_FORWARD_OFFSET_DEG,
                 "lidar_h_margin_deg": LIDAR_H_MARGIN_DEG,
-                "lidar_save_mode": LIDAR_SAVE_MODE,
-                "lidar_camera_offset_sec": LIDAR_CAMERA_OFFSET_SEC,
-                "lidar_storage_format": LIDAR_STORAGE_FORMAT,
                 "lidar_pcap_seconds": LIDAR_PCAP_SECONDS,
-                "lidar_pcap_gzip": LIDAR_PCAP_GZIP,
-                "lidar_kernel_timestamp": LIDAR_KERNEL_TIMESTAMP,
-                "camera_pts_enabled": CAMERA_PTS_ENABLED,
                 "camera_handover_grace_sec": CAMERA_HANDOVER_GRACE_SEC,
-                "camera_manifest_timestamp": CAMERA_MANIFEST_TIMESTAMP,
-                "camera_durable_writes": CAMERA_DURABLE_WRITES,
-                "camera_read_mode": CAMERA_READ_MODE,
-                "gps_enabled": GPS_ENABLED,
                 "gps_device": GPS_DEVICE,
                 "gps_preferred_device": GPS_PREFERRED_DEVICE,
                 "gps_baudrate": GPS_BAUDRATE,
@@ -1197,9 +1022,7 @@ LIDAR_CLOCK_RECORD = struct.Struct("<QQQII")
 class LidarRawRecorder:
     """LiDAR UDP raw packet만 파일에 덤프한다. 파싱/좌표변환은 하지 않는다."""
 
-    def __init__(
-        self, bind_ip: str, port: int, log_interval_sec: float, recorder: "RunRecorder | None"
-    ):
+    def __init__(self, bind_ip: str, port: int, log_interval_sec: float, recorder: "RunRecorder"):
         self.bind_ip = bind_ip
         self.port = port
         self.log_interval_sec = log_interval_sec
@@ -1215,17 +1038,12 @@ class LidarRawRecorder:
         self.dropped_packet_count = 0
         self.kernel_drop_count = 0
         self.socket_rcvbuf_bytes = 0
-        self.frame_window_count = 0
-        self.frame_window_empty_count = 0
         self.pcap_writer = None
         self.pending_recorder = None
         self.pending_boundary = None
         self.pcap_peer = LinkHeaderBuilder(dst_port=int(port))
         self.peer_known = False
         self.sequence_tracker = xt32_packet.SequenceTracker()
-        self.clock_tracker = xt32_packet.ClockOffsetTracker()
-        self.tail_present_count = 0
-        self.tail_missing_count = 0
         self.kernel_timestamp_count = 0
         self.kernel_timestamp_available = False
         self.rotation_count = 0
@@ -1244,15 +1062,12 @@ class LidarRawRecorder:
         self.clock_path = None
         self.clock_file = None
 
-    def _open_storage(self):
-        if self.recorder is None or not SAVE_LIDAR_RAW:
-            return
-        self.pcap_writer = PcapLidarWriter(
-            self.recorder.lidar_pcap_dir,
+    def _new_writer(self, recorder: "RunRecorder") -> PcapLidarWriter:
+        return PcapLidarWriter(
+            recorder.lidar_pcap_dir,
+            self.pcap_peer,
             seconds_per_file=LIDAR_PCAP_SECONDS,
-            gzip_output=LIDAR_PCAP_GZIP,
             max_pending=LIDAR_PCAP_QUEUE_SIZE,
-            peer=self.pcap_peer,
         )
 
     def schedule_rotation(self, recorder: "RunRecorder", boundary: float):
@@ -1268,42 +1083,20 @@ class LidarRawRecorder:
             self.pending_boundary = float(boundary)
 
     def _apply_pending_rotation_locked(self, timestamp: float) -> bool:
-        """Swap writers if this packet belongs to the next folder. Lock held."""
+        """Swap writers if this packet belongs to the next folder. Lock held.
+
+        The new writer is swapped in first; the old one is closed afterwards on
+        a helper thread.  Closing joins a writer thread and can take seconds
+        under disk load, and the receive loop must not wait for it.
+        """
         if self.pending_recorder is None or timestamp < self.pending_boundary:
             return False
         recorder = self.pending_recorder
         self.pending_recorder = None
         self.pending_boundary = None
-        self._swap_storage_locked(recorder)
-        return True
-
-    def rebind_recorder(self, recorder: "RunRecorder"):
-        """Point storage at a new run folder without pausing reception.
-
-        The new writer is opened and swapped in first; the old one is closed
-        afterwards on a helper thread.  Closing joins a writer thread and can
-        take seconds under disk load, and the receive loop must not wait for it.
-        """
-        if not SAVE_LIDAR_RAW:
-            self.recorder = recorder
-            return
-        with self.storage_lock:
-            self._swap_storage_locked(recorder)
-
-    def _swap_storage_locked(self, recorder: "RunRecorder"):
-        if not SAVE_LIDAR_RAW:
-            self.recorder = recorder
-            return
-        previous = None
         self.recorder = recorder
         previous = self.pcap_writer
-        self.pcap_writer = PcapLidarWriter(
-            recorder.lidar_pcap_dir,
-            seconds_per_file=LIDAR_PCAP_SECONDS,
-            gzip_output=LIDAR_PCAP_GZIP,
-            max_pending=LIDAR_PCAP_QUEUE_SIZE,
-            peer=self.pcap_peer,
-        )
+        self.pcap_writer = self._new_writer(recorder)
         with self.lock:
             self.rotation_count += 1
 
@@ -1316,10 +1109,8 @@ class LidarRawRecorder:
                         f"rotation close failed: {type(exc).__name__}: {exc}"
                     )
 
-        if previous is not None:
-            threading.Thread(
-                target=_close_previous, name="lidar-storage-close", daemon=True
-            ).start()
+        threading.Thread(target=_close_previous, name="lidar-storage-close", daemon=True).start()
+        return True
 
     def note_peer(self, addr):
         """Remember the sensor's address so synthesised pcap headers are real."""
@@ -1331,34 +1122,13 @@ class LidarRawRecorder:
             return
         self.peer_known = True
 
-    def start(self, external_source: bool = False):
-        """Start storage and optionally the built-in UDP receiver.
-
-        ``external_source=True`` is reserved for an external live source. Its
-        viewer already owns UDP/2368, so packets are fed through
-        :meth:`ingest_packet` instead of opening a second competing socket.
-        """
-        self._open_storage()
+    def start(self):
+        """Open storage and start the UDP receiver thread."""
+        self.pcap_writer = self._new_writer(self.recorder)
         self.stop_event.clear()
         self.running = True
-        if not external_source:
-            self.thread = threading.Thread(target=self._run, daemon=True)
-            self.thread.start()
-
-    def start_external(self):
-        self.start(external_source=True)
-
-    def update_transport_stats(
-        self,
-        socket_rcvbuf_bytes: int | None = None,
-        kernel_drop_count: int | None = None,
-    ):
-        """Attach socket health measured by an external UDP owner."""
-        with self.lock:
-            if socket_rcvbuf_bytes is not None:
-                self.socket_rcvbuf_bytes = int(socket_rcvbuf_bytes)
-            if kernel_drop_count is not None:
-                self.kernel_drop_count = max(self.kernel_drop_count, int(kernel_drop_count))
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
 
     def stop(self):
         self.running = False
@@ -1384,28 +1154,10 @@ class LidarRawRecorder:
                 "byte_count": self.byte_count,
                 "saved_packet_count": self.saved_packet_count,
                 "saved_byte_count": self.saved_byte_count,
+                # FoV-filtered datagrams, not UDP/kernel packet loss.
                 "fov_fully_filtered_datagram_count": self.dropped_packet_count,
-                # Backward-compatible internal name. These are FoV-filtered
-                # datagrams, not UDP/kernel packet loss.
-                "dropped_packet_count": self.dropped_packet_count,
                 "kernel_drop_count": self.kernel_drop_count,
                 "socket_rcvbuf_bytes": self.socket_rcvbuf_bytes,
-                "frame_window_count": self.frame_window_count,
-                "frame_window_empty_count": self.frame_window_empty_count,
-                "clock_step_count": 0,
-                "aligned_window_request_count": 0,
-                "aligned_non_anchor_count": 0,
-                "aligned_covered_count": 0,
-                "aligned_buffer_miss_count": 0,
-                "aligned_empty_count": 0,
-                "aligned_rejected_count": 0,
-                "aligned_duplicate_packets_skipped": 0,
-                "aligned_clock_invalid": False,
-                "aligned_continuous_fallback": False,
-                "fallback_trigger_timestamp": None,
-                "fallback_start_timestamp": None,
-                "fallback_reason": None,
-                "fallback_packet_count": 0,
                 "first_packet_timestamp": self.first_packet_timestamp,
                 "last_packet_timestamp": self.last_packet_timestamp,
                 "storage_errors": list(self.storage_errors),
@@ -1414,17 +1166,12 @@ class LidarRawRecorder:
                 "receiver_bound": self.receiver_bound,
                 "fatal_error": self.fatal_error,
                 "run_rotation_count": self.rotation_count,
-                "packet_tail_present_count": self.tail_present_count,
-                "packet_tail_missing_count": self.tail_missing_count,
                 "kernel_timestamp_available": self.kernel_timestamp_available,
                 "kernel_timestamp_count": self.kernel_timestamp_count,
                 "sensor_sequence": self.sequence_tracker.summary(),
-                "sensor_clock": self.clock_tracker.summary(),
             }
         if self.pcap_writer:
             result.update(self.pcap_writer.stats())
-        else:
-            result["storage_format"] = "pcap"
         with self.lock:
             result["received_packet_count"] = self.received_packet_count
             result["last_receive_timestamp"] = self.last_receive_timestamp
@@ -1440,12 +1187,7 @@ class LidarRawRecorder:
         with self.lock:
             return self.fatal_error
 
-    def _storage_enabled(self):
-        return self.pcap_writer is not None
-
     def _write_packet(self, timestamp: float, payload: bytes):
-        if not self._storage_enabled() or not payload:
-            return
         with self.storage_lock:
             self._apply_pending_rotation_locked(timestamp)
             self.pcap_writer.write_packet(timestamp, payload)
@@ -1453,21 +1195,19 @@ class LidarRawRecorder:
             self.saved_packet_count += 1
             self.saved_byte_count += len(payload)
 
-    def ingest_packet(self, timestamp, data, kernel_drop_count=None):
+    def ingest_packet(self, timestamp, data):
         """Accept only monotonic, PTP-qualified sensor time, then apply the whole-packet FoV."""
         with self.lock:
             self.last_receive_timestamp = timestamp
             self.received_packet_count += 1
-        if kernel_drop_count is not None:
-            self.update_transport_stats(kernel_drop_count=kernel_drop_count)
         okay, reason = GUARD.qualification()
         if not okay:
             GUARD.reject("lidar_" + reason)
             return
         try:
-            native, sequence, sensor_ts = xt32_clock(data)
+            native, sequence = xt32_clock(data)
             announce = GUARD.status()[1]
-            utc = native_to_utc(native, "ptp", announce)
+            utc = native_to_utc(native, announce)
         except ValueError:
             GUARD.reject("lidar_invalid_clock")
             return
@@ -1496,27 +1236,22 @@ class LidarRawRecorder:
                 )
             )
         timestamp = utc / NS
-        # xt32_clock() only accepts full packets, so the tail is always there.
         with self.lock:
-            self.tail_present_count += 1
             self.sequence_tracker.update(sequence)
-            self.clock_tracker.update(timestamp, sensor_ts)
-        save_data = data
-        if LIDAR_FOV_FILTER_ENABLED and not lidar_payload_within_fov(
+        save = not LIDAR_FOV_FILTER_ENABLED or lidar_payload_within_fov(
             data, LIDAR_CAMERA_FORWARD_OFFSET_DEG, LIDAR_H_MARGIN_DEG
-        ):
-            save_data = b""
-        if self._storage_enabled() and save_data:
-            self._write_packet(timestamp, save_data)
+        )
+        if save:
+            self._write_packet(timestamp, data)
         with self.lock:
             if self.first_packet_timestamp is None:
                 self.first_packet_timestamp = timestamp
             self.last_packet_timestamp = timestamp
             self.packet_count += 1
             self.byte_count += len(data)
-            if not save_data:
+            if not save:
                 self.dropped_packet_count += 1
-        return len(save_data)
+        return len(data) if save else 0
 
     def _run(self):
         retry_delay = LIDAR_RECONNECT_INITIAL_SEC
@@ -1529,27 +1264,23 @@ class LidarRawRecorder:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                if LIDAR_SOCKET_RCVBUF_BYTES > 0:
-                    sock.setsockopt(
-                        socket.SOL_SOCKET,
-                        socket.SO_RCVBUF,
-                        LIDAR_SOCKET_RCVBUF_BYTES,
-                    )
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, LIDAR_SOCKET_RCVBUF_BYTES)
                 actual_rcvbuf = int(sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))
                 sock.bind((self.bind_ip, self.port))
                 sock.settimeout(1)
                 socket_inode = linux_udp_socket_inode(sock)
+                # SO_TIMESTAMPNS puts the kernel's receive time on each datagram,
+                # without the Python scheduling delay before recvmsg returns.
                 kernel_stamps = False
-                if LIDAR_KERNEL_TIMESTAMP:
-                    try:
-                        sock.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
-                        kernel_stamps = True
-                    except OSError as exc:
-                        print(
-                            f"[LiDAR WARN] SO_TIMESTAMPNS unavailable ({exc}); "
-                            "falling back to user-space receive time",
-                            flush=True,
-                        )
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
+                    kernel_stamps = True
+                except OSError as exc:
+                    print(
+                        f"[LiDAR WARN] SO_TIMESTAMPNS unavailable ({exc}); "
+                        "falling back to user-space receive time",
+                        flush=True,
+                    )
                 with self.lock:
                     self.socket_rcvbuf_bytes = actual_rcvbuf
                     self.receiver_bound = True
@@ -1693,145 +1424,63 @@ def open_capture(url: str):
     )
 
 
-def capture_frame_info(capture, fallback_timestamp):
-    getter = getattr(capture, "get_last_frame_info", None)
-    if callable(getter):
-        info = dict(getter() or {})
-    else:
-        info = {}
-    arrival = float(info.get("arrival_timestamp") or fallback_timestamp)
-    result = {
-        "source_frame_id": info.get("source_frame_id"),
-        "arrival_timestamp": arrival,
-        "capture_mode": info.get("capture_mode", "synchronous"),
-    }
-    # Keep the camera-provided PTP/RTP capture metadata together.
-    for key in (
-        "capture_timestamp",
-        "arrival_monotonic",
-        "camera_pts",
-        "camera_pts_seconds",
-        "camera_time_base",
-        "pts_epoch_offset",
-        "pts_offset_converged",
-        "pts_samples_in_window",
-    ):
-        if key in info:
-            result[key] = info[key]
-    result.update(info)
-    return result
+# Camera counters summed over reconnects for run_finished.
+CAMERA_COUNTERS = (
+    "decoded_frames",
+    "delivered_frames",
+    "selected_frames",
+    "overwritten_frames",
+    "read_failures",
+    "pts_settling_skipped_frames",
+    "timestamp_backstep_dropped_frames",
+)
 
 
-def frame_reference_timestamp(frame_info: dict, fallback: float) -> float:
-    """The single time the rest of the collector treats as 'when the frame is'.
+def build_camera_frame_record(job: dict, saved_timestamp: float) -> dict:
+    """One frames.jsonl row. main_live reads these keys, so keep them stable.
 
-    Everything downstream - LiDAR window requests, save pacing - has to agree
-    on one clock, and this is where that choice is made.
+    Three different clocks, kept apart on purpose:
+      capture_timestamp - when the camera sampled the scene (PTP via RTCP)
+      arrival_timestamp - when the decoded frame reached this process
+      saved_timestamp   - when the JPEG hit the disk
     """
-    capture = frame_info.get("capture_timestamp")
-    if capture is None or CAMERA_MANIFEST_TIMESTAMP == "arrival":
-        return float(frame_info.get("arrival_timestamp") or fallback)
-    return float(capture)
-
-
-def merge_capture_stats(total, capture):
-    getter = getattr(capture, "stats", None)
-    stats = dict(getter() or {}) if callable(getter) else {"mode": "synchronous"}
-    total["sessions"] = total.get("sessions", 0) + 1
-    modes = total.setdefault("modes", [])
-    mode = str(stats.get("mode", "unknown"))
-    if mode not in modes:
-        modes.append(mode)
-    for key in (
-        "decoded_frames",
-        "delivered_frames",
-        "selected_frames",
-        "skipped_frames",
-        "overwritten_frames",
-        "read_failures",
-        "pts_missing_frames",
-        "pts_settling_skipped_frames",
-        "pts_settle_timeouts",
-        "pts_stream_resets",
-        "timestamp_backstep_dropped_frames",
-    ):
-        total[key] = total.get(key, 0) + int(stats.get(key, 0))
-    if mode in {"pyav_pts", "gstreamer_vaapi_pts"}:
-        total["pts_startup_settled"] = bool(
-            total.get("pts_startup_settled", True) and stats.get("pts_startup_settled", False)
-        )
-
-
-def build_camera_frame_record(
-    frame_index: int,
-    frame_timestamp: float,
-    collector_read_timestamp: float,
-    frame_info: dict,
-    saved_timestamp: float,
-    *,
-    lidar_anchor: bool = True,
-    camera_interval_sec: float | None = None,
-    camera_gap_detected: bool = False,
-):
-    frame_name = f"{int(frame_index):08d}.jpg"
-    # Three different clocks, kept apart on purpose:
-    #   capture_timestamp - when the camera sampled the scene (PTS-derived)
-    #   arrival_timestamp - when the decoded frame reached this process
-    #   saved_timestamp   - when the JPEG hit the disk
-    # `timestamp` names whichever of the first two the run was configured to
-    # treat as the frame's time; timestamp_source says which one it is.
-    arrival = float(frame_info.get("arrival_timestamp", frame_timestamp))
-    capture = frame_info.get("capture_timestamp")
-    timestamp_source = (
-        "camera_ptp_rtcp_utc"
-        if capture is not None and CAMERA_MANIFEST_TIMESTAMP == "capture"
-        else "host_arrival"
-    )
-    record = {
-        "frame_index": int(frame_index),
-        "timestamp": float(frame_timestamp),
-        "path": f"frames/{frame_name}",
-        "timestamp_source": timestamp_source,
-        "capture_timestamp": None if capture is None else float(capture),
-        "arrival_timestamp": arrival,
-        "arrival_monotonic": frame_info.get("arrival_monotonic"),
-        "camera_pts": frame_info.get("camera_pts"),
-        "camera_pts_seconds": frame_info.get("camera_pts_seconds"),
-        "camera_time_base": frame_info.get("camera_time_base"),
-        "pts_epoch_offset": frame_info.get("pts_epoch_offset"),
-        "pts_offset_converged": frame_info.get("pts_offset_converged"),
-        "pts_samples_in_window": frame_info.get("pts_samples_in_window"),
-        "collector_read_timestamp": float(collector_read_timestamp),
-        "saved_timestamp": float(saved_timestamp),
-        "frame_age_ms_at_read": max(
-            0.0,
-            (float(collector_read_timestamp) - arrival) * 1000.0,
-        ),
-        "source_frame_id": frame_info.get("source_frame_id"),
-        "capture_mode": frame_info.get("capture_mode", "synchronous"),
-        "camera_interval_sec": (
-            None if camera_interval_sec is None else float(camera_interval_sec)
-        ),
-        "camera_gap_detected": bool(camera_gap_detected),
+    info = job["frame_info"]
+    read_at = job["collector_read_timestamp"]
+    return {
+        "frame_index": job["frame_index"],
+        "timestamp": info["capture_timestamp"],
+        "path": f"frames/{job['frame_index']:08d}.jpg",
+        "timestamp_source": info["timestamp_source"],
+        "capture_timestamp": info["capture_timestamp"],
+        "arrival_timestamp": info["arrival_timestamp"],
+        "arrival_monotonic": info["arrival_monotonic"],
+        "camera_pts": info["camera_pts"],
+        "camera_pts_seconds": info["camera_pts_seconds"],
+        "camera_time_base": info["camera_time_base"],
+        "pts_epoch_offset": info["pts_epoch_offset"],
+        "pts_offset_converged": info["pts_offset_converged"],
+        "pts_samples_in_window": None,
+        "collector_read_timestamp": read_at,
+        "saved_timestamp": saved_timestamp,
+        "frame_age_ms_at_read": max(0.0, (read_at - info["arrival_timestamp"]) * 1000.0),
+        "source_frame_id": info["source_frame_id"],
+        "capture_mode": info["capture_mode"],
+        "camera_interval_sec": job["camera_interval_sec"],
+        "camera_gap_detected": job["camera_gap_detected"],
+        "timestamp_ns": info["timestamp_ns"],
+        "arrival_timestamp_ns": info["arrival_timestamp_ns"],
+        "camera_rtp_timestamp": info["camera_rtp_timestamp"],
+        "camera_ssrc": info["camera_ssrc"],
+        "ptp_grandmaster": info["ptp_grandmaster"],
     }
-    for key in (
-        "timestamp_ns",
-        "timestamp_source",
-        "arrival_timestamp_ns",
-        "camera_rtp_timestamp",
-        "camera_ssrc",
-        "ptp_grandmaster",
-    ):
-        record[key] = frame_info[key]
-    return record
 
 
 class CameraFrameWriter:
     """Encode on an ordered worker, then durably write JPEGs on another worker.
 
-    The queue absorbs short storage stalls caused by background uploads. Files
-    are renamed atomically before their JSONL record is appended, so uploaders
-    and post-processors never observe a manifest entry for a partial JPEG.
+    The queue absorbs short storage stalls. Files are renamed atomically
+    before their JSONL record is appended, so main_live never observes a
+    manifest entry for a partial JPEG.
     """
 
     def __init__(self, recorder: RunRecorder, queue_size: int):
@@ -1898,44 +1547,30 @@ class CameraFrameWriter:
         """Send later frames to a new run folder; queued ones keep their own."""
         self.recorder = recorder
 
-    def drain(self, timeout: float = 10.0) -> bool:
-        """Wait for queued JPEGs to land, so a folder is complete when sealed."""
-        deadline = time.monotonic() + max(0.0, timeout)
-        while time.monotonic() < deadline:
-            if self.jobs.unfinished_tasks == 0 and self.encode_jobs.unfinished_tasks == 0:
-                return True
-            time.sleep(0.02)
-        return self.jobs.unfinished_tasks == 0 and self.encode_jobs.unfinished_tasks == 0
-
     def enqueue(
         self,
         frame,
         frame_index: int,
-        frame_timestamp: float,
         collector_read_timestamp: float,
         frame_info: dict,
-        *,
-        lidar_anchor: bool = True,
-        camera_interval_sec: float | None = None,
-        camera_gap_detected: bool = False,
+        camera_interval_sec: float | None,
+        camera_gap_detected: bool,
     ):
         self._raise_if_failed()
         if self.closed:
             raise RuntimeError("camera frame writer is already closed")
         job = {
-            "frame_index": int(frame_index),
+            "frame_index": frame_index,
             "frame": frame,  # Transfer ownership; the caller must not mutate this array.
             # The destination is captured now, not read by the worker later, so
             # a folder rotation cannot move already-queued frames into the
             # next run.
             "frames_dir": self.recorder.frames_dir,
             "frames_jsonl": self.recorder.frames_jsonl,
-            "frame_timestamp": float(frame_timestamp),
-            "collector_read_timestamp": float(collector_read_timestamp),
-            "frame_info": dict(frame_info),
-            "lidar_anchor": bool(lidar_anchor),
+            "collector_read_timestamp": collector_read_timestamp,
+            "frame_info": frame_info,
             "camera_interval_sec": camera_interval_sec,
-            "camera_gap_detected": bool(camera_gap_detected),
+            "camera_gap_detected": camera_gap_detected,
         }
         if self.encode_jobs.full():
             with self.lock:
@@ -1975,6 +1610,8 @@ class CameraFrameWriter:
                         with self.lock:
                             self.gpu_encoded_frames += 1
                     else:
+                        import cv2  # CPU fallback only; the GPU path never loads OpenCV
+
                         started = time.perf_counter()
                         ok, encoded = cv2.imencode(
                             ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
@@ -2007,11 +1644,10 @@ class CameraFrameWriter:
     def _write_loop(self, sync_pool):
         manifest = None
         manifest_path = None
-        carry = None
+        held = []  # a barrier (callback or stop) taken while filling a batch
         while True:
-            first = carry if carry is not None else self.jobs.get()
-            carry = None
-            if first is None or "stop_after_batch" in first:
+            first = held.pop() if held else self.jobs.get()
+            if first is None:
                 if manifest is not None:
                     manifest.close()
                 self.jobs.task_done()
@@ -2029,18 +1665,11 @@ class CameraFrameWriter:
                     except queue.Empty:
                         break
                     if job is None or "callback" in job:
-                        # A separate flag is needed because None is a valid stop token.
-                        carry = job
-                        if job is None:
-                            carry = {"stop_after_batch": True}
+                        held.append(job)
                         break
                     batch.append(job)
             try:
                 self._raise_if_failed()
-                if "stop_after_batch" in first:
-                    if manifest is not None:
-                        manifest.close()
-                    return
                 if "callback" in first:
                     first["callback"]()
                     continue
@@ -2054,14 +1683,13 @@ class CameraFrameWriter:
                     for job in batch:
                         frame_name = f"{job['frame_index']:08d}.jpg"
                         frames_dir = job["frames_dir"]
-                        final_path = frames_dir / frame_name
                         temp_path = frames_dir / f"{frame_name}.tmp"
                         started = time.perf_counter()
                         handle = handles.enter_context(temp_path.open("wb"))
                         handle.write(job["jpeg"])
                         handle.flush()
                         self._timing("jpeg_write", started)
-                        pending_files.append((job, handle, temp_path, final_path))
+                        pending_files.append((job, handle, temp_path, frames_dir / frame_name))
 
                     def sync_one(handle):
                         started = time.perf_counter()
@@ -2069,34 +1697,20 @@ class CameraFrameWriter:
                         self._timing("jpeg_fsync", started)
 
                     started = time.perf_counter()
-                    if CAMERA_DURABLE_WRITES:
-                        futures = [
-                            sync_pool.submit(sync_one, handle) for _, handle, _, _ in pending_files
-                        ]
-                        # Wait for every fd before closing any handle, including
-                        # when one fsync failed. Never publish a failed batch.
-                        wait(futures)
-                        for future in futures:
-                            future.result()
+                    futures = [sync_pool.submit(sync_one, handle) for _, handle, _, _ in pending_files]
+                    # Wait for every fd before closing any handle, including
+                    # when one fsync failed. Never publish a failed batch.
+                    wait(futures)
+                    for future in futures:
+                        future.result()
                     self._timing("jpeg_fsync_batch", started)
-                    for job, handle, temp_path, final_path in pending_files:
+                    for job, _, temp_path, final_path in pending_files:
                         os.replace(temp_path, final_path)
                         directories.add(job["frames_dir"])
-                        record = build_camera_frame_record(
-                            job["frame_index"],
-                            job["frame_timestamp"],
-                            job["collector_read_timestamp"],
-                            job["frame_info"],
-                            time.time(),
-                            lidar_anchor=job["lidar_anchor"],
-                            camera_interval_sec=job["camera_interval_sec"],
-                            camera_gap_detected=job["camera_gap_detected"],
-                        )
-                        records.append((job, record))
+                        records.append((job, build_camera_frame_record(job, time.time())))
                 started = time.perf_counter()
-                if CAMERA_DURABLE_WRITES:
-                    for directory in directories:
-                        fsync_directory(directory)
+                for directory in directories:
+                    fsync_directory(directory)
                 self._timing("directory_fsync_batch", started)
                 started = time.perf_counter()
                 # Publish records only after every referenced JPEG and directory is durable.
@@ -2105,15 +1719,13 @@ class CameraFrameWriter:
                     if destination != manifest_path:
                         if manifest is not None:
                             manifest.flush()
-                            if CAMERA_DURABLE_WRITES:
-                                os.fsync(manifest.fileno())
+                            os.fsync(manifest.fileno())
                             manifest.close()
                         manifest = destination.open("a", encoding="utf-8")
                         manifest_path = destination
                     manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
                 manifest.flush()
-                if CAMERA_DURABLE_WRITES:
-                    os.fsync(manifest.fileno())
+                os.fsync(manifest.fileno())
                 self._timing("manifest_write_fsync_batch", started)
                 with self.lock:
                     self.written_frames += len(records)
@@ -2169,102 +1781,50 @@ class CameraFrameWriter:
             return None if not self.errors else self.errors[0]
 
 
-def save_camera_frame_record(
-    recorder: RunRecorder,
-    frame,
-    frame_index: int,
-    frame_timestamp: float,
-    collector_read_timestamp: float,
-    frame_info: dict,
-    *,
-    lidar_anchor: bool = True,
-    camera_interval_sec: float | None = None,
-    camera_gap_detected: bool = False,
-):
-    """Save one camera frame using the collector's canonical run schema."""
-    frame_name = f"{int(frame_index):08d}.jpg"
-    frame_path = recorder.frames_dir / frame_name
-    if isinstance(frame, bytes):  # already a JPEG from the GPU encoder
-        frame_path.write_bytes(frame)
-    elif not cv2.imwrite(str(frame_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]):
-        raise RuntimeError(f"failed to save camera frame: {frame_path}")
-    saved_timestamp = time.time()
-    frame_record = build_camera_frame_record(
-        frame_index,
-        frame_timestamp,
-        collector_read_timestamp,
-        frame_info,
-        saved_timestamp,
-        lidar_anchor=lidar_anchor,
-        camera_interval_sec=camera_interval_sec,
-        camera_gap_detected=camera_gap_detected,
-    )
-    append_jsonl(
-        recorder.frames_jsonl,
-        frame_record,
-        durable=CAMERA_DURABLE_WRITES,
-    )
-    return frame_record
-
-
 def finalize_run_record(
     recorder: RunRecorder,
-    lidar_stats: dict,
+    stats: dict,
     *,
     saved_frames: int,
-    dropped_bad_frames: int,
     warmup_skipped_frames: int,
     camera_capture: dict,
-    camera_storage: dict | None = None,
-    connection_summary: dict | None = None,
-    gps_stats: dict | None = None,
-    fatal_error: str | None = None,
-    shutdown_signal=None,
-    entrypoint: str = "collect_data.py",
+    camera_storage: dict,
+    connection_summary: dict,
+    gps_stats: dict,
+    fatal_error: str | None,
+    shutdown_signal,
 ):
     """Write the shared ``run_finished`` schema and print its summary."""
-    stats = dict(lidar_stats or {"packet_count": 0, "byte_count": 0})
-    stats.setdefault("packet_count", 0)
-    stats.setdefault("byte_count", 0)
     append_jsonl(
         recorder.meta_dir / "run_meta.jsonl",
         {
             "event": "run_finished",
             "run_id": recorder.run_id,
             "timestamp": time.time(),
-            "entrypoint": str(entrypoint),
+            "entrypoint": "collect_data.py",
             "status": "failed" if fatal_error else "completed",
             "fatal_error": fatal_error,
-            "saved_frames": int(saved_frames),
-            "dropped_bad_frames": int(dropped_bad_frames),
-            "warmup_skipped_frames": int(warmup_skipped_frames),
-            "camera_capture": dict(camera_capture or {}),
-            "camera_storage": dict(camera_storage or {}),
-            "connection_summary": dict(connection_summary or {}),
-            "gps": dict(gps_stats or {"enabled": False}),
+            "saved_frames": saved_frames,
+            "warmup_skipped_frames": warmup_skipped_frames,
+            "camera_capture": camera_capture,
+            "camera_storage": camera_storage,
+            "connection_summary": connection_summary,
+            "gps": gps_stats,
             "shutdown_signal": shutdown_signal,
             "lidar_packets": stats["packet_count"],
             "lidar_bytes": stats["byte_count"],
-            "lidar_saved_packets": stats.get("saved_packet_count", 0),
-            "lidar_saved_bytes": stats.get("saved_byte_count", 0),
-            "lidar_fov_fully_filtered_datagrams": stats.get(
-                "fov_fully_filtered_datagram_count", stats.get("dropped_packet_count", 0)
-            ),
-            "lidar_dropped_packets": stats.get("dropped_packet_count", 0),
-            "lidar_kernel_dropped_packets": stats.get("kernel_drop_count", 0),
-            "lidar_socket_rcvbuf_bytes": stats.get("socket_rcvbuf_bytes", 0),
-            "lidar_receiver_restarts": stats.get("receiver_restart_count", 0),
-            "lidar_transport_errors": stats.get("transport_errors", []),
-            "lidar_frame_windows": stats.get("frame_window_count", 0),
-            "lidar_empty_frame_windows": stats.get("frame_window_empty_count", 0),
-            "lidar_clock_steps": stats.get("clock_step_count", 0),
-            "lidar_sensor_sequence": dict(stats.get("sensor_sequence") or {}),
+            "lidar_saved_packets": stats["saved_packet_count"],
+            "lidar_saved_bytes": stats["saved_byte_count"],
+            "lidar_fov_fully_filtered_datagrams": stats["fov_fully_filtered_datagram_count"],
+            "lidar_kernel_dropped_packets": stats["kernel_drop_count"],
+            "lidar_socket_rcvbuf_bytes": stats["socket_rcvbuf_bytes"],
+            "lidar_receiver_restarts": stats["receiver_restart_count"],
+            "lidar_transport_errors": stats["transport_errors"],
+            "lidar_sensor_sequence": stats["sensor_sequence"],
             "lidar_storage": {
                 key: value
                 for key, value in stats.items()
-                if key.startswith("chunk_")
-                or key.startswith("pcap_")
-                or key in {"storage_format", "storage_errors", "fatal_error"}
+                if key.startswith("pcap_") or key in {"storage_format", "storage_errors", "fatal_error"}
             },
         },
         durable=True,
@@ -2272,41 +1832,31 @@ def finalize_run_record(
     print(f"Saved run: {recorder.run_dir}")
     print(f"  frames        : {saved_frames}")
     print(f"  warmup skipped: {warmup_skipped_frames}")
-    print(f"  bad frames    : {dropped_bad_frames}")
     print(f"  camera capture: {camera_capture}")
-    if camera_storage:
-        print(f"  camera storage: {camera_storage}")
+    print(f"  camera storage: {camera_storage}")
     print(f"  lidar packets : {stats['packet_count']}")
     print(
-        f"  lidar saved   : {stats.get('saved_packet_count', 0)} packets, "
-        f"{stats.get('saved_byte_count', 0)} bytes"
+        f"  lidar saved   : {stats['saved_packet_count']} packets, "
+        f"{stats['saved_byte_count']} bytes"
     )
     print(
-        "  lidar FoV cut : "
-        f"{stats.get('fov_fully_filtered_datagram_count', stats.get('dropped_packet_count', 0))} "
+        f"  lidar FoV cut : {stats['fov_fully_filtered_datagram_count']} "
         "fully filtered datagrams (not transport loss)"
     )
-    print(f"  lidar RX drop : {stats.get('kernel_drop_count', 0)} packets")
-    print(f"  lidar rcvbuf  : {stats.get('socket_rcvbuf_bytes', 0)} bytes")
-    print(f"  lidar windows : {stats.get('frame_window_count', 0)}")
-    print(f"  lidar storage : {stats.get('storage_format', 'unknown')}")
-    if gps_stats and gps_stats.get("enabled"):
-        print(
-            "  GPS           : "
-            f"sentences={gps_stats.get('sentence_count', 0)} "
-            f"valid_fixes={gps_stats.get('valid_fix_count', 0)} "
-            f"checksum_errors={gps_stats.get('checksum_error_count', 0)}"
-        )
+    print(f"  lidar RX drop : {stats['kernel_drop_count']} packets")
+    print(f"  lidar rcvbuf  : {stats['socket_rcvbuf_bytes']} bytes")
+    print(
+        "  GPS           : "
+        f"sentences={gps_stats['sentence_count']} "
+        f"valid_fixes={gps_stats['valid_fix_count']} "
+        f"checksum_errors={gps_stats['checksum_error_count']}"
+    )
 
 
-def _run_collector(on_collection_ready=None, collection_stop_event=None):
-    print("=== Camera + LiDAR + GPS Collector (no inference) ===")
+def _run_collector(stop: threading.Event):
+    print("=== Camera + LiDAR + GPS Collector ===")
     print(f"CONFIG_PATH    : {CONFIG_PATH}")
     print(f"RTSP_URL       : {RTSP_URL}")
-    print(f"RTSP_PROFILE   : {RTSP_PROFILE}")
-    print("RTSP_OPTS      : GStreamer TCP; latency=50ms")
-    print(f"CAMERA_MODE    : {CAMERA_READ_MODE}")
-    print(f"LATEST_FRAME   : {CAMERA_LATEST_FRAME_ENABLED} " f"buffer={CAMERA_FRAME_BUFFER_SIZE}")
     print(
         "CAMERA_RECOVER : "
         f"timeout={CAMERA_CONNECTION_TIMEOUT_SEC:.1f}s "
@@ -2315,25 +1865,8 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
         f"{CAMERA_RECONNECT_MAX_SEC:.1f}s"
     )
     print(f"FRAME_SAVE_FPS : {FRAME_SAVE_FPS}")
-    print(
-        f"CAMERA_CLOCK   : pts={CAMERA_PTS_ENABLED} "
-        f"manifest_timestamp={CAMERA_MANIFEST_TIMESTAMP}"
-    )
-    print(
-        f"CAMERA_WRITER  : "
-        f"{'async' if CAMERA_ASYNC_WRITE else 'synchronous'} "
-        f"queue={CAMERA_WRITE_QUEUE_SIZE}"
-    )
-    print(f"JPEG_QUALITY   : {JPEG_QUALITY}")
-    print(f"SHOW_WINDOW    : {SHOW_WINDOW}")
-    print(f"CAMERA_DECODE  : {CAMERA_DECODE_ENABLED}")
-    print(f"RAW_VIDEO_COPY : {SAVE_RAW_VIDEO_COPY}")
-    print(f"BBOX_FLIP_X    : {BBOX_FLIP_X}")
-    print(f"DISPLAY_FLIP_X : {DISPLAY_FLIP_X}")
-    print(f"BBOX_SRC_SIZE  : {BBOX_SOURCE_SIZE or '-'}")
-    print(f"BBOX_LBOX_SIZE : {BBOX_LETTERBOX_SIZE or '-'}")
-    print(f"DROP_BAD_FRAMES: {DROP_BAD_FRAMES}")
-    print(f"LIDAR_ENABLED  : {LIDAR_ENABLED}")
+    print(f"CAMERA_WRITER  : queue={CAMERA_WRITE_QUEUE_SIZE}")
+    print(f"JPEG_QUALITY   : {JPEG_QUALITY} (gpu={CAMERA_GPU_JPEG})")
     print(f"LIDAR_UDP      : {LIDAR_BIND_IP}:{LIDAR_UDP_PORT}")
     print(f"LIDAR_RCVBUF   : requested={LIDAR_SOCKET_RCVBUF_BYTES} bytes")
     print(
@@ -2343,37 +1876,26 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
         f"{LIDAR_RECONNECT_MAX_SEC:.1f}s"
     )
     print(f"LIDAR_FOV      : {LIDAR_FOV_FILTER_ENABLED}")
-    print(f"LIDAR_SAVE_MODE: {LIDAR_SAVE_MODE}")
-    print(f"LIDAR_STORAGE  : {LIDAR_STORAGE_FORMAT}")
-    print(f"LIDAR_PCAP_SEC : {LIDAR_PCAP_SECONDS} " f"gzip={LIDAR_PCAP_GZIP}")
     if LIDAR_FOV_FILTER_ENABLED:
         print(
-            "LIDAR_FOV_MODE : whole datagrams only "
-            "(a part-trimmed datagram is not a valid capture)"
+            f"LIDAR_FOV_CFG  : forward={LIDAR_CAMERA_FORWARD_OFFSET_DEG:.1f} deg, "
+            f"margin=+/-{LIDAR_H_MARGIN_DEG:.1f} deg, whole datagrams only"
         )
-    print(f"LIDAR_KERNEL_TS: {LIDAR_KERNEL_TIMESTAMP}")
-    if LIDAR_FOV_FILTER_ENABLED:
-        print(
-            f"LIDAR_FOV_CFG  : forward={LIDAR_CAMERA_FORWARD_OFFSET_DEG:.1f} deg, margin=+/-{LIDAR_H_MARGIN_DEG:.1f} deg"
-        )
-    print(f"GPS_ENABLED    : {GPS_ENABLED}")
-    if GPS_ENABLED:
-        print(f"GPS_DEVICE     : {GPS_DEVICE}")
-        print(f"GPS_PREFERRED  : {GPS_PREFERRED_DEVICE or '-'}")
-        print(f"GPS_BAUDRATE   : {GPS_BAUDRATE}")
-        print(
-            "GPS_RECOVER    : "
-            f"timeout={GPS_CONNECTION_TIMEOUT_SEC:.1f}s "
-            f"backoff={GPS_RECONNECT_INITIAL_SEC:.1f}.."
-            f"{GPS_RECONNECT_MAX_SEC:.1f}s"
-        )
-    print(f"RECORD_ENABLED : {RECORD_ENABLED}")
+    print(f"LIDAR_PCAP_SEC : {LIDAR_PCAP_SECONDS}")
+    print(f"GPS_DEVICE     : {GPS_DEVICE}")
+    print(f"GPS_PREFERRED  : {GPS_PREFERRED_DEVICE or '-'}")
+    print(f"GPS_BAUDRATE   : {GPS_BAUDRATE}")
+    print(
+        "GPS_RECOVER    : "
+        f"timeout={GPS_CONNECTION_TIMEOUT_SEC:.1f}s "
+        f"backoff={GPS_RECONNECT_INITIAL_SEC:.1f}.."
+        f"{GPS_RECONNECT_MAX_SEC:.1f}s"
+    )
     print(f"SAVE_DIR       : {SAVE_DIR}")
 
-    # Collect until the disk is nearly full. There is no planned-duration
-    # capacity preflight: the only storage limit is the min_free_gb reserve,
-    # rechecked every disk_check_interval_sec while running.
-    free_gb = check_free_space_gb(RUNS_DIR)
+    # Collect until the disk is nearly full. The only storage limit is the
+    # min_free_gb reserve, rechecked every disk_check_interval_sec.
+    free_gb = check_free_space_gb(SAVE_DIR)
     print(f"DISK_FREE      : {free_gb:.1f} GB")
     print(
         "RUN_CAPACITY   : "
@@ -2387,7 +1909,7 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
         )
     next_disk_check_at = time.time() + DISK_CHECK_INTERVAL_SEC
 
-    write_mibs = measure_storage_write_mibs(RUNS_DIR, STORAGE_PREFLIGHT_MIB)
+    write_mibs = measure_storage_write_mibs(SAVE_DIR, STORAGE_PREFLIGHT_MIB)
     if write_mibs is None:
         print("DISK_WRITE     : not measured")
     else:
@@ -2396,7 +1918,7 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
             print(
                 "",
                 "*" * 70,
-                f"[STORAGE WARN] {RUNS_DIR} writes at only {write_mibs:.2f} MiB/s.",
+                f"[STORAGE WARN] {SAVE_DIR} writes at only {write_mibs:.2f} MiB/s.",
                 f"               Collection needs about {STORAGE_MIN_WRITE_MIBS:.0f} MiB/s"
                 " and will drop LiDAR packets below that.",
                 "               A USB disk that negotiated a slow link looks exactly",
@@ -2409,43 +1931,22 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
                 flush=True,
             )
 
-    recorder = RunRecorder(RUNS_DIR) if RECORD_ENABLED else None
+    recorder = RunRecorder(SAVE_DIR)
     run_sequence = 0
-    next_run_rotation_at = next_rotation_time(time.time()) if recorder is not None else None
-    if recorder is not None:
-        print(f"RUN_DIR        : {recorder.run_dir}")
-        if next_run_rotation_at is None:
-            print("RUN_ROTATION   : off (one folder per power-on)")
-        else:
-            print(
-                f"RUN_ROTATION   : every {RUN_ROTATION_MINUTES:g} min, "
-                f"next at "
-                f"{datetime.fromtimestamp(next_run_rotation_at):%Y-%m-%d %H:%M:%S}"
-            )
-    camera_writer = None
-    if recorder is not None and SAVE_FRAMES and CAMERA_ASYNC_WRITE:
-        camera_writer = CameraFrameWriter(
-            recorder,
-            CAMERA_WRITE_QUEUE_SIZE,
-        )
-
+    next_run_rotation_at = next_rotation_time(time.time())
+    print(f"RUN_DIR        : {recorder.run_dir}")
+    print(
+        f"RUN_ROTATION   : every {RUN_ROTATION_MINUTES:g} min, next at "
+        f"{datetime.fromtimestamp(next_run_rotation_at):%Y-%m-%d %H:%M:%S}"
+    )
+    camera_writer = CameraFrameWriter(recorder, CAMERA_WRITE_QUEUE_SIZE)
     cap = None
-    print("Camera reconnect supervisor enabled; opening RTSP in main loop.")
 
-    lidar = None
-    if LIDAR_ENABLED:
-        lidar = LidarRawRecorder(LIDAR_BIND_IP, LIDAR_UDP_PORT, LIDAR_LOG_INTERVAL_SEC, recorder)
-        lidar.start()
+    lidar = LidarRawRecorder(LIDAR_BIND_IP, LIDAR_UDP_PORT, LIDAR_LOG_INTERVAL_SEC, recorder)
+    lidar.start()
 
-    gps = None
-    if GPS_ENABLED:
-        gps = GpsNmeaRecorder(
-            GPS_DEVICE,
-            GPS_BAUDRATE,
-            recorder,
-            GPS_PREFERRED_DEVICE,
-        )
-        gps.start()
+    gps = GpsNmeaRecorder(GPS_DEVICE, GPS_BAUDRATE, recorder, GPS_PREFERRED_DEVICE)
+    gps.start()
 
     connection_states = {}
     connection_state_started_at = {}
@@ -2458,43 +1959,33 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
 
     def report_connection_state(sensor: str, state: str, detail: str | None = None):
         """Print only connection transitions, never one line per packet/frame."""
-        normalized = str(state).upper()
         previous = connection_states.get(sensor)
-        if previous == normalized:
+        if previous == state:
             return
         changed_at = time.time()
         previous_started_at = connection_state_started_at.get(sensor, changed_at)
         previous_duration = max(0.0, changed_at - previous_started_at)
         if previous == "DISCONNECTED":
-            connection_downtime_sec[sensor] = (
-                connection_downtime_sec.get(sensor, 0.0) + previous_duration
-            )
-        connection_states[sensor] = normalized
+            connection_downtime_sec[sensor] += previous_duration
+        connection_states[sensor] = state
         connection_state_started_at[sensor] = changed_at
-        count_key = f"{sensor}:{normalized}"
+        count_key = f"{sensor}:{state}"
         connection_transition_counts[count_key] = connection_transition_counts.get(count_key, 0) + 1
-        print(
-            f"[CONNECTION {time.strftime('%H:%M:%S')}] " f"{sensor}={normalized}",
-            flush=True,
-        )
-        if recorder is not None:
-            event = {
-                "event": "connection_state",
-                "timestamp": changed_at,
-                "sensor": sensor,
-                "state": normalized,
-                "previous_state": previous,
-                "previous_state_duration_sec": previous_duration,
-            }
-            if detail:
-                event["detail"] = str(detail)
-            try:
-                append_jsonl(recorder.connection_events_jsonl, event)
-            except OSError as exc:
-                print(
-                    f"[CONNECTION WARN] failed to record state event: {exc}",
-                    flush=True,
-                )
+        print(f"[CONNECTION {time.strftime('%H:%M:%S')}] {sensor}={state}", flush=True)
+        event = {
+            "event": "connection_state",
+            "timestamp": changed_at,
+            "sensor": sensor,
+            "state": state,
+            "previous_state": previous,
+            "previous_state_duration_sec": previous_duration,
+        }
+        if detail:
+            event["detail"] = detail
+        try:
+            append_jsonl(recorder.connection_events_jsonl, event)
+        except OSError as exc:
+            print(f"[CONNECTION WARN] failed to record state event: {exc}", flush=True)
 
     def poll_connection_states(now: float, force: bool = False):
         nonlocal next_connection_check
@@ -2503,16 +1994,8 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
         next_connection_check = now + 0.2
 
         camera_last = last_camera_frame_seen
-        stats_getter = getattr(cap, "stats", None)
-        if callable(stats_getter):
-            try:
-                capture_stats = dict(stats_getter() or {})
-                camera_last = max(
-                    camera_last,
-                    float(capture_stats.get("last_frame_timestamp") or 0.0),
-                )
-            except Exception:
-                pass
+        if cap is not None:
+            camera_last = max(camera_last, cap.frame_timestamp)
         if camera_last > 0.0 and now - camera_last < CAMERA_CONNECTION_TIMEOUT_SEC:
             report_connection_state("CAMERA", "CONNECTED")
         elif camera_last > 0.0 or now - connection_monitor_started_at >= CAMERA_WATCHDOG_SEC:
@@ -2520,33 +2003,20 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
         else:
             report_connection_state("CAMERA", "WAITING")
 
-        if lidar is not None:
-            try:
-                lidar_last = lidar.latest_packet_timestamp()
-            except Exception:
-                lidar_last = 0.0
-            if lidar_last > 0.0 and now - lidar_last < LIDAR_CONNECTION_TIMEOUT_SEC:
-                report_connection_state("LIDAR", "CONNECTED")
-            elif now - connection_monitor_started_at >= LIDAR_CONNECTION_TIMEOUT_SEC:
-                report_connection_state("LIDAR", "DISCONNECTED")
-            else:
-                report_connection_state("LIDAR", "WAITING")
+        lidar_last = lidar.latest_packet_timestamp()
+        if lidar_last > 0.0 and now - lidar_last < LIDAR_CONNECTION_TIMEOUT_SEC:
+            report_connection_state("LIDAR", "CONNECTED")
+        elif now - connection_monitor_started_at >= LIDAR_CONNECTION_TIMEOUT_SEC:
+            report_connection_state("LIDAR", "DISCONNECTED")
         else:
-            report_connection_state("LIDAR", "DISABLED")
+            report_connection_state("LIDAR", "WAITING")
 
-        if gps is not None:
-            report_connection_state("GPS", "CONNECTED" if gps.is_connected() else "DISCONNECTED")
-        else:
-            report_connection_state("GPS", "DISABLED")
+        report_connection_state("GPS", "CONNECTED" if gps.is_connected() else "DISCONNECTED")
 
     poll_connection_states(connection_monitor_started_at, force=True)
 
-    # ffmpeg의 fps filter가 이미 저장 목표 이하로 프레임률을 제한한다면 다시
-    # wall-clock 간격으로 거르지 않는다. 두 단계의 목표 FPS가 같을 때 수신 jitter로
-    # nominal interval보다 아주 조금 짧아진 프레임을 버리면 실제 저장률이 크게 떨어진다.
-    # PyAV decimates on capture time inside the capture thread, which is
-    # strictly better than re-filtering here on arrival time.
     frame_index = 0
+    expected_frame_interval = 1.0 / FRAME_SAVE_FPS
     # Set when a rotation is waiting for the camera stream to reach the
     # boundary; frames taken before it keep going to the folder that closed.
     pending_camera_recorder = None
@@ -2573,22 +2043,22 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
 
         def finish_after_frames():
             actual_saved_frames = persisted_frame_count(closing["recorder"])
-            if actual_saved_frames != int(saved_frames):
+            if actual_saved_frames != saved_frames:
                 print(
                     "[FRAME COUNT] corrected run_finished saved_frames "
                     f"{saved_frames} -> {actual_saved_frames}",
                     flush=True,
                 )
-            lidar_snapshot = dict(closing["lidar_stats_process_cumulative"] or {})
             # Writer-local fields describe whichever folder was current when the
             # snapshot happened. At a packet-time boundary that may already be the
             # next folder, which made old run metadata report false pcap counts
             # (often zero). Per-folder pcap totals are authoritative in pcaps.jsonl;
             # keep this object strictly process-cumulative.
-            for key in list(lidar_snapshot):
-                if key.startswith("pcap_") or key.startswith("chunk_"):
-                    lidar_snapshot.pop(key, None)
-            lidar_snapshot.pop("storage_format", None)
+            lidar_snapshot = {
+                key: value
+                for key, value in closing["lidar_stats_process_cumulative"].items()
+                if not key.startswith("pcap_") and key != "storage_format"
+            }
             append_jsonl(
                 closing["recorder"].meta_dir / "run_meta.jsonl",
                 {
@@ -2601,8 +2071,7 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
                     "run_sequence": closing["recorder"].run_sequence,
                     "next_run_id": closing["next_run_id"],
                     "saved_frames": actual_saved_frames,
-                    "frame_counter_before_manifest_check": int(saved_frames),
-                    "dropped_bad_frames": closing["dropped_bad_frames"],
+                    "frame_counter_before_manifest_check": saved_frames,
                     "warmup_skipped_frames": closing["warmup_skipped_frames"],
                     # Receiver counters are cumulative for the collector process,
                     # not for this folder alone. Per-folder counts come from the
@@ -2616,22 +2085,18 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
                 durable=True,
             )
 
-        if camera_writer is not None and not camera_writer.closed:
+        if not camera_writer.closed:
             camera_writer.submit_callback(finish_after_frames)
         else:
             finish_after_frames()
 
     last_saved_frame_timestamp = None
-    bad_frame_count = 0
     warmup_skipped = 0
-    collection_ready_notified = False
     camera_reconnect_attempt = 0
     next_camera_reconnect_at = 0.0
     warmup_until = 0.0
     fatal_exception = None
-    shutdown_signal_event = threading.Event()
     shutdown_signal_name = None
-    previous_signal_handlers = {}
     health_started_at = time.time()
     next_health_at = health_started_at + HEALTH_LOG_INTERVAL_SEC
     health_last_at = health_started_at
@@ -2649,33 +2114,29 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
         nonlocal health_last_lidar_packets
         nonlocal health_sample_count
 
-        if recorder is None:
-            return
         if not force and now < next_health_at:
             return
 
         interval = max(1e-6, now - health_last_at)
         elapsed = max(0.0, now - health_started_at)
-        camera_storage_now = {} if camera_writer is None else camera_writer.stats()
-        lidar_now = {} if lidar is None else lidar.stats()
-        gps_now = {"enabled": False} if gps is None else gps.stats()
-        lidar_packets_now = int(lidar_now.get("packet_count", 0))
+        camera_storage_now = camera_writer.stats()
+        lidar_now = lidar.stats()
+        gps_now = gps.stats()
+        lidar_packets_now = lidar_now["packet_count"]
         # frame_index restarts at 0 in every rotated folder, so a negative
         # delta means a rotation happened inside this interval, not a fault.
-        camera_recent_fps = max(0, int(frame_index) - health_last_frame_count) / interval
+        camera_recent_fps = max(0, frame_index - health_last_frame_count) / interval
         lidar_recent_packet_rate = (lidar_packets_now - health_last_lidar_packets) / interval
-        disk_free_gib = check_free_space_gb(RUNS_DIR)
+        disk_free_gib = check_free_space_gb(SAVE_DIR)
         try:
-            fs_stats = os.statvfs(RUNS_DIR)
+            fs_stats = os.statvfs(SAVE_DIR)
             inode_free = int(fs_stats.f_favail)
             inode_total = int(fs_stats.f_files)
-        except (OSError, AttributeError):
+        except OSError:
             inode_free = None
             inode_total = None
 
-        camera_disk_bytes = int(camera_storage_now.get("written_bytes", 0))
-        lidar_disk_bytes = int(lidar_now.get("pcap_disk_bytes", 0))
-        committed_bytes = camera_disk_bytes + lidar_disk_bytes
+        committed_bytes = camera_storage_now["written_bytes"] + lidar_now.get("pcap_disk_bytes", 0)
         observed_gib_per_hour = (
             committed_bytes / (1024**3) * 3600.0 / elapsed if elapsed >= 60.0 else None
         )
@@ -2686,65 +2147,42 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
         )
         os_metrics = system_metrics.snapshot()
         cpu_temperature_c = os_metrics.get("cpu_temperature_c")
-        cpu_throttled = os_metrics.get("cpu_throttled_status")
         process_rss_mib = os_metrics.get("process_rss_mib")
-        load_average = os_metrics.get("load_average")
-
-        analysis_status = {}
-        analysis_status_path = Path("/dev/shm/porthole_analysis_status.json")
-        try:
-            analysis_status = json.loads(analysis_status_path.read_text())
-        except (OSError, ValueError, TypeError):
-            analysis_status = {}
-        analysis_queue = analysis_status.get("queue", {})
-        analysis_updated_at = analysis_status.get("updated_at")
-        analysis_age_sec = (
-            None if analysis_updated_at is None else max(0.0, now - float(analysis_updated_at))
-        )
-        analysis_run = analysis_status.get("active_run")
-        analysis_summary = {
-            "inference_pending_frames": analysis_queue.get("inference_pending_frames"),
-            "inference_fps": analysis_queue.get("inference_fps"),
-            "oldest_age_seconds": analysis_queue.get("oldest_age_seconds"),
-            "status_age_seconds": analysis_age_sec,
-            "active_run": analysis_run,
-            "active_frames": analysis_status.get("active_frames"),
-        }
 
         record = {
             "event": "health",
-            "timestamp": float(now),
+            "timestamp": now,
             "elapsed_sec": elapsed,
             "sample_index": health_sample_count,
-            "camera_saved_frames": int(frame_index),
+            "camera_saved_frames": frame_index,
             "camera_recent_fps": camera_recent_fps,
             "camera_writer": camera_storage_now,
             "camera_connection_state": connection_states.get("CAMERA"),
             "lidar_packets": lidar_packets_now,
             "lidar_recent_packet_rate": lidar_recent_packet_rate,
-            "lidar_saved_packets": int(lidar_now.get("saved_packet_count", 0)),
-            "lidar_kernel_drops": int(lidar_now.get("kernel_drop_count", 0)),
-            "lidar_pcap_queue_high_watermark": int(lidar_now.get("pcap_queue_high_watermark", 0)),
-            "lidar_pcap_queue_block_count": int(lidar_now.get("pcap_queue_block_count", 0)),
+            "lidar_saved_packets": lidar_now["saved_packet_count"],
+            "lidar_kernel_drops": lidar_now["kernel_drop_count"],
+            "lidar_pcap_queue_high_watermark": lidar_now.get("pcap_queue_high_watermark", 0),
+            "lidar_pcap_queue_block_count": lidar_now.get("pcap_queue_block_count", 0),
             "lidar_pcap_writer_errors": lidar_now.get("pcap_writer_errors", []),
-            "camera_capture": cap.stats() if cap is not None and hasattr(cap, "stats") else {},
-            "lidar_receiver_restarts": int(lidar_now.get("receiver_restart_count", 0)),
+            "camera_capture": {} if cap is None else cap.stats(),
+            "lidar_receiver_restarts": lidar_now["receiver_restart_count"],
             "lidar_connection_state": connection_states.get("LIDAR"),
             "gps_connection_state": connection_states.get("GPS"),
-            "gps_sentences": int(gps_now.get("sentence_count", 0)),
-            "gps_valid_fixes": int(gps_now.get("valid_fix_count", 0)),
-            "gps_checksum_errors": int(gps_now.get("checksum_error_count", 0)),
-            "gps_parse_errors": int(gps_now.get("parse_error_count", 0)),
-            "gps_receiver_restarts": int(gps_now.get("receiver_restart_count", 0)),
+            "gps_sentences": gps_now["sentence_count"],
+            "gps_valid_fixes": gps_now["valid_fix_count"],
+            "gps_checksum_errors": gps_now["checksum_error_count"],
+            "gps_parse_errors": gps_now["parse_error_count"],
+            "gps_receiver_restarts": gps_now["receiver_restart_count"],
             "gps_last_sentence_age_sec": (
                 None
-                if gps_now.get("last_sentence_timestamp") is None
-                else max(0.0, now - float(gps_now["last_sentence_timestamp"]))
+                if gps_now["last_sentence_timestamp"] is None
+                else max(0.0, now - gps_now["last_sentence_timestamp"])
             ),
             "gps_last_valid_fix_age_sec": (
                 None
-                if gps_now.get("last_valid_fix_timestamp") is None
-                else max(0.0, now - float(gps_now["last_valid_fix_timestamp"]))
+                if gps_now["last_valid_fix_timestamp"] is None
+                else max(0.0, now - gps_now["last_valid_fix_timestamp"])
             ),
             "committed_data_bytes": committed_bytes,
             "observed_storage_gib_per_hour": observed_gib_per_hour,
@@ -2754,10 +2192,8 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
             "inode_free": inode_free,
             "inode_total": inode_total,
             "process_rss_mib": process_rss_mib,
-            "load_average": load_average,
+            "load_average": os_metrics.get("load_average"),
             "cpu_temperature_c": cpu_temperature_c,
-            "cpu_throttled_status": cpu_throttled,
-            "analysis": analysis_summary,
         }
         append_jsonl(recorder.health_jsonl, record)
 
@@ -2766,23 +2202,14 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
         )
         temp_text = "-" if cpu_temperature_c is None else f"{cpu_temperature_c:.1f}C"
         rss_text = "-" if process_rss_mib is None else f"{process_rss_mib:.0f}MiB"
-        infer_q = analysis_summary["inference_pending_frames"]
-        infer_fps = analysis_summary["inference_fps"]
-        infer_q_text = "-" if infer_q is None else str(int(infer_q))
-        infer_fps_text = "-" if infer_fps is None else f"{float(infer_fps):.2f}"
-        analysis_age_text = "-" if analysis_age_sec is None else f"{analysis_age_sec:.0f}s"
-        analysis_folder_text = "-" if not analysis_run else Path(analysis_run).name
         print(
             f"[HEALTH {time.strftime('%H:%M:%S')}] "
             f"elapsed={elapsed / 3600.0:.2f}h "
             f"camera={camera_recent_fps:.2f}fps "
-            f"camQ={camera_storage_now.get('queue_pending', 0)}/"
-            f"{CAMERA_WRITE_QUEUE_SIZE} "
+            f"camQ={camera_storage_now['queue_pending']}/{CAMERA_WRITE_QUEUE_SIZE} "
             f"lidar={lidar_recent_packet_rate:.0f}pkt/s "
-            f"rxDrop={lidar_now.get('kernel_drop_count', 0)} "
-            f"gpsFix={gps_now.get('valid_fix_count', 0)} "
-            f"inferQ={infer_q_text} inferFPS={infer_fps_text} "
-            f"inferAge={analysis_age_text} inferFolder={analysis_folder_text} "
+            f"rxDrop={lidar_now['kernel_drop_count']} "
+            f"gpsFix={gps_now['valid_fix_count']} "
             f"disk={disk_free_gib:.1f}GiB "
             f"rate={storage_rate_text} temp={temp_text} rss={rss_text}",
             flush=True,
@@ -2793,21 +2220,16 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
                 f">= {HEALTH_WARN_CPU_TEMP_C:.1f}C",
                 flush=True,
             )
-        if cpu_throttled and not cpu_throttled.endswith("=0x0"):
-            print(
-                f"[HEALTH WARN] CPU throttling reported: {cpu_throttled}",
-                flush=True,
-            )
-        if int(lidar_now.get("kernel_drop_count", 0)) > 0:
+        if lidar_now["kernel_drop_count"] > 0:
             print(
                 "[HEALTH WARN] LiDAR UDP kernel drops are non-zero: "
-                f"{lidar_now.get('kernel_drop_count', 0)}",
+                f"{lidar_now['kernel_drop_count']}",
                 flush=True,
             )
 
         health_sample_count += 1
         health_last_at = now
-        health_last_frame_count = int(frame_index)
+        health_last_frame_count = frame_index
         health_last_lidar_packets = lidar_packets_now
         next_health_at = now + HEALTH_LOG_INTERVAL_SEC
 
@@ -2817,7 +2239,7 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
         The writers switch on their own data timestamps, so they only need to
         know the boundary before it arrives.  Arming ahead of time removes the
         main loop from the timing path entirely: however late this loop notices
-        the hour, the LiDAR and GPS threads have already been told where the
+        the boundary, the LiDAR and GPS threads have already been told where the
         line is.
         """
         nonlocal armed_recorder, armed_boundary
@@ -2825,21 +2247,16 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
             return
         try:
             armed_recorder = RunRecorder(
-                RUNS_DIR,
+                SAVE_DIR,
                 run_sequence=run_sequence + 1,
                 started_at=boundary_time,
             )
         except Exception as exc:
-            print(
-                f"[ROTATE ERROR] could not create the next run folder: {exc}",
-                flush=True,
-            )
+            print(f"[ROTATE ERROR] could not create the next run folder: {exc}", flush=True)
             return
         armed_boundary = boundary_time
-        if lidar is not None:
-            lidar.schedule_rotation(armed_recorder, boundary_time)
-        if gps is not None:
-            gps.rebind_recorder(armed_recorder, boundary_time)
+        lidar.schedule_rotation(armed_recorder, boundary_time)
+        gps.rebind_recorder(armed_recorder, boundary_time)
 
     def rotate_run(boundary_time: float):
         """Seal the current folder and continue collecting into the next one.
@@ -2854,12 +2271,12 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
         sense next to its neighbours.
         """
         nonlocal recorder, run_sequence, next_run_rotation_at
-        nonlocal health_last_frame_count, warmup_skipped, bad_frame_count
+        nonlocal health_last_frame_count, warmup_skipped
         nonlocal pending_camera_recorder, camera_boundary_time, pending_finish
         nonlocal armed_recorder, armed_boundary
 
         previous = recorder
-        lidar_snapshot = None if lidar is None else lidar.stats()
+        lidar_snapshot = lidar.stats()
 
         # arm_rotation already created the folder and told LiDAR/GPS where the
         # boundary is; if it could not, fall back to creating it here.
@@ -2869,10 +2286,7 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
         armed_recorder = None
         armed_boundary = None
         if new_recorder is None:
-            print(
-                "[ROTATE ERROR] no folder available; continuing in the current one.",
-                flush=True,
-            )
+            print("[ROTATE ERROR] no folder available; continuing in the current one.", flush=True)
             next_run_rotation_at = next_rotation_time(time.time())
             return
 
@@ -2895,21 +2309,18 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
         pending_finish = {
             "recorder": previous,
             "next_run_id": new_recorder.run_id,
-            "dropped_bad_frames": int(bad_frame_count),
-            "warmup_skipped_frames": int(warmup_skipped),
+            "warmup_skipped_frames": warmup_skipped,
             "lidar_stats_process_cumulative": lidar_snapshot,
         }
 
         recorder = new_recorder
         run_sequence += 1
         health_last_frame_count = 0
-        bad_frame_count = 0
         warmup_skipped = 0
         next_run_rotation_at = next_rotation_time(time.time())
         print(
             f"[ROTATE] {previous.run_id} -> {new_recorder.run_id} "
-            f"(next at "
-            f"{datetime.fromtimestamp(next_run_rotation_at):%H:%M:%S})",
+            f"(next at {datetime.fromtimestamp(next_run_rotation_at):%H:%M:%S})",
             flush=True,
         )
 
@@ -2927,8 +2338,7 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
         nonlocal pending_camera_recorder, camera_boundary_time, frame_index
         if pending_camera_recorder is None:
             return
-        if camera_writer is not None:
-            camera_writer.rebind_recorder(pending_camera_recorder)
+        camera_writer.rebind_recorder(pending_camera_recorder)
         lag_ms = (time.time() - camera_boundary_time) * 1000.0
         detail = ", forced: no frame crossed it" if forced else ""
         print(
@@ -2944,30 +2354,22 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
 
     def request_graceful_shutdown(signum, _frame):
         nonlocal shutdown_signal_name
-        try:
-            shutdown_signal_name = signal.Signals(signum).name
-        except (ValueError, AttributeError):
-            shutdown_signal_name = str(signum)
-        shutdown_signal_event.set()
-        if collection_stop_event is not None:
-            collection_stop_event.set()
+        shutdown_signal_name = signal.Signals(signum).name
+        stop.set()
 
-    if threading.current_thread() is threading.main_thread():
-        graceful_signals = [signal.SIGTERM]
-        if hasattr(signal, "SIGHUP"):
-            graceful_signals.append(signal.SIGHUP)
-        for handled_signal in graceful_signals:
-            previous_signal_handlers[handled_signal] = signal.getsignal(handled_signal)
-            signal.signal(handled_signal, request_graceful_shutdown)
+    for handled_signal in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(handled_signal, request_graceful_shutdown)
 
     def release_camera_capture():
         nonlocal cap
-        current = cap
-        cap = None
+        current, cap = cap, None
         if current is None:
             return
         try:
-            merge_capture_stats(camera_stats, current)
+            stats = current.stats()
+            camera_stats["sessions"] = camera_stats.get("sessions", 0) + 1
+            for key in CAMERA_COUNTERS:
+                camera_stats[key] = camera_stats.get(key, 0) + stats[key]
         except Exception as exc:
             print(f"[camera] stats merge failed during release: {exc}")
         try:
@@ -2979,28 +2381,22 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
         nonlocal camera_reconnect_attempt, next_camera_reconnect_at
         release_camera_capture()
         camera_reconnect_attempt += 1
-        exponent = min(camera_reconnect_attempt - 1, 10)
         delay = min(
             CAMERA_RECONNECT_MAX_SEC,
-            CAMERA_RECONNECT_INITIAL_SEC * (2**exponent),
+            CAMERA_RECONNECT_INITIAL_SEC * (2 ** min(camera_reconnect_attempt - 1, 10)),
         )
         next_camera_reconnect_at = time.time() + delay
         report_connection_state("CAMERA", "DISCONNECTED", detail=reason)
-        print(
-            f"[camera] {reason}; retry={camera_reconnect_attempt} " f"in {delay:.1f}s",
-            flush=True,
-        )
+        print(f"[camera] {reason}; retry={camera_reconnect_attempt} in {delay:.1f}s", flush=True)
 
-    def try_open_camera(now: float) -> bool:
+    def try_open_camera(now: float):
         nonlocal cap, warmup_until
-        if cap is not None:
-            return True
         if now < next_camera_reconnect_at:
-            return False
+            return
         candidate = None
         try:
             candidate = open_capture(RTSP_URL)
-            if candidate is None or not candidate.isOpened():
+            if not candidate.isOpened():
                 raise RuntimeError("RTSP capture did not open")
         except Exception as exc:
             if candidate is not None:
@@ -3009,40 +2405,26 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
                 except Exception:
                     pass
             schedule_camera_reconnect(f"RTSP open failed ({type(exc).__name__}: {exc})")
-            return False
-
+            return
         cap = candidate
         warmup_until = time.time() + CAMERA_WARMUP_SEC
-        print(
-            "RTSP process opened; waiting for the first decoded frame.",
-            flush=True,
-        )
-        return True
+        print("RTSP process opened; waiting for the first decoded frame.", flush=True)
 
     try:
-        while True:
-            if shutdown_signal_event.is_set():
-                print(f"Graceful shutdown requested ({shutdown_signal_name}).")
-                break
-            if collection_stop_event is not None and collection_stop_event.is_set():
-                print("Collection stop requested.")
-                break
-
+        while not stop.is_set():
             loop_now = time.time()
             if (
                 pending_camera_recorder is not None
-                and camera_boundary_time is not None
                 and loop_now >= camera_boundary_time + CAMERA_HANDOVER_GRACE_SEC
             ):
                 hand_over_camera(forced=True)
-            if next_run_rotation_at is not None:
-                if loop_now >= next_run_rotation_at - ROTATION_ARM_LEAD_SEC:
-                    arm_rotation(next_run_rotation_at)
-                if loop_now >= next_run_rotation_at:
-                    rotate_run(next_run_rotation_at)
+            if loop_now >= next_run_rotation_at - ROTATION_ARM_LEAD_SEC:
+                arm_rotation(next_run_rotation_at)
+            if loop_now >= next_run_rotation_at:
+                rotate_run(next_run_rotation_at)
             poll_connection_states(loop_now)
             if loop_now >= next_disk_check_at:
-                runtime_free_gb = check_free_space_gb(RUNS_DIR)
+                runtime_free_gb = check_free_space_gb(SAVE_DIR)
                 next_disk_check_at = loop_now + DISK_CHECK_INTERVAL_SEC
                 if runtime_free_gb < MIN_FREE_GB:
                     raise RuntimeError(
@@ -3051,13 +2433,10 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
                     )
             emit_health_sample(loop_now)
 
-            camera_write_fatal = (
-                None if camera_writer is None else camera_writer.fatal_error_message()
-            )
+            camera_write_fatal = camera_writer.fatal_error_message()
             if camera_write_fatal:
                 raise RuntimeError(f"camera frame storage failure: {camera_write_fatal}")
-
-            lidar_fatal = None if lidar is None else lidar.fatal_error_message()
+            lidar_fatal = lidar.fatal_error_message()
             if lidar_fatal:
                 raise RuntimeError(f"LiDAR storage/receiver failure: {lidar_fatal}")
 
@@ -3066,32 +2445,24 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
                 time.sleep(0.01)
                 continue
 
-            # grab()은 스트림을 한 프레임 진행시킨다(색공간 변환은 하지 않음).
-            frame = None
-            try:
-                ok, frame = cap.read()
-            except Exception as exc:
-                schedule_camera_reconnect(f"frame read raised {type(exc).__name__}: {exc}")
-                continue
-            if not ok or frame is None:
-                if getattr(cap, "nonblocking_read", False) and cap.isOpened():
+            ok, frame = cap.read()
+            if not ok:
+                if cap.isOpened():
                     time.sleep(0.005)
                     continue
                 schedule_camera_reconnect("frame read failed or watchdog expired")
                 continue
 
             collector_read_timestamp = time.time()
-            frame_info = capture_frame_info(cap, collector_read_timestamp)
-            frame_timestamp = frame_reference_timestamp(frame_info, collector_read_timestamp)
+            frame_info = cap.get_last_frame_info()
+            frame_timestamp = frame_info["capture_timestamp"]
             last_camera_frame_seen = frame_timestamp
             report_connection_state("CAMERA", "CONNECTED")
             camera_reconnect_attempt = 0
             next_camera_reconnect_at = 0.0
 
-            # 저장할 프레임만 여기서 디코딩한다.
-
             if frame_timestamp < warmup_until:
-                # 워밍업 구간: 읽기는 계속하되 저장은 건너뛴다(시작 회색 프레임 제거).
+                # Keep reading but skip saving: a new stream starts with grey frames.
                 warmup_skipped += 1
                 continue
 
@@ -3099,159 +2470,103 @@ def _run_collector(on_collection_ready=None, collection_stop_event=None):
                 hand_over_camera()
 
             frame_index += 1
-
             camera_interval_sec = (
                 None
                 if last_saved_frame_timestamp is None
                 else frame_timestamp - last_saved_frame_timestamp
             )
-            expected_frame_interval = 1.0 / FRAME_SAVE_FPS
             camera_gap_detected = bool(
                 camera_interval_sec is not None
                 and camera_interval_sec
                 > max(expected_frame_interval * 2.5, expected_frame_interval + 0.1)
             )
-            lidar_anchor = True
-
-            if recorder is not None and SAVE_FRAMES:
-                if camera_writer is not None:
-                    camera_writer.enqueue(
-                        frame,
-                        frame_index,
-                        frame_timestamp,
-                        collector_read_timestamp,
-                        frame_info,
-                        lidar_anchor=lidar_anchor,
-                        camera_interval_sec=camera_interval_sec,
-                        camera_gap_detected=camera_gap_detected,
-                    )
-                else:
-                    save_camera_frame_record(
-                        recorder,
-                        frame,
-                        frame_index,
-                        frame_timestamp,
-                        collector_read_timestamp,
-                        frame_info,
-                        lidar_anchor=lidar_anchor,
-                        camera_interval_sec=camera_interval_sec,
-                        camera_gap_detected=camera_gap_detected,
-                    )
-
+            camera_writer.enqueue(
+                frame,
+                frame_index,
+                collector_read_timestamp,
+                frame_info,
+                camera_interval_sec,
+                camera_gap_detected,
+            )
             last_saved_frame_timestamp = frame_timestamp
-
-            if not collection_ready_notified:
-                collection_ready_notified = True
-                if on_collection_ready is not None:
-                    on_collection_ready(recorder, frame_timestamp)
-
+        print(f"Graceful shutdown requested ({shutdown_signal_name or 'PTP monitor'}).")
     except KeyboardInterrupt:
         print("Interrupted by user (Ctrl+C).")
     except Exception as exc:
         fatal_exception = exc
-        print(
-            f"[COLLECTOR FATAL] {type(exc).__name__}: {exc}",
-            flush=True,
-        )
+        print(f"[COLLECTOR FATAL] {type(exc).__name__}: {exc}", flush=True)
     finally:
         release_camera_capture()
-        if camera_writer is not None:
-            camera_writer.close()
-        if lidar is not None:
-            lidar.stop()
-        if gps is not None:
-            gps.stop()
+        camera_writer.close()
+        lidar.stop()
+        gps.stop()
         try:
             emit_health_sample(time.time(), force=True)
         except Exception as exc:
             print(f"[HEALTH WARN] final health sample failed: {exc}", flush=True)
         system_metrics.stop()
 
-    camera_storage_stats = {} if camera_writer is None else camera_writer.stats()
-    if fatal_exception is None and camera_storage_stats.get("errors"):
+    camera_storage_stats = camera_writer.stats()
+    if fatal_exception is None and camera_storage_stats["errors"]:
         fatal_exception = RuntimeError(
             f"camera frame storage failed: {camera_storage_stats['errors']}"
         )
 
-    if fatal_exception is None and lidar is not None:
-        post_stop_stats = lidar.stats()
-        post_stop_error = post_stop_stats.get("fatal_error")
-        storage_errors = post_stop_stats.get("storage_errors") or []
-        if post_stop_error or storage_errors:
-            fatal_exception = RuntimeError(
-                "LiDAR storage failed: " f"{post_stop_error or storage_errors}"
-            )
-
-    if recorder is not None:
-        stats = lidar.stats() if lidar is not None else {"packet_count": 0, "byte_count": 0}
-        gps_stats = gps.stats() if gps is not None else {"enabled": False}
-        summary_time = time.time()
-        downtime = dict(connection_downtime_sec)
-        for sensor, state in connection_states.items():
-            if state == "DISCONNECTED":
-                downtime[sensor] = downtime.get(sensor, 0.0) + max(
-                    0.0,
-                    summary_time - connection_state_started_at.get(sensor, summary_time),
-                )
-        connection_summary = {
-            "final_states": dict(connection_states),
-            "transition_counts": dict(connection_transition_counts),
-            "disconnected_seconds": downtime,
-        }
-        # A rotation may still be waiting for the camera to reach the boundary.
-        # Close that folder first so it is never left without a run_finished.
-        if pending_finish is not None:
-            write_pending_finish(frame_index, reason="collector_stopped_before_handover")
-            # recorder already points to the newly armed folder. No camera
-            # frame crossed the boundary, so its own count is zero.
-            frame_index = 0
-
-        final_saved_frames = persisted_frame_count(recorder)
-        if final_saved_frames != int(frame_index):
-            print(
-                "[FRAME COUNT] corrected final saved_frames "
-                f"{frame_index} -> {final_saved_frames}",
-                flush=True,
-            )
-        finalize_run_record(
-            recorder,
-            stats,
-            saved_frames=final_saved_frames,
-            dropped_bad_frames=bad_frame_count,
-            warmup_skipped_frames=warmup_skipped,
-            camera_capture=camera_stats,
-            camera_storage=camera_storage_stats,
-            connection_summary=connection_summary,
-            gps_stats=gps_stats,
-            fatal_error=(
-                None
-                if fatal_exception is None
-                else f"{type(fatal_exception).__name__}: {fatal_exception}"
-            ),
-            shutdown_signal=shutdown_signal_name,
-            entrypoint="collect_data.py",
+    stats = lidar.stats()
+    if fatal_exception is None and (stats["fatal_error"] or stats["storage_errors"]):
+        fatal_exception = RuntimeError(
+            f"LiDAR storage failed: {stats['fatal_error'] or stats['storage_errors']}"
         )
+
+    summary_time = time.time()
+    downtime = dict(connection_downtime_sec)
+    for sensor, state in connection_states.items():
+        if state == "DISCONNECTED":
+            downtime[sensor] += max(
+                0.0, summary_time - connection_state_started_at.get(sensor, summary_time)
+            )
+    connection_summary = {
+        "final_states": dict(connection_states),
+        "transition_counts": dict(connection_transition_counts),
+        "disconnected_seconds": downtime,
+    }
+    # A rotation may still be waiting for the camera to reach the boundary.
+    # Close that folder first so it is never left without a run_finished.
+    if pending_finish is not None:
+        write_pending_finish(frame_index, reason="collector_stopped_before_handover")
+        # recorder already points to the newly armed folder. No camera
+        # frame crossed the boundary, so its own count is zero.
+        frame_index = 0
+
+    final_saved_frames = persisted_frame_count(recorder)
+    if final_saved_frames != frame_index:
+        print(
+            f"[FRAME COUNT] corrected final saved_frames {frame_index} -> {final_saved_frames}",
+            flush=True,
+        )
+    finalize_run_record(
+        recorder,
+        stats,
+        saved_frames=final_saved_frames,
+        warmup_skipped_frames=warmup_skipped,
+        camera_capture=camera_stats,
+        camera_storage=camera_storage_stats,
+        connection_summary=connection_summary,
+        gps_stats=gps.stats(),
+        fatal_error=(
+            None
+            if fatal_exception is None
+            else f"{type(fatal_exception).__name__}: {fatal_exception}"
+        ),
+        shutdown_signal=shutdown_signal_name,
+    )
 
     print("Finished.")
-    for handled_signal, previous_handler in previous_signal_handlers.items():
-        signal.signal(handled_signal, previous_handler)
     if fatal_exception is not None:
         raise fatal_exception
-    return recorder.run_dir if recorder is not None else None
 
 
-def main(on_collection_ready=None, collection_stop_event=None):
-    collector_lock = acquire_collector_lock()
-    try:
-        return _run_collector(
-            on_collection_ready=on_collection_ready,
-            collection_stop_event=collection_stop_event,
-        )
-    finally:
-        collector_lock.close()
-
-
-def run(duration=0.0):
+def run():
     """Own the strict PTP guard for the full lifetime of the collector."""
     if not os.path.ismount("/mnt/ssd"):
         raise RuntimeError("SSD is not mounted")
@@ -3265,15 +2580,11 @@ def run(duration=0.0):
                 return
 
     threading.Thread(target=watchdog, daemon=True).start()
-    timer = threading.Timer(duration, stop.set) if duration > 0 else None
-    if timer:
-        timer.start()
     try:
-        main(collection_stop_event=stop)
+        with acquire_collector_lock():
+            _run_collector(stop)
     finally:
         stop.set()
-        if timer:
-            timer.cancel()
         GUARD.close()
         if GUARD.errors:
             raise RuntimeError("PTP monitor failed: " + repr(GUARD.errors))

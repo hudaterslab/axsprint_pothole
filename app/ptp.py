@@ -72,14 +72,12 @@ class RtpClock:
     max_step_ns: int = 2_000_000
     last: dict | None = None
     stable_reports: int = 0
-    rejected_reports: int = 0
     last_error: str = "no_sender_report"
 
     def update(self, report: dict, arrival_utc_ns: int, arrival_monotonic_ns: int) -> bool:
         if abs(report["sender_utc_ns"] - arrival_utc_ns) > self.max_host_difference_ns:
             self.stable_reports = 0
             self.last = None
-            self.rejected_reports += 1
             self.last_error = "sender_clock_not_utc_synchronized"
             return False
         entry = dict(report, arrival_monotonic_ns=arrival_monotonic_ns)
@@ -94,7 +92,6 @@ class RtpClock:
             entry["mapping_residual_ns"] = residual
             if abs(residual) > self.max_step_ns:
                 self.stable_reports = 1
-                self.rejected_reports += 1
                 self.last_error = "sender_clock_step"
                 self.last = entry
                 return False
@@ -132,11 +129,8 @@ def ptp_announce(payload: bytes) -> dict | None:
     )
 
 
-def native_to_utc(native_ns: int, timescale: str, announce: dict | None) -> int:
-    if timescale == "utc":
-        return native_ns
-    if timescale != "ptp":
-        raise ValueError("Native time scale must be explicitly ptp or utc")
+def native_to_utc(native_ns: int, announce: dict | None) -> int:
+    """PTP (TAI) native time minus the advertised UTC offset; never a guessed one."""
     if not announce or not announce["utc_offset_valid"] or not announce["ptp_timescale"]:
         raise ValueError("No valid PTP-to-UTC relationship received")
     return native_ns - announce["current_utc_offset"] * NS
@@ -233,7 +227,7 @@ def qualified(snapshot, now_monotonic_ns=None, max_offset_ns=100_000, max_age_ns
     return True, ""
 
 
-def enable_sensors(force_camera=False):
+def enable_sensors():
     result = {}
     try:
         url = "http://192.168.1.201/pandar.cgi?"
@@ -251,7 +245,7 @@ def enable_sensors(force_camera=False):
         result["lidar_error"] = str(exc)
     try:
         state = read_sensor("camera")
-        if force_camera or state.get("port_state") != "SLAVE":
+        if state.get("port_state") != "SLAVE":
             result["camera_start"] = camera_command("start-ptp")
         result["camera_state"] = state.get("port_state", state.get("error"))
     except Exception as exc:
@@ -259,9 +253,8 @@ def enable_sensors(force_camera=False):
     return result
 
 
-def udp_payload(frame, linktype=1):
-    if linktype != 1:
-        raise ValueError("Ethernet PCAP required")
+def udp_payload(frame):
+    """(source port, destination port, payload) of an Ethernet IPv4 UDP frame, else None."""
     if len(frame) < 14:
         return None
     offset = 14
@@ -384,8 +377,8 @@ class PtpGuard:
                     best = run
         return best
 
-    def log(self, name, data, utc_ns=None):
-        recorder = self.recorder(utc_ns)
+    def log(self, name, data):
+        recorder = self.recorder()
         if recorder:
             with (recorder.meta_dir / name).open("a") as f:
                 f.write(json.dumps(data) + "\n")
@@ -437,7 +430,6 @@ class PtpGuard:
 
     def start(self):
         self.phc_fds = [os.open("/dev/ptp" + str(n), os.O_RDONLY | os.O_CLOEXEC) for n in (0, 1)]
-        self.phc_ids = [(~fd << 3) | 3 for fd in self.phc_fds]
         self.socket = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
         try:
             attach_filter(self.socket)

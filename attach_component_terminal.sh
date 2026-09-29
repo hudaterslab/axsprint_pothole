@@ -11,11 +11,8 @@ case "$COMPONENT" in
   collector)
     COMPONENT_LABEL="Collector"
     ;;
-  uploader)
-    COMPONENT_LABEL="Uploader"
-    ;;
   *)
-    echo "usage: $0 {collector|uploader|analysis}" >&2
+    echo "usage: $0 {collector|analysis}" >&2
     exit 2
     ;;
 esac
@@ -45,26 +42,6 @@ read_owner_state() {
       return 0
     fi
   fi
-
-  # Compatibility with a supervisor that started before state-file support
-  # was deployed. Read its NUL-delimited argv rather than guessing a log name.
-  local pid=""
-  local -a argv=()
-  while IFS= read -r pid; do
-    [[ -r "/proc/$pid/cmdline" ]] || continue
-    mapfile -d '' -t argv <"/proc/$pid/cmdline" || true
-    if (( ${#argv[@]} >= 6 )) \
-      && [[ "${argv[1]}" == "$SCRIPT_DIR/run_component_foreground.sh" ]] \
-      && [[ "${argv[2]}" == "--supervisor" ]] \
-      && [[ "${argv[3]}" == "$COMPONENT" ]] \
-      && [[ -r "${argv[5]}" ]]; then
-      SUPERVISOR_PID="$pid"
-      LOG_FILE="${argv[5]}"
-      return 0
-    fi
-  done < <(pgrep -u "$UID" -f \
-    "$SCRIPT_DIR/run_component_foreground.sh --supervisor $COMPONENT " || true)
-
   return 1
 }
 

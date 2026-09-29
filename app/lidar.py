@@ -16,28 +16,7 @@ NS = 1_000_000_000
 
 PACKET_HEADER_SIZE = 12
 
-BLOCK_SIZE = 130
-
-TAIL_SIZE = 28
-
 FULL_PACKET_SIZE = 1080
-
-_TAIL_MOTOR = struct.Struct("<H")
-
-_TAIL_U32 = struct.Struct("<I")
-
-
-def has_tail(payload: bytes) -> bool:
-    """True when the payload still carries a 28-byte tail after whole blocks."""
-    if len(payload) < PACKET_HEADER_SIZE + TAIL_SIZE:
-        return False
-    return (len(payload) - PACKET_HEADER_SIZE - TAIL_SIZE) % BLOCK_SIZE == 0
-
-
-def block_count(payload: bytes) -> int:
-    body = len(payload) - PACKET_HEADER_SIZE - (TAIL_SIZE if has_tail(payload) else 0)
-    return max(0, body // BLOCK_SIZE)
-
 
 _TAIL_FIELDS = struct.Struct("<10xBH6sIBI")
 
@@ -97,57 +76,6 @@ class SequenceTracker:
         }
 
 
-class ClockOffsetTracker:
-    """Track ``host - sensor`` so a run records its own clock relationship."""
-
-    def __init__(self):
-        self.count = 0
-        self.min = None
-        self.max = None
-        self.total = 0.0
-        self.first = None
-        self.last = None
-        self.first_host = None
-        self.last_host = None
-
-    def update(self, host_timestamp: float, sensor_ts: float | None):
-        if sensor_ts is None:
-            return
-        delta = float(host_timestamp) - float(sensor_ts)
-        self.count += 1
-        self.total += delta
-        if self.min is None or delta < self.min:
-            self.min = delta
-        if self.max is None or delta > self.max:
-            self.max = delta
-        if self.first is None:
-            self.first = delta
-            self.first_host = float(host_timestamp)
-        self.last = delta
-        self.last_host = float(host_timestamp)
-
-    def summary(self) -> dict:
-        if self.count == 0:
-            return {"samples": 0}
-        span = (
-            (self.last_host - self.first_host)
-            if self.first_host is not None and self.last_host is not None
-            else 0.0
-        )
-        drift = (self.last - self.first) if self.first is not None else 0.0
-        return {
-            "samples": self.count,
-            "host_minus_sensor_min": self.min,
-            "host_minus_sensor_max": self.max,
-            "host_minus_sensor_mean": self.total / self.count,
-            "host_minus_sensor_first": self.first,
-            "host_minus_sensor_last": self.last,
-            "observed_span_sec": span,
-            "drift_sec": drift,
-            "drift_ppm": (drift / span * 1e6) if span > 1.0 else None,
-        }
-
-
 _CALENDAR_SECONDS: dict[bytes, int] = {}
 
 
@@ -168,18 +96,17 @@ def _calendar_seconds(utc: bytes) -> int:
     return seconds
 
 
-def xt32_clock(payload: bytes) -> tuple[int, int, float]:
+def xt32_clock(payload: bytes) -> tuple[int, int]:
     """Hesai protocol 6.1: full 32-channel, 8-block datagram and native UTC tail.
 
-    Returns (native ns, sequence, native seconds); the tail is unpacked once.
+    Returns (native ns, sequence); the tail is unpacked once.
     """
     if len(payload) != 1080 or payload[:4] != b"\xee\xff\x06\x01" or payload[6:8] != b"\x20\x08":
         raise ValueError("Expected a complete PandarXT 32-channel packet")
     _mode, _rpm, utc, microseconds, _factory, sequence = _TAIL_FIELDS.unpack_from(payload, 1052)
     if microseconds >= 1_000_000:
         raise ValueError("Invalid LiDAR microseconds")
-    seconds = _calendar_seconds(utc)
-    return seconds * NS + microseconds * 1000, sequence, seconds + microseconds / 1e6
+    return _calendar_seconds(utc) * NS + microseconds * 1000, sequence
 
 
 PCAP_MAGIC_USEC = 0xA1B2C3D4
@@ -218,14 +145,12 @@ DEFAULT_DST_PORT = 2368
 
 
 def _fsync_directory(path: Path) -> None:
-    """Persist a rename on POSIX; Windows does not allow directory fsync."""
-    if os.name == "nt":
-        return
+    """Persist a rename (best effort)."""
     descriptor = None
     try:
-        descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        descriptor = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
         os.fsync(descriptor)
-    except (OSError, AttributeError):
+    except OSError:
         pass
     finally:
         if descriptor is not None:
@@ -343,22 +268,18 @@ class PcapLidarWriter:
     def __init__(
         self,
         directory: Path,
+        peer: LinkHeaderBuilder,
         seconds_per_file: float = 10.0,
         flush_bytes: int = 1 << 20,
-        gzip_output: bool = False,
         max_pending: int = 8,
-        peer: LinkHeaderBuilder | None = None,
     ):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.manifest_path = self.directory / "pcaps.jsonl"
         self.seconds_per_file = max(0.5, float(seconds_per_file))
         self.flush_bytes = max(4096, int(flush_bytes))
-        if gzip_output:
-            raise ValueError("Only uncompressed PCAP is supported")
-        self.gzip_output = False
         self.suffix = ".pcap"
-        self.peer = peer or LinkHeaderBuilder()
+        self.peer = peer
         self.sync_bytes = max(self.flush_bytes, 4 << 20)
         self._unsynced = 0
 
@@ -400,9 +321,6 @@ class PcapLidarWriter:
             errors = list(self.writer_errors)
         if errors:
             raise RuntimeError(f"LiDAR pcap writer failed: {errors}")
-
-    def set_peer(self, src_ip, src_port, dst_ip=None, dst_port=None):
-        self.peer.set_peer(src_ip, src_port, dst_ip, dst_port)
 
     def write_packet(self, timestamp: float, payload: bytes):
         if self.writer_errors:
@@ -460,13 +378,6 @@ class PcapLidarWriter:
         self.file_payload_bytes = 0
         self._submit(job)
 
-    def rotate(self):
-        """Close the current file so a run/clock boundary starts a new one."""
-        self._raise_if_writer_failed()
-        if self.closed:
-            raise RuntimeError("pcap writer is already closed")
-        self._seal_current()
-
     # ------------------------------------------------------------------
     # writer thread
     # ------------------------------------------------------------------
@@ -511,19 +422,11 @@ class PcapLidarWriter:
         """
         try:
             handle.flush()
-        except (OSError, ValueError):
-            return
-        raw = getattr(handle, "fileobj", None) or getattr(handle, "myfileobj", None)
-        try:
-            fileno = raw.fileno() if raw is not None else handle.fileno()
-        except (OSError, ValueError, AttributeError):
-            return
-        try:
             if full:
-                os.fsync(fileno)
+                os.fsync(handle.fileno())
             else:
-                os.fdatasync(fileno)
-        except (OSError, ValueError, AttributeError):
+                os.fdatasync(handle.fileno())
+        except (OSError, ValueError):
             pass
 
     def _apply(self, job, handle, temp_path):

@@ -6,9 +6,7 @@
 live_detection/
   main_live.py      실시간 포트홀 탐지 (카메라 탐지 + 라이다 깊이 측정)
   camera_calib_best_effort_v30.json   카메라 렌즈 보정값 (30도 장착, main_live.py가 읽음)
-  camera_calib_best_effort.json       카메라 렌즈 보정값 (45도 장착)
   XT32_Angle_Correction_File.csv      라이다 채널 각도 (main_live.py가 읽음)
-  XT32_Angle_Correction_File_v30.csv  라이다 채널 각도 (내용은 위와 같음, 현재 사용 안 함)
   best_seg.dxnn     main_live.py 모델 (저장소에 넣지 않음, ./download_models.sh로 받음)
   download_models.sh   모델 다운로드 (Hugging Face HudatersU/road_maintanance, sha256 확인)
   .env.example      main_live.py 설정 예시 (.env로 복사해 채움, .env는 저장소 제외)
@@ -39,6 +37,8 @@ live_detection/
 현재 사용하지 않는 LCZ·BIN 저장, 프레임별 LiDAR 잘라 저장하기, 비PTP 시각 추정,
 PyAV·OpenCV·FFmpeg 대체 수신 경로, 원본 영상 복사와 화면 표시 코드는 제거했습니다.
 PTP 기능을 기존 클래스에 실행 중 덮어씌우던 연결도 없애고 수집 코드에 직접 통합했습니다.
+항상 켜 두던 설정 스위치(`record_enabled`, `lidar_enabled` 등)와 코드가 읽지 않는 설정 키도 없앴습니다.
+`config.yaml`에는 수집기가 실제로 읽는 값만 있습니다.
 Python이 만드는 `app/__pycache__`는 실행 캐시입니다.
 `var`가 없어도 시작 시 다시 만들며, 일반 사용자 수집기가 PID를 기록할 수 있도록
 PTP 서비스와 실행 도우미가 디렉터리 소유자를 `hudaters`로 확인합니다.
@@ -69,9 +69,9 @@ PTP 기준 시계는 계속 동작합니다. 분석 프로세스 자동 실행�
 자동 실행 항목은 이 폴더의 `launch_component_terminal.sh collector`를 실행합니다.
 터미널 실행, 수집 실행·종료 제어, 원격 터미널 연결, SSD 확인 스크립트를 모두
 이 폴더로 옮겼습니다. 현재 수집 실행에는 `porthole` 폴더의 코드가 필요하지 않습니다.
-이전 `porthole`의 같은 이름 4개는 호환용 심볼릭 링크이며 실제 코드는 이 폴더에만 있습니다.
-공유 스크립트의 수동 `analysis`·`uploader` 명령은 예전 프로그램 경로를 유지하지만,
-두 프로그램의 자동 실행은 계속 꺼져 있습니다.
+이 폴더의 스크립트는 `collector`(수집)와 `analysis`(`main_live.py`) 두 가지만 실행합니다.
+이전 `porthole` 폴더의 같은 이름 스크립트 4개는 예전 `ptp_pothole` 폴더를 가리키는 링크이며
+이 폴더와 관계없습니다.
 고정 실행 도우미 `/usr/local/sbin/ptp-pothole-collector-foreground`가
 일반 사용자 수집기에 PTP 패킷 확인에 필요한 네트워크 권한을 제공합니다.
 이 도우미와 systemd·sudoers·LXQt 자동 시작 등록은 운영체제의 표준 위치에 유지합니다.

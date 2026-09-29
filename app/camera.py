@@ -20,7 +20,6 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from types import SimpleNamespace
 from ptp import GUARD, NS, RtpClock, sender_reports
 
 
@@ -38,7 +37,6 @@ class CameraStream:
         self.pts_map = collections.OrderedDict()
         self.reports = []
         self.sessions = set()
-        self.errors = []
         gi.require_version("GstVideo", "1.0")
         from gi.repository import GstVideo
 
@@ -122,8 +120,8 @@ class CameraStream:
                     # Drained by the collector; bound memory if its writer fails.
                     if len(self.reports) > 256:
                         del self.reports[:-256]
-        except Exception as exc:
-            self.errors.append(str(exc))
+        except Exception:
+            pass  # a malformed report only delays the RTP-to-UTC mapping
 
     def start(self):
         if self.pipeline.set_state(self.Gst.State.PLAYING) == self.Gst.StateChangeReturn.FAILURE:
@@ -183,9 +181,7 @@ class CameraStream:
             rtp=rtp_info[0] if rtp_info else None,
             ssrc=rtp_info[1] if rtp_info else None,
             camera_utc_ns=timestamp,
-            timestamp_source="rtcp_sender_report" if timestamp is not None else None,
             timestamp_error=error,
-            is_keyframe=not b.has_flags(self.Gst.BufferFlags.DELTA_UNIT),
             reports=reports,
         )
 
@@ -204,12 +200,11 @@ class GstFrame:
         self.payload = payload
         self.jpeg = jpeg  # payload is a GPU-encoded JPEG, not NV12 pixels
 
-    def to_ndarray(self, format="bgr24"):
+    def to_ndarray(self):
+        """BGR image of an NV12 frame (the CPU-encoding fallback)."""
         import cv2
         import numpy as np
 
-        if format != "bgr24":
-            raise ValueError(format)
         nv12 = np.frombuffer(self.payload, np.uint8).reshape(self.height * 3 // 2, self.width)
         return cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
 
@@ -240,11 +235,6 @@ class GstContainer:
             self.process.stdin.close()
             self.first = self._frame(timeout)
             self.encoder = "vaapijpegenc" if self.first.jpeg else "opencv_cpu"
-            self.stream = SimpleNamespace(
-                time_base=1e-9,
-                thread_type=None,
-                codec_context=SimpleNamespace(width=self.first.width, height=self.first.height),
-            )
         except BaseException:
             self.close()
             raise
@@ -289,7 +279,7 @@ class GstContainer:
         frame.metadata = metadata
         return frame
 
-    def decode(self, video=0):
+    def decode(self):
         while not self.closed:
             frame, self.first = self.first, None
             yield frame if frame is not None else self._frame(3)
@@ -314,8 +304,6 @@ class GstContainer:
 class CameraCapture:
     """Read PTP-qualified frames while preserving capture timestamps and order."""
 
-    nonblocking_read = True
-
     def __init__(self, url, buffer_size=8, watchdog_sec=5.0, connection_timeout_sec=1.0,
                  jpeg_quality=None):
         self.url = url
@@ -335,33 +323,20 @@ class CameraCapture:
         self.decoded_count = 0
         self.delivered_count = 0
         self.selected_count = 0
-        self.skipped_count = 0
         self.overwritten_count = 0
         self.read_failure_count = 0
-        self.pts_missing_count = 0
         self.pts_settling_skipped_count = 0
-        self.settle_timeout_count = 0
         self.timestamp_backstep_dropped_count = 0
         self.buffer_high_watermark = 0
         self.last_info = {}
-        self.grabbed_frame = None
-        self.time_base = None
-        self.next_capture_deadline = None
-        self.width = 0
-        self.height = 0
         self.startup_settled = False
-        self.first_pts_arrival = None
-        self.stream_reset_count = 0
         self.last_emitted_capture = None
 
         # Open here, not on the worker thread: the collector calls isOpened()
         # immediately after constructing a capture and treats False as a failed
         # connection, so an asynchronous open reads as a dead camera.
-        self.container, self.stream = self._open()
-        self.stream.thread_type = "AUTO"
-        self.time_base = float(self.stream.time_base) if self.stream.time_base else 0.0
-        self.width = self.stream.codec_context.width
-        self.height = self.stream.codec_context.height
+        self.container = GstContainer(self.url, timeout=max(15.0, self.connection_timeout_sec * 5),
+                                      jpeg_quality=self.jpeg_quality)
         self.opened = True
 
         self.thread = threading.Thread(target=self._run, name="ptp-camera-capture", daemon=True)
@@ -372,8 +347,6 @@ class CameraCapture:
             if not self.running or not self.opened or not self.thread.is_alive():
                 return False
             reference = self.frame_timestamp or self.started_at
-        if self.watchdog_sec <= 0:
-            return True
         return time.time() - reference <= self.watchdog_sec
 
     def read(self):
@@ -393,59 +366,37 @@ class CameraCapture:
         with self.lock:
             result = {
                 "mode": "gstreamer_vaapi_ptp",
-                "hardware_decoder": getattr(self.container, "decoder", None),
-                "jpeg_encoder": getattr(self.container, "encoder", None),
+                "hardware_decoder": self.container.decoder,
+                "jpeg_encoder": self.container.encoder,
                 "decoded_frames": self.decoded_count,
                 "delivered_frames": self.delivered_count,
                 "selected_frames": self.selected_count,
-                "skipped_frames": self.skipped_count,
                 "overwritten_frames": self.overwritten_count,
                 "read_failures": self.read_failure_count,
-                "pts_missing_frames": self.pts_missing_count,
                 "pts_settling_skipped_frames": self.pts_settling_skipped_count,
-                "pts_settle_timeouts": self.settle_timeout_count,
-                "pts_stream_resets": self.stream_reset_count,
-                "timestamp_backstep_dropped_frames": (self.timestamp_backstep_dropped_count),
+                "timestamp_backstep_dropped_frames": self.timestamp_backstep_dropped_count,
                 "pts_startup_settled": self.startup_settled,
                 "buffer_capacity": self.buffer_size,
                 "buffer_pending": len(self.frames),
                 "buffer_high_watermark": self.buffer_high_watermark,
-                "camera_time_base": self.time_base,
+                "camera_time_base": 1e-9,
                 "last_frame_timestamp": self.frame_timestamp,
                 "last_error": self.last_error,
             }
         result.update(
-            mode="gstreamer_vaapi_ptp",
             ptp_qualification=GUARD.qualification(),
             ptp_rejected=dict(GUARD.rejected),
         )
         return result
-
-    def grab(self):
-        ok, frame = self.read()
-        self.grabbed_frame = frame if ok else None
-        return ok
-
-    def retrieve(self):
-        frame = self.grabbed_frame
-        if frame is None:
-            return False, None
-        self.grabbed_frame = None
-        return True, frame
 
     def release(self):
         self.running = False
         if self.thread.is_alive():
             self.thread.join(timeout=6.0)
 
-    def _open(self):
-        container = GstContainer(self.url, timeout=max(15.0, self.connection_timeout_sec * 5),
-                                 jpeg_quality=self.jpeg_quality)
-        return container, container.stream
-
     def _run(self):
         try:
-            for frame in self.container.decode(video=0):
+            for frame in self.container.decode():
                 if not self.running:
                     break
                 meta = frame.metadata

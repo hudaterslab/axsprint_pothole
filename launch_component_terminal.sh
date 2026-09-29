@@ -5,10 +5,10 @@ SCRIPT_DIR="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
 COMPONENT="${1:-}"
 
 case "$COMPONENT" in
-  collector|uploader|analysis)
+  collector|analysis)
     ;;
   *)
-    echo "usage: $0 {collector|uploader|analysis}" >&2
+    echo "usage: $0 {collector|analysis}" >&2
     exit 2
     ;;
 esac
@@ -16,7 +16,7 @@ esac
 # LXQt autostart is evaluated independently in every graphical login.  The
 # machine has a local SDDM session on :0 and may also have one or more XRDP
 # sessions on :10, :11, ... .  Starting the same autostart in XRDP would open
-# duplicate terminals while the local-console collector/uploader still own
+# duplicate terminals while the local-console collector/analysis still own
 # their locks.
 #
 # Collection remains owned by the physical-console session.  XRDP opens an
