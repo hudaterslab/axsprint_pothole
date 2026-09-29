@@ -4,12 +4,9 @@ Run: python3 -u main_live.py
 Input: /mnt/ssd/porthole_runs/YYYYMMDD/run/{frames,lidar,gps,meta}
 Every committed frame is processed in FIFO order; checkpoints and upload retries
 survive restarts. No other project Python file is imported or executed.
---lidar-workers N moves per-frame LiDAR work to N processes (default 0: all here);
-tracking and commits always stay in source order in the main process.
 Model/calibration files and installed NumPy/OpenCV/DEEPX runtime are data/runtime
 dependencies. PTP synchronizes clocks; GPS speed, when available, compensates
-vehicle motion between LiDAR packets and the image (--motion auto, the default).
---motion required drops LiDAR depth without GPS speed; --motion off never compensates.
+vehicle motion between LiDAR packets and the image.
 """
 
 from __future__ import annotations
@@ -24,12 +21,10 @@ for _thread_env in (
     os.environ.setdefault(_thread_env, "1")
 from collections import OrderedDict
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import datetime
-from datetime import timedelta
 from datetime import timezone
 from functools import lru_cache
 from pathlib import Path
@@ -43,7 +38,6 @@ import cv2
 import hashlib
 import json
 import math
-import multiprocessing
 import numpy as np
 import re
 import select
@@ -61,17 +55,22 @@ import urllib.parse
 import urllib.request
 import uuid
 import zlib
-import argparse
 
 POTHOLE_DEPTH_M = 0.005
 
 PROJECT = Path(__file__).resolve().parent
 
+ROOT = Path("/mnt/ssd/porthole_runs")  # collector recordings
+
+OUTPUT = Path("/mnt/ssd/porthole_live_analysis")
+
+BATCH_SIZE = 16  # frames per checkpoint
+
+POLL_SECONDS = 0.5
+
+MIN_FREE_GB = 10  # analysis pauses below this, so recording keeps the disk
+
 OFFSET_SEC = 0.0
-
-CAMERA_TIMING_MODE = "recorded"
-
-LIDAR_MOTION_ENABLED = True
 
 ALIGNMENT_PROFILE_ID = "ptp_live_recorded_utc_v1"
 
@@ -92,10 +91,6 @@ CAMERA_SPATIAL_CALIBRATION = {
 }
 
 LIDAR_CALIBRATION = PROJECT / "XT32_Angle_Correction_File.csv"
-
-SAVE_IMAGES = True
-
-POTHOLE_MIN_DEPTH_M = POTHOLE_DEPTH_M
 
 CONFIDENCE_THRESHOLD = 0.25
 
@@ -293,7 +288,7 @@ class PreparedUpload:
     preparation_ms: float
 
 
-def prepare_upload(source, manifest, compression_level=1):
+def prepare_upload(source, manifest):
     """Complete source I/O, hashes and optional lossless encoding before send time."""
     begin = time.monotonic_ns()
     manifest = dict(manifest, _receive_token=uuid.uuid4().hex)
@@ -301,8 +296,6 @@ def prepare_upload(source, manifest, compression_level=1):
     validate_manifest(manifest)
     aliases = content_aliases(manifest["files"])
     expected = sum(info["bytes"] for name, info in manifest["files"].items() if name not in aliases)
-    if type(compression_level) is not int or not 0 <= compression_level <= 9:
-        raise ValueError("Invalid upload compression level")
     encoded_files, segments = [], []
     for name, info in manifest["files"].items():
         raw = b"".join(payload_chunks(Path(source), {name: info}, aliases))
@@ -310,12 +303,8 @@ def prepare_upload(source, manifest, compression_level=1):
             continue  # Alias content was verified but is sent only once.
         encoded, encoding = raw, "identity"
         # JPEG already has compression. Recompressing it wasted most CPU time.
-        if (
-            compression_level
-            and Path(name).suffix.lower() in (".json", ".pcap")
-            and len(raw) >= 1024
-        ):
-            compressed = zlib.compress(raw, compression_level)
+        if Path(name).suffix.lower() in (".json", ".pcap") and len(raw) >= 1024:
+            compressed = zlib.compress(raw, 1)
             if len(compressed) <= len(raw) - max(256, int(len(raw) * 0.05)):
                 encoded, encoding = compressed, "zlib"
         encoded_files.append(encoded)
@@ -534,13 +523,8 @@ def serve(target):
 
 
 class PersistentUploader:
-    def __init__(self, options, relative, command=None, timeout=60):
-        self.options, self.relative, self.command, self.timeout = (
-            options,
-            relative,
-            command,
-            timeout,
-        )
+    def __init__(self, options, relative, timeout=60):
+        self.options, self.relative, self.timeout = (options, relative, timeout)
         self.proc = None
         self.buffer = bytearray()
 
@@ -586,7 +570,7 @@ class PersistentUploader:
             return
         self.close()
         target = self.options.destination.rstrip("/") + "/" + self.relative.as_posix()
-        command = self.command or [
+        command = [
             "ssh",
             "-T",
             "-i",
@@ -677,9 +661,7 @@ class PersistentUploader:
 
     def upload(self, source, manifest):
         try:
-            prepared = prepare_upload(
-                source, manifest, getattr(self.options, "compression_level", 1)
-            )
+            prepared = prepare_upload(source, manifest)
             self.connect()
             deadline = time.monotonic() + max(
                 self.timeout,
@@ -733,13 +715,6 @@ class PersistentUploader:
             proc.kill()
             proc.wait(timeout=5)
         proc.stdout.close()
-
-    def __enter__(self):
-        self.connect()
-        return self
-
-    def __exit__(self, *args):
-        self.close()
 
 
 class PermanentUploadError(Exception):
@@ -832,7 +807,7 @@ class LiDAR2Camera:
         self.fx, self.fy = (float(data["fx"]), float(data["fy"]))
         self.cx, self.cy = (float(data["cx"]), float(data["cy"]))
         self.k1, self.k2 = (float(data["D"][0]), float(data["D"][1]))
-        spatial = data if CAMERA_SPATIAL_CALIBRATION is None else CAMERA_SPATIAL_CALIBRATION
+        spatial = CAMERA_SPATIAL_CALIBRATION
         self.R = np.asarray(spatial["R_sensor_to_cam"], dtype=np.float64)
         self.t = np.asarray(spatial["t_cam"], dtype=np.float64).reshape(3)
         if self.R.shape != (3, 3):
@@ -851,7 +826,7 @@ class LiDAR2Camera:
             "t_cam": self.t.tolist(),
         }
 
-    def convert_3D_to_camera_coords(self, sensor_xyz, print_info=False):
+    def convert_3D_to_camera_coords(self, sensor_xyz):
         points = np.asarray(sensor_xyz, dtype=np.float64)
         return (points - self.t) @ self.R.T
 
@@ -869,17 +844,12 @@ class LiDAR2Camera:
         valid &= np.isfinite(pixels).all(axis=1)
         return (pixels, valid)
 
-    def convert_3D_to_2D(self, sensor_xyz, print_info=False):
-        return self.project(sensor_xyz)[0]
-
 
 model_infer__CLASS_NAMES = ("Crack", "Pothole")
 
 SUSPECT_CLASS_IDS = frozenset((0, 1))
 
 MASK_COEFFICIENTS = 32
-
-DETECTION_CHANNELS = 4 + len(model_infer__CLASS_NAMES) + MASK_COEFFICIENTS
 
 
 @dataclass(frozen=True)
@@ -900,18 +870,11 @@ class Detection:
     box_xyxy: np.ndarray
     mask_coefficients: np.ndarray
     mask: Optional[np.ndarray] = None
-    track_id: Optional[str] = None
-    occurrence_index: int = 1
-    mask_path: Optional[str] = None
 
 
-def letterbox_rgb_uint8(
-    image_bgr: np.ndarray, size: int = 640, out: Optional[np.ndarray] = None
-) -> tuple[np.ndarray, LetterboxContext]:
-    """Return contiguous NHWC RGB uint8 without keeping an original-image copy.
-
-    ``out``, a (1, size, size, 3) uint8 array, is filled in place when given.
-    """
+def letterbox_rgb_uint8(image_bgr: np.ndarray, out: np.ndarray) -> tuple[np.ndarray, LetterboxContext]:
+    """Fill out, a (1, 640, 640, 3) uint8 array, with the NHWC RGB model input."""
+    size = 640
     height, width = image_bgr.shape[:2]
     scale = min(size / width, size / height)
     resized_width = max(1, min(size, int(round(width * scale))))
@@ -919,7 +882,7 @@ def letterbox_rgb_uint8(
     resized = cv2.resize(image_bgr, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
     pad_x = (size - resized_width) // 2
     pad_y = (size - resized_height) // 2
-    input_nhwc = np.empty((1, size, size, 3), dtype=np.uint8) if out is None else out
+    input_nhwc = out
     input_nhwc.fill(114)
     input_nhwc[0, pad_y : pad_y + resized_height, pad_x : pad_x + resized_width] = resized[:, :, ::-1]
     context = LetterboxContext(
@@ -1060,8 +1023,7 @@ def attach_masks(
 class DXNNDetector:
     def __init__(self, model_path, confidence=0.25, nms_iou=0.45, mask_threshold=0.5,
                  class_names=model_infer__CLASS_NAMES, selected_class_ids=SUSPECT_CLASS_IDS):
-        # Imported here so LiDAR worker processes never load the NPU runtime.
-        import dx_engine
+        import dx_engine  # the NPU runtime, needed only once analysis starts
 
         self.model_path = Path(model_path).expanduser().resolve()
         self.class_names = tuple(class_names)
@@ -1081,11 +1043,8 @@ class DXNNDetector:
         self.engine = self.engines[0]
         # DXRT 3.3 keeps about 400 KB for every request made with a new input
         # array (none when one is reused), so requests take their input from
-        # fixed buffers: one per request in flight, plus one for detect().
-        self.inputs = [np.empty((1, 640, 640, 3), dtype=np.uint8) for _ in range(4)]
-        self.core_totals = [dict(completed=0, npu_us=0, latency_us=0) for _ in self.engines]
-        self.core_report_at = time.monotonic()
-        self.core_report_totals = [dict(row) for row in self.core_totals]
+        # fixed buffers, one per request in flight.
+        self.inputs = [np.empty((1, 640, 640, 3), dtype=np.uint8) for _ in range(3)]
         self.confidence = float(confidence)
         self.nms_iou = float(nms_iou)
         self.mask_threshold = float(mask_threshold)
@@ -1104,29 +1063,13 @@ class DXNNDetector:
             self.dispose()
             raise RuntimeError(f"Unexpected outputs for {self.model_path.name}: {outputs}")
 
-        self.metadata = dict(
-            file_name=self.model_path.name, sha256=sha(self.model_path), runtime="DXRT",
-            python_runtime_version=getattr(dx_engine, "__version__", None),
-            class_names=list(self.class_names), class_filter=sorted(self.selected_class_ids),
-            input_shape=[1, 640, 640, 3], input_layout="NHWC", input_dtype="uint8",
-            color_order="RGB", resize="centered_letterbox", pad_value=114,
-            confidence_threshold=self.confidence, nms_iou=self.nms_iou,
-            mask_threshold=self.mask_threshold,
-        )
-
     def decode(self, outputs, context):
         detections = decode_detections(outputs[0], context, self.confidence, self.nms_iou,
                                        self.class_names, self.selected_class_ids)
         attach_masks(detections, outputs[1], context, self.mask_threshold)
         return detections
 
-    def detect(self, frame):
-        tensor, context = letterbox_rgb_uint8(frame, out=self.inputs[3])
-        outputs = self.engine.run(tensor)
-        self._record_completion(self.engine)
-        return self.decode(outputs, context)
-
-    def iter_detect(self, records, load_image, wait_for_collector=lambda: None):
+    def iter_detect(self, records, load_image):
         """Keep at most three native requests in flight; yield in source order.
 
         Pending entries own input tensors until wait() completes. Refill before
@@ -1145,11 +1088,10 @@ class DXNNDetector:
             except StopIteration:
                 exhausted = True
                 return
-            wait_for_collector()
             image = load_image(record)
             # At most three requests are pending, so a buffer comes round
             # again only after its request has been waited for.
-            tensor, context = letterbox_rgb_uint8(image, out=self.inputs[submitted % 3])
+            tensor, context = letterbox_rgb_uint8(image, self.inputs[submitted % 3])
             submitted += 1
             engine = self.engines[next_engine]
             next_engine = (next_engine + 1) % len(self.engines)
@@ -1162,7 +1104,6 @@ class DXNNDetector:
             while pending:
                 engine, job_id, record, image, tensor, context = pending[0]
                 outputs = engine.wait(job_id)
-                self._record_completion(engine)
                 pending.popleft()
                 detections = self.decode(outputs, context)
                 if not exhausted:
@@ -1180,48 +1121,11 @@ class DXNNDetector:
             if first_error is not None:
                 raise first_error
 
-    def _record_completion(self, engine):
-        row = self.core_totals[self.engines.index(engine)]
-        row["completed"] += 1
-        row["npu_us"] += int(engine.get_npu_inference_time())
-        row["latency_us"] += int(engine.get_latency())
-
-    def core_metrics(self):
-        now = time.monotonic()
-        elapsed = now - self.core_report_at
-        result = []
-        for core, (row, before) in enumerate(zip(self.core_totals, self.core_report_totals)):
-            count = row["completed"] - before["completed"]
-            result.append(
-                dict(
-                    core=core,
-                    **row,
-                    interval_completed=count,
-                    interval_seconds=elapsed,
-                    fps=count / elapsed if elapsed else 0,
-                    npu_ms=((row["npu_us"] - before["npu_us"]) / count / 1000 if count else None),
-                    latency_ms=(
-                        (row["latency_us"] - before["latency_us"]) / count / 1000 if count else None
-                    ),
-                )
-            )
-        self.core_report_at = now
-        self.core_report_totals = [dict(row) for row in self.core_totals]
-        return result
-
     def dispose(self):
         for engine in self.engines:
             if hasattr(engine, "dispose"):
                 engine.dispose()
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        self.dispose()
-
-
-VERSION = "road_flow_iou_v2"
 
 DEFAULTS = dict(
     max_missed_frames=5,
@@ -1299,66 +1203,22 @@ class Track:
     track_id: int
     class_id: int
     box: np.ndarray
-    first_frame: int
     last_frame: int
-    observations: int = 0
-    observed_depth_frames: int = 0
-    unobserved_frames: int = 0
     confirmed: bool = False
     confirmed_frame: int | None = None
     confirmed_depth_m: float | None = None
     velocity: np.ndarray = field(default_factory=lambda: np.zeros(4))
     last_detection_box: np.ndarray | None = None
 
-    def summary(self, closed_frame, reason):
-        return dict(
-            track_id=self.track_id,
-            class_id=self.class_id,
-            first_frame=self.first_frame,
-            last_frame=self.last_frame,
-            closed_frame=closed_frame,
-            close_reason=reason,
-            observations=self.observations,
-            observed_depth_frames=self.observed_depth_frames,
-            unobserved_frames=self.unobserved_frames,
-            confirmed=self.confirmed,
-            confirmed_frame=self.confirmed_frame,
-            confirmed_depth_m=self.confirmed_depth_m,
-            state=(
-                "confirmed"
-                if self.confirmed
-                else ("unobserved" if not self.observed_depth_frames else "observed_not_confirmed")
-            ),
-        )
-
 
 class ObjectTracker:
-    def __init__(self, **settings):
-        unknown = set(settings) - set(DEFAULTS)
-        if unknown:
-            raise ValueError(f"Unknown tracking settings: {unknown}")
-        self.settings = {**DEFAULTS, **settings}
-        if (
-            not 0 < self.settings["association_iou"] <= 1
-            or not 0 <= self.settings["max_missed_frames"] <= 30
-        ):
-            raise ValueError("Invalid association settings")
+    def __init__(self):
+        self.settings = DEFAULTS
         self.active = {}
         self.next_id = 1
         self.previous = None
         self.previous_points = None
         self.last_frame = None
-        self.last_motion = {}
-
-    def configuration(self):
-        return dict(
-            version=VERSION,
-            **self.settings,
-            identity_inputs="camera_pixels_class_bbox_only",
-            confirmation_policy="first_valid_frame_depth_pass_latched",
-            scope="one_passage_per_replay_loop",
-            unobserved_policy="retain_pending_then_report_separately_not_drop_gt",
-        )
 
     def _motion(self, image, needed):
         height, width = image.shape[:2]
@@ -1370,7 +1230,6 @@ class ObjectTracker:
         )
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY) if small.ndim == 3 else small
         matrix = None
-        detail = dict(method="no_motion", valid=False, inliers=0)
         if (
             needed
             and self.previous is not None
@@ -1409,12 +1268,6 @@ class ObjectTracker:
                             else np.empty((0, 2))
                         )
                         spread = np.ptp(selected, axis=0) if len(selected) else np.zeros(2)
-                        detail = dict(
-                            method="road_fit_rejected",
-                            valid=False,
-                            inliers=count,
-                            pairs=len(a),
-                        )
                         if (
                             homography is not None
                             and np.isfinite(homography).all()
@@ -1425,12 +1278,6 @@ class ObjectTracker:
                         ):
                             scaling = np.diag([scale, scale, 1.0])
                             matrix = np.linalg.inv(scaling) @ homography @ scaling
-                            detail = dict(
-                                method="road_lk_homography",
-                                valid=True,
-                                inliers=count,
-                                pairs=len(a),
-                            )
         mask = np.zeros(gray.shape, np.uint8)
         h, w = gray.shape
         mask[int(0.12 * h) : int(0.74 * h), int(0.12 * w) : int(0.9 * w)] = 255
@@ -1440,7 +1287,6 @@ class ObjectTracker:
             else None
         )
         self.previous = gray
-        self.last_motion = detail
         return matrix
 
     @staticmethod
@@ -1454,20 +1300,18 @@ class ObjectTracker:
         ratio = np.prod(result[2:] - result[:2]) / np.prod(box[2:] - box[:2])
         return result if 0.1 <= ratio <= 10 else box.copy()
 
-    def update(self, frame, image, detections, observations=None):
-        """Return a row for every detection plus closed tracks; no future data."""
+    def update(self, frame, image, detections, observations):
+        """Return a row for every detection; no future data."""
         frame = int(frame)
         if self.last_frame is not None and frame <= self.last_frame:
             raise ValueError("New passage/replay requires a new tracker; frame IDs must increase")
-        if observations is not None and len(detections) != len(observations):
+        if len(detections) != len(observations):
             raise ValueError("Tracking observation count mismatch")
         parsed = [(int(d["class_id"]), bounds(d)) for d in detections]
         if any((cls not in (0, 1) for (cls, _) in parsed)):
             raise ValueError("Unsupported tracking class")
-        closed = []
         for tid, track in list(self.active.items()):
             if frame - track.last_frame > self.settings["max_missed_frames"] + 1:
-                closed.append(track.summary(frame, "missed_frame_limit"))
                 del self.active[tid]
         matrix = self._motion(image, bool(self.active or detections))
         for track in self.active.values():
@@ -1491,27 +1335,22 @@ class ObjectTracker:
                 track.box = box.copy()
                 track.last_frame = frame
             else:
-                track = Track(self.next_id, cls, box.copy(), frame, frame)
+                track = Track(self.next_id, cls, box.copy(), frame)
                 self.next_id += 1
                 self.active[track.track_id] = track
                 score, gap = (None, 0)
             track.last_detection_box = box.copy()
-            track.observations += 1
             was_confirmed = track.confirmed
-            observation = observations[j] if observations is not None else None
-            depth = None if observation is None else observation.get("max_depth_m")
-            reason = None if observation is None else observation.get("reason")
+            observation = observations[j]
+            depth = observation.get("max_depth_m")
+            reason = observation.get("reason")
             valid_depth = (
                 cls == 1
                 and depth is not None
                 and math.isfinite(float(depth))
                 and (reason in ("depth_pass", "depth_below_threshold"))
             )
-            if valid_depth:
-                track.observed_depth_frames += 1
-            elif cls == 1:
-                track.unobserved_frames += 1
-            if observation is not None and bool(observation.get("accepted")):
+            if bool(observation.get("accepted")):
                 if cls == 1 and (
                     not valid_depth
                     or reason != "depth_pass"
@@ -1547,11 +1386,6 @@ class ObjectTracker:
                 )
             )
         self.last_frame = frame
-        return (rows, closed)
-
-    def finish(self):
-        rows = [track.summary(self.last_frame, "passage_end") for track in self.active.values()]
-        self.active.clear()
         return rows
 
 
@@ -1561,27 +1395,13 @@ ALLOWED_DAMAGE_TYPES = {"road_damage", "pothole", "linear_crack"}
 
 DAMAGE_TYPE_KO = {"pothole": "포트홀", "linear_crack": "크랙", "road_damage": "러팅"}
 
-KMA_BASE_URL_ENV = "KMA_BASE_URL"
 
-KMA_SERVICE_KEY_ENV = "KMA_SERVICE_KEY"
-
-DEFAULT_KMA_BASE_URL = "https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0"
-
-KMA_ASOS_BASE_URL_ENV = "KMA_ASOS_BASE_URL"
-
-KMA_ASOS_SERVICE_KEY_ENV = "KMA_ASOS_SERVICE_KEY"
-
-DEFAULT_KMA_ASOS_BASE_URL = "https://apis.data.go.kr/1360000/AsosHourlyInfoService"
-
-ASOS_STATIONS_PATH = Path(__file__).with_name("asos_stations.csv")
-
-
-def _load_local_env(path: Optional[Path] = None) -> None:
+def _load_local_env() -> None:
     """Load a sibling .env without overriding explicitly set environment values.
 
     As in a shell, a later assignment in the file wins over an earlier one.
     """
-    env_path = Path(path) if path is not None else Path(__file__).with_name(".env")
+    env_path = Path(__file__).with_name(".env")
     if not env_path.is_file():
         return
     values = {}
@@ -1609,20 +1429,6 @@ def camera_time_kst(timestamp: float) -> datetime:
     return datetime.fromtimestamp(float(timestamp), timezone.utc).astimezone(KST)
 
 
-def artifact_stem(
-    camera_timestamp: float, camera_index: int, damage_type: str, cluster_id: int
-) -> str:
-    damage_type = str(damage_type).strip().lower()
-    if damage_type not in ALLOWED_DAMAGE_TYPES:
-        raise ValueError(
-            f"damage_type must be one of {sorted(ALLOWED_DAMAGE_TYPES)}, got {damage_type!r}"
-        )
-    instant = camera_time_kst(camera_timestamp)
-    milliseconds = instant.microsecond // 1000
-    time_part = instant.strftime("%Y%m%d_%H%M%S") + f"_{milliseconds:03d}"
-    return f"{time_part}_{damage_type}_c{int(camera_index):08d}_d{int(cluster_id):03d}"
-
-
 def _finite_float(value) -> Optional[float]:
     try:
         number = float(value)
@@ -1631,38 +1437,19 @@ def _finite_float(value) -> Optional[float]:
     return number if math.isfinite(number) else None
 
 
-def write_damage_json(path: Path, payload: dict) -> None:
-    path = Path(path)
-    partial = path.with_suffix(path.suffix + ".partial")
-    partial.unlink(missing_ok=True)
-    partial.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False),
-        encoding="utf-8",
-    )
-    partial.replace(path)
-
-
 def build_damage_payload(
     *,
     damage_type: str,
-    camera_index: int,
     camera_timestamp: float,
-    lidar_frame_id: int,
     lidar_timestamp: float,
     time_error_sec: float,
     cluster: dict,
     bbox: tuple[int, int, int, int],
     polygons_px: list[list[dict]],
     gps: dict,
-    weather: dict,
     vehicle_type: str,
     sensor_mount_height_cm: float,
     sensor_mount_angles_xyz_deg: dict,
-    source_image: str,
-    json_name: str,
-    image_name: str,
-    sensor_mount_angle_convention: str = "",
-    sensor_mount_angle_source: str = "",
 ) -> dict:
     damage_type = str(damage_type).strip().lower()
     if damage_type not in ALLOWED_DAMAGE_TYPES:
@@ -1670,15 +1457,15 @@ def build_damage_payload(
     camera_dt = camera_time_kst(camera_timestamp)
     lidar_dt = camera_time_kst(lidar_timestamp)
     x0, y0, x1, y1 = (int(value) for value in bbox)
+    # No weather service is configured on the terminals.
     compact_weather = {
-        "source": weather.get("source"),
-        "status": weather.get("status"),
-        "condition": weather.get("condition"),
-        "temperature_c": _finite_float(weather.get("temperature_c")),
-        "humidity_pct": _finite_float(weather.get("humidity_pct")),
+        "source": "KMA_DATA_GO_KR_ULTRA_SHORT_NOWCAST",
+        "status": "unavailable",
+        "condition": None,
+        "temperature_c": None,
+        "humidity_pct": None,
+        "reason": "No KMA weather API is configured",
     }
-    if weather.get("status") != "ok":
-        compact_weather["reason"] = weather.get("reason")
     return {
         "type": DAMAGE_TYPE_KO[damage_type],
         "vehicle": str(vehicle_type),
@@ -1727,412 +1514,6 @@ def build_damage_payload(
     }
 
 
-def unavailable_weather(reason: str, source: str = "KMA_DATA_GO_KR_ULTRA_SHORT_NOWCAST") -> dict:
-    return {"source": str(source), "status": "unavailable", "reason": str(reason)}
-
-
-def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    radius_km = 6371.0088
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dp = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dp / 2.0) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2.0) ** 2
-    return 2.0 * radius_km * math.asin(math.sqrt(a))
-
-
-def latlon_to_kma_grid(latitude_deg: float, longitude_deg: float) -> tuple[int, int]:
-    """Convert WGS84 latitude/longitude to KMA DFS 5 km grid coordinates."""
-    re_km = 6371.00877
-    grid_km = 5.0
-    slat1 = math.radians(30.0)
-    slat2 = math.radians(60.0)
-    olon = math.radians(126.0)
-    olat = math.radians(38.0)
-    xo = 43.0
-    yo = 136.0
-    sn = math.log(math.cos(slat1) / math.cos(slat2)) / math.log(
-        math.tan(math.pi * 0.25 + slat2 * 0.5) / math.tan(math.pi * 0.25 + slat1 * 0.5)
-    )
-    sf = math.tan(math.pi * 0.25 + slat1 * 0.5) ** sn * math.cos(slat1) / sn
-    ro = re_km / grid_km * sf / math.tan(math.pi * 0.25 + olat * 0.5) ** sn
-    ra = re_km / grid_km * sf / math.tan(math.pi * 0.25 + math.radians(latitude_deg) * 0.5) ** sn
-    theta = math.radians(longitude_deg) - olon
-    if theta > math.pi:
-        theta -= 2.0 * math.pi
-    if theta < -math.pi:
-        theta += 2.0 * math.pi
-    theta *= sn
-    nx = int(math.floor(ra * math.sin(theta) + xo + 0.5))
-    ny = int(math.floor(ro - ra * math.cos(theta) + yo + 0.5))
-    return (nx, ny)
-
-
-PTY_CONDITIONS = {
-    0: "no_precipitation",
-    1: "rain",
-    2: "rain_and_snow",
-    3: "snow",
-    5: "raindrop",
-    6: "raindrop_and_snow_flurry",
-    7: "snow_flurry",
-}
-
-
-def _numeric_observation(value):
-    number = _finite_float(value)
-    return number if number is not None else value
-
-
-def _safe_api_error(exc: Exception) -> str:
-    """Describe request failures without leaking a service key embedded in a URL."""
-    if isinstance(exc, urllib.error.HTTPError):
-        return f"HTTPError: HTTP {exc.code}"
-    if isinstance(exc, urllib.error.URLError):
-        return f"URLError: {exc.reason}"
-    return f"{type(exc).__name__}: {exc}"
-
-
-class KmaVilageClient:
-    """Failure-tolerant getUltraSrtNcst client with grid/hour caching."""
-
-    def __init__(
-        self,
-        service_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-        timeout_sec: float = 15.0,
-    ):
-        self.service_key = (
-            str(service_key).strip()
-            if service_key is not None
-            else os.environ.get(KMA_SERVICE_KEY_ENV, "").strip()
-        )
-        self.base_url = (
-            str(base_url).strip()
-            if base_url is not None
-            else os.environ.get(KMA_BASE_URL_ENV, DEFAULT_KMA_BASE_URL).strip()
-        ).rstrip("/")
-        self.timeout_sec = float(timeout_sec)
-        self._weather_cache: dict[tuple[str, str, int, int], dict] = {}
-
-    @property
-    def enabled(self) -> bool:
-        return bool(self.service_key and self.base_url)
-
-    def _request(self, params: dict) -> dict:
-        query = urllib.parse.urlencode({**params, "serviceKey": self.service_key})
-        request = urllib.request.Request(
-            self.base_url + "/getUltraSrtNcst?" + query,
-            headers={"User-Agent": "unicons-road-damage-export/2.0"},
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout_sec) as response:
-            return json.loads(response.read().decode("utf-8"))
-
-    @staticmethod
-    def _base_instant(camera_timestamp: float) -> datetime:
-        instant = camera_time_kst(camera_timestamp)
-        if instant.minute < 10:
-            instant -= timedelta(hours=1)
-        return instant.replace(minute=0, second=0, microsecond=0)
-
-    def weather_for(self, camera_timestamp: float, latitude_deg, longitude_deg) -> dict:
-        if not self.enabled:
-            return unavailable_weather(f"{KMA_BASE_URL_ENV} or {KMA_SERVICE_KEY_ENV} is not set")
-        latitude = _finite_float(latitude_deg)
-        longitude = _finite_float(longitude_deg)
-        if latitude is None or longitude is None:
-            return unavailable_weather("GPS latitude/longitude is unavailable")
-        instant = self._base_instant(camera_timestamp)
-        nx, ny = latlon_to_kma_grid(latitude, longitude)
-        base_date = instant.strftime("%Y%m%d")
-        base_time = instant.strftime("%H00")
-        cache_key = (base_date, base_time, nx, ny)
-        cached = self._weather_cache.get(cache_key)
-        if cached is not None:
-            return dict(cached)
-        try:
-            document = self._request(
-                {
-                    "pageNo": 1,
-                    "numOfRows": 1000,
-                    "dataType": "JSON",
-                    "base_date": base_date,
-                    "base_time": base_time,
-                    "nx": nx,
-                    "ny": ny,
-                }
-            )
-            response = document.get("response", {})
-            header = response.get("header", {})
-            result_code = str(header.get("resultCode", ""))
-            if result_code != "00":
-                message = str(header.get("resultMsg", "KMA request failed"))
-                raise RuntimeError(f"KMA {result_code}: {message}")
-            items = response.get("body", {}).get("items", {}).get("item", [])
-            if isinstance(items, dict):
-                items = [items]
-            if not items:
-                raise RuntimeError("KMA response contained no observation items")
-            values = {str(item.get("category", "")): item.get("obsrValue") for item in items}
-            pty_value = _finite_float(values.get("PTY"))
-            pty_code = int(pty_value) if pty_value is not None else None
-            first = items[0]
-            payload = {
-                "source": "KMA_DATA_GO_KR_ULTRA_SHORT_NOWCAST",
-                "status": "ok",
-                "grid": {"nx": nx, "ny": ny},
-                "requested_base_at_kst": instant.isoformat(),
-                "observed_at_kst": f"{first.get('baseDate', base_date)}{first.get('baseTime', base_time)}",
-                "condition": PTY_CONDITIONS.get(pty_code, "unknown"),
-                "precipitation_type_code": pty_code,
-                "temperature_c": _numeric_observation(values.get("T1H")),
-                "humidity_pct": _numeric_observation(values.get("REH")),
-                "precipitation_1h": _numeric_observation(values.get("RN1")),
-                "wind_direction_deg": _numeric_observation(values.get("VEC")),
-                "wind_speed_m_s": _numeric_observation(values.get("WSD")),
-                "wind_east_west_m_s": _numeric_observation(values.get("UUU")),
-                "wind_north_south_m_s": _numeric_observation(values.get("VVV")),
-            }
-        except Exception as exc:
-            payload = unavailable_weather(_safe_api_error(exc))
-            payload["grid"] = {"nx": nx, "ny": ny}
-            payload["requested_base_at_kst"] = instant.isoformat()
-        self._weather_cache[cache_key] = payload
-        return dict(payload)
-
-
-def load_asos_stations(path: Optional[Path] = None) -> list[dict]:
-    """Load the checked-in KMA ASOS station coordinate snapshot."""
-    station_path = Path(path) if path is not None else ASOS_STATIONS_PATH
-    stations = []
-    with station_path.open("r", newline="", encoding="utf-8-sig") as handle:
-        for row in csv.DictReader(handle):
-            station_id = _finite_float(row.get("station_id"))
-            latitude = _finite_float(row.get("latitude_deg"))
-            longitude = _finite_float(row.get("longitude_deg"))
-            if station_id is None or latitude is None or longitude is None:
-                continue
-            stations.append(
-                {
-                    "id": int(station_id),
-                    "name_en": str(row.get("station_name_en", "")).strip(),
-                    "latitude_deg": latitude,
-                    "longitude_deg": longitude,
-                }
-            )
-    if not stations:
-        raise RuntimeError(f"No usable ASOS stations in {station_path}")
-    return stations
-
-
-def nearest_asos_station(latitude_deg: float, longitude_deg: float, stations: list[dict]) -> dict:
-    """Return a copy of the geographically nearest ASOS station."""
-    station = min(
-        stations,
-        key=lambda item: _haversine_km(
-            latitude_deg,
-            longitude_deg,
-            float(item["latitude_deg"]),
-            float(item["longitude_deg"]),
-        ),
-    )
-    result = dict(station)
-    result["distance_km"] = _haversine_km(
-        latitude_deg,
-        longitude_deg,
-        float(station["latitude_deg"]),
-        float(station["longitude_deg"]),
-    )
-    return result
-
-
-def _weather_condition_from_asos(item: dict) -> str:
-    snow = max(
-        float(_finite_float(item.get("dsnw")) or 0.0),
-        float(_finite_float(item.get("hr3Fhsc")) or 0.0),
-    )
-    precipitation = _finite_float(item.get("rn"))
-    cloud_cover = _finite_float(item.get("dc10Tca"))
-    if snow > 0.0:
-        return "snow"
-    if precipitation is not None and precipitation > 0.0:
-        return "rain"
-    if cloud_cover is None:
-        return "unknown"
-    if cloud_cover >= 8.0:
-        return "cloudy"
-    if cloud_cover >= 3.0:
-        return "partly_cloudy"
-    return "clear"
-
-
-class KmaAsosHistoricalClient:
-    """ASOS hourly history selected by nearest station to capture GPS."""
-
-    def __init__(
-        self,
-        service_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-        stations_path: Optional[Path] = None,
-        timeout_sec: float = 15.0,
-    ):
-        encoded_key = (
-            str(service_key).strip()
-            if service_key is not None
-            else os.environ.get(KMA_ASOS_SERVICE_KEY_ENV, "").strip()
-        )
-        self.service_key = urllib.parse.unquote(encoded_key)
-        self.base_url = (
-            str(base_url).strip()
-            if base_url is not None
-            else os.environ.get(KMA_ASOS_BASE_URL_ENV, DEFAULT_KMA_ASOS_BASE_URL).strip()
-        ).rstrip("/")
-        self.timeout_sec = float(timeout_sec)
-        self.stations_path = (
-            Path(stations_path) if stations_path is not None else ASOS_STATIONS_PATH
-        )
-        self._stations: Optional[list[dict]] = None
-        self._weather_cache: dict[tuple[str, str, int], dict] = {}
-
-    @property
-    def enabled(self) -> bool:
-        return bool(self.service_key and self.base_url and self.stations_path.is_file())
-
-    def _request(self, params: dict) -> dict:
-        query = urllib.parse.urlencode({**params, "serviceKey": self.service_key})
-        request = urllib.request.Request(
-            self.base_url + "/getWthrDataList?" + query,
-            headers={"User-Agent": "unicons-road-damage-export/2.0"},
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout_sec) as response:
-            return json.loads(response.read().decode("utf-8", errors="replace"))
-
-    def stations(self) -> list[dict]:
-        if self._stations is None:
-            self._stations = load_asos_stations(self.stations_path)
-        return self._stations
-
-    def weather_for(self, camera_timestamp: float, latitude_deg, longitude_deg) -> dict:
-        source = "KMA_DATA_GO_KR_ASOS_HOURLY"
-        if not self.enabled:
-            return unavailable_weather(
-                f"{KMA_ASOS_BASE_URL_ENV} or {KMA_ASOS_SERVICE_KEY_ENV} is not set",
-                source,
-            )
-        latitude = _finite_float(latitude_deg)
-        longitude = _finite_float(longitude_deg)
-        if latitude is None or longitude is None:
-            return unavailable_weather("GPS latitude/longitude is unavailable", source)
-        instant = camera_time_kst(camera_timestamp).replace(minute=0, second=0, microsecond=0)
-        try:
-            station = nearest_asos_station(latitude, longitude, self.stations())
-        except Exception as exc:
-            return unavailable_weather(_safe_api_error(exc), source)
-        date = instant.strftime("%Y%m%d")
-        hour = instant.strftime("%H")
-        station_id = int(station["id"])
-        cache_key = (date, hour, station_id)
-        cached = self._weather_cache.get(cache_key)
-        if cached is not None:
-            return dict(cached)
-        try:
-            document = self._request(
-                {
-                    "pageNo": 1,
-                    "numOfRows": 10,
-                    "dataType": "JSON",
-                    "dataCd": "ASOS",
-                    "dateCd": "HR",
-                    "startDt": date,
-                    "startHh": hour,
-                    "endDt": date,
-                    "endHh": hour,
-                    "stnIds": station_id,
-                }
-            )
-            response = document.get("response", {})
-            header = response.get("header", {})
-            result_code = str(header.get("resultCode", ""))
-            if result_code != "00":
-                message = str(header.get("resultMsg", "KMA ASOS request failed"))
-                raise RuntimeError(f"KMA ASOS {result_code}: {message}")
-            items = response.get("body", {}).get("items", {}).get("item", [])
-            if isinstance(items, dict):
-                items = [items]
-            if not items:
-                raise RuntimeError("KMA ASOS response contained no observations")
-            item = items[0]
-            station_name = str(item.get("stnNm") or station.get("name_en") or "")
-            payload = {
-                "source": source,
-                "status": "ok",
-                "station": {
-                    "id": station_id,
-                    "name": station_name,
-                    "latitude_deg": float(station["latitude_deg"]),
-                    "longitude_deg": float(station["longitude_deg"]),
-                    "gps_distance_km": float(station["distance_km"]),
-                    "selection_method": "nearest_haversine_to_capture_gps",
-                },
-                "requested_at_kst": instant.isoformat(),
-                "observed_at_kst": str(item.get("tm") or ""),
-                "condition": _weather_condition_from_asos(item),
-                "temperature_c": _finite_float(item.get("ta")),
-                "humidity_pct": _finite_float(item.get("hm")),
-                "precipitation_1h_mm": _finite_float(item.get("rn")),
-                "wind_direction_deg": _finite_float(item.get("wd")),
-                "wind_speed_m_s": _finite_float(item.get("ws")),
-                "local_pressure_hpa": _finite_float(item.get("pa")),
-                "sea_level_pressure_hpa": _finite_float(item.get("ps")),
-                "cloud_cover_tenths": _finite_float(item.get("dc10Tca")),
-                "visibility_10m": _finite_float(item.get("vs")),
-                "snow_depth_cm": _finite_float(item.get("dsnw")),
-                "weather_phenomenon_code": item.get("dmstMtphNo") or None,
-            }
-        except Exception as exc:
-            payload = unavailable_weather(_safe_api_error(exc), source)
-            payload["station"] = {
-                "id": station_id,
-                "name": station.get("name_en", ""),
-                "latitude_deg": float(station["latitude_deg"]),
-                "longitude_deg": float(station["longitude_deg"]),
-                "gps_distance_km": float(station["distance_km"]),
-                "selection_method": "nearest_haversine_to_capture_gps",
-            }
-            payload["requested_at_kst"] = instant.isoformat()
-        self._weather_cache[cache_key] = payload
-        return dict(payload)
-
-
-class KmaWeatherClient:
-    """Use GPS-grid nowcast for recent captures and nearest ASOS for history."""
-
-    def __init__(
-        self,
-        nowcast: Optional[KmaVilageClient] = None,
-        historical: Optional[KmaAsosHistoricalClient] = None,
-    ):
-        self.nowcast = nowcast or KmaVilageClient()
-        self.historical = historical or KmaAsosHistoricalClient()
-
-    @property
-    def enabled(self) -> bool:
-        return self.nowcast.enabled or self.historical.enabled
-
-    def weather_for(self, camera_timestamp: float, latitude_deg, longitude_deg) -> dict:
-        capture = camera_time_kst(camera_timestamp)
-        age_hours = (datetime.now(KST) - capture).total_seconds() / 3600.0
-        if age_hours <= 24.0 and self.nowcast.enabled:
-            recent = self.nowcast.weather_for(camera_timestamp, latitude_deg, longitude_deg)
-            if recent.get("status") == "ok":
-                return recent
-        if self.historical.enabled:
-            return self.historical.weather_for(camera_timestamp, latitude_deg, longitude_deg)
-        if self.nowcast.enabled:
-            return self.nowcast.weather_for(camera_timestamp, latitude_deg, longitude_deg)
-        return unavailable_weather("No KMA weather API is configured")
-
-
 VEHICLE_TYPE = os.environ.get("DAMAGE_EXPORT_VEHICLE_TYPE", "현대 팰리세이드")
 
 SENSOR_MOUNT_HEIGHT_CM = 190.0
@@ -2178,14 +1559,11 @@ def mask_polygons(mask):
 
 
 class DamageArtifactExporter:
-    def __init__(self, output, run_dir, save_images=True, camera=None):
-        self.save_images = save_images
-        self.directory = Path(output) / "certifcate"
-        self.directory.mkdir(parents=True, exist_ok=True)
-        _, self.gps_streams = lidar__load_gps_streams(Path(run_dir))
-        self.weather = KmaWeatherClient()
-        self.pcap_cache = {}
-        camera = LiDAR2Camera(CAMERA_CALIBRATION) if camera is None else camera
+    """Per-damage records of one frame; commit() points directory at the frame's stage."""
+
+    def __init__(self, camera):
+        self.directory = None
+        self.gps_streams = {}
         self.camera_extrinsics = camera.extrinsics
         self.calibration_ids = {
             "camera": {
@@ -2198,86 +1576,30 @@ class DamageArtifactExporter:
             },
         }
 
-    def stage_pcaps(self, paths):
-        """Copy selected source PCAPs byte-for-byte; never serialize points to CSV."""
-        files, metadata = [], []
-        for source in map(Path, paths):
-            source = source.resolve()
-            stat = source.stat()
-            signature = (
-                stat.st_dev,
-                stat.st_ino,
-                stat.st_size,
-                stat.st_mtime_ns,
-                stat.st_ctime_ns,
-            )
-            cached = self.pcap_cache.get(source)
-            if cached is None or cached[0] != signature:
-                digest = sha(source)
-                destination = self.directory / ("lidar_" + digest + ".pcap")
-                temporary = destination.with_suffix(".pcap.partial")
-                if not destination.exists():
-                    try:
-                        shutil.copyfile(source, temporary)
-                        if sha(temporary) != digest:
-                            raise ValueError("PCAP source changed during artifact copy")
-                        temporary.replace(destination)
-                    finally:
-                        temporary.unlink(missing_ok=True)
-                elif sha(destination) != digest:
-                    raise ValueError("Existing artifact PCAP checksum differs")
-                after = source.stat()
-                if signature != (
-                    after.st_dev,
-                    after.st_ino,
-                    after.st_size,
-                    after.st_mtime_ns,
-                    after.st_ctime_ns,
-                ):
-                    raise ValueError("PCAP source changed during export")
-                item = dict(
-                    name=destination.name,
-                    source_name=source.name,
-                    sha256=digest,
-                    bytes=stat.st_size,
-                )
-                cached = (signature, destination, item)
-                self.pcap_cache[source] = cached
-            files.append(cached[1])
-            metadata.append(cached[2])
-        return files, metadata
-
     def save(
         self,
-        index,
         timestamp,
-        source_image,
         detections,
         fused,
         point_count,
         road_xyz,
         lidar_timestamp,
-        pcap_sources=(),
+        payloads,
         scan_start=None,
         scan_end=None,
-        scan_status="unavailable",
         target_lidar_timestamp=None,
         camera_timing=None,
         motion_compensation=None,
-        payloads=None,
     ):
+        """Append one damage record per detection to payloads."""
         if len(detections) != len(fused):
             raise ValueError("Detection/fusion count mismatch")
         if not detections:
-            return []
-        # The live frame exporter attaches a single scan PCAP after collecting
-        # all object payloads. The legacy standalone exporter keeps its own path.
-        pcap_files, pcap_metadata = ([], []) if payloads is not None else self.stage_pcaps(pcap_sources)
-        written = list(dict.fromkeys(pcap_files))
+            return
         lidar_metadata = dict(
             schema="pandar_xt32_pcap_v1",
-            pcap_files=pcap_metadata,
-            status=scan_status if pcap_metadata else "pcap_unavailable",
+            pcap_files=[],
+            status="pcap_unavailable",  # commit() attaches the scan PCAP
             decoded_on_terminal=lidar_timestamp is not None,
             scan_start_epoch_sec=None if scan_start is None else scan_start - 1e-6,
             scan_end_epoch_sec=None if scan_end is None else scan_end + 1e-6,
@@ -2295,10 +1617,7 @@ class DamageArtifactExporter:
             pcap_copy_policy="selected_source_file_bytes_unchanged",
         )
         gps = lidar__gps_values_for_camera(self.gps_streams, timestamp)
-        weather = self.weather.weather_for(
-            timestamp, gps.get("latitude_deg"), gps.get("longitude_deg")
-        )
-        for object_id, (detection, obj) in enumerate(zip(detections, fused)):
+        for detection, obj in zip(detections, fused):
             pothole = int(detection.class_id) == 1
             if pothole and (not obj.get("validation", {}).get("accepted")):
                 raise ValueError("Unverified pothole cannot be exported")
@@ -2318,29 +1637,18 @@ class DamageArtifactExporter:
                 if pothole
                 else damage_geometry(object_road, include_depth=False)
             )
-            stem = artifact_stem(timestamp, index, damage_type, object_id)
-            image_path = self.directory / (stem + ".jpg")
-            json_path = self.directory / (stem + ".json")
-            if any((path.exists() for path in (image_path, json_path))):
-                raise FileExistsError(f"Artifact already exists: {stem}")
             payload = build_damage_payload(
                 damage_type=damage_type,
-                camera_index=index,
                 camera_timestamp=timestamp,
-                lidar_frame_id=index,
                 lidar_timestamp=(timestamp if lidar_timestamp is None else lidar_timestamp),
                 time_error_sec=(0.0 if lidar_timestamp is None else lidar_timestamp - timestamp),
                 cluster=geometry,
                 bbox=tuple(np.rint(detection.box_xyxy).astype(int)),
                 polygons_px=mask_polygons(detection.mask),
                 gps=gps,
-                weather=weather,
                 vehicle_type=VEHICLE_TYPE,
                 sensor_mount_height_cm=SENSOR_MOUNT_HEIGHT_CM,
                 sensor_mount_angles_xyz_deg=SENSOR_MOUNT_ANGLE_XYZ_DEG,
-                source_image=str(source_image),
-                json_name=json_path.name,
-                image_name=image_path.name,
             )
             payload["lidar"] = dict(lidar_metadata, object_point_count=len(indices))
             if lidar_timestamp is None:
@@ -2353,32 +1661,11 @@ class DamageArtifactExporter:
                     "scope": "one_passage_per_replay_loop",
                     "report_policy": "first_confirmation_only",
                 }
-            if payloads is not None:
-                # Keep damage measurements in one JSON/image pair per frame.
-                payloads.append(payload)
-                continue
-            temporary = image_path.with_name(stem + ".partial.jpg")
-            try:
-                if self.save_images:
-                    if Path(source_image).suffix.lower() in (".jpg", ".jpeg"):
-                        shutil.copyfile(source_image, temporary)
-                    else:
-                        image = cv2.imread(str(source_image))
-                        if image is None or not cv2.imwrite(str(temporary), image):
-                            raise IOError(f"Cannot save source image: {source_image}")
-                if self.save_images:
-                    temporary.replace(image_path)
-                write_damage_json(json_path, payload)
-                written.extend([json_path] + ([image_path] if self.save_images else []))
-            except Exception:
-                for path in (temporary, image_path, json_path):
-                    path.unlink(missing_ok=True)
-                raise
-        return written
+            payloads.append(payload)
 
 
-def matched_gps_metadata(streams, timestamp):
-    """Vehicle position with explicit NMEA validity; missing fixes stay null."""
+def matched_gps_position(streams, timestamp):
+    """Position of the nearest valid NMEA fix; latitude/longitude are None without one."""
     gga, _ = lidar__nearest_gps_record(streams.get("GGA"), timestamp)
     rmc, _ = lidar__nearest_gps_record(streams.get("RMC"), timestamp)
     def position_valid(record):
@@ -2391,19 +1678,10 @@ def matched_gps_metadata(streams, timestamp):
     valid_rmc = position_valid(rmc) and str(rmc.get("gps_status", rmc.get("status", ""))).upper() == "A"
     valid_gga = position_valid(gga) and (_finite_float(gga.get("fix_quality")) or 0) > 0
     position = rmc if valid_rmc else gga if valid_gga else None
-    data = lidar__gps_values_for_camera(streams, timestamp)
-    data.update(valid=position is not None, position_reference="vehicle", crs="WGS84",
-                timestamp_source="host_receive_usb_nmea", ptp_synchronized=False,
-                latitude_deg=None if position is None else position["latitude_deg"],
-                longitude_deg=None if position is None else position["longitude_deg"],
-                host_receive_epoch_sec=None if position is None else float(position["timestamp"]),
-                time_error_ms=None if position is None else
-                (float(position["timestamp"]) - timestamp) * 1000,
-                altitude_m=data["altitude_m"] if valid_gga else None,
-                speed_kmh=data["speed_kmh"] if valid_rmc else None,
-                course_deg=data["course_deg"] if valid_rmc else None,
-                reason="valid_fix" if position is not None else "no_valid_nearby_fix")
-    return clean(data)
+    return dict(
+        latitude_deg=None if position is None else position["latitude_deg"],
+        longitude_deg=None if position is None else position["longitude_deg"],
+    )
 
 
 def terminal_id():
@@ -2411,8 +1689,8 @@ def terminal_id():
     return os.getenv("PORTHOLE_TERMINAL_ID", "").strip() or socket.gethostname()
 
 
-def save_detection_frame(directory, source_image, image, row, timestamp, key,
-                         damage_detections, damage_payloads, gps, lidar):
+def save_detection_frame(directory, source_image, image, row, key,
+                         damage_detections, damage_payloads, gps, pcap_files):
     """Frame JSON in the terminal-server data spec (단말기-서버 데이터 명세서, 2026-09-28).
 
     Only record_id, categories, images, annotations, gps and lidar.pcap_files are
@@ -2427,8 +1705,8 @@ def save_detection_frame(directory, source_image, image, row, timestamp, key,
         raise ValueError("Unsupported category in damage frame export")
     height, width = image.shape[:2]
     index = int(row["frame_index"])
-    timestamp_ns = int(row.get("timestamp_ns") or round(timestamp * 1e9))
-    stem = detection_frame_stem(row, timestamp)
+    timestamp_ns = int(row["timestamp_ns"])
+    stem = detection_frame_stem(row)
     image_path, json_path = directory / (stem + ".jpg"), directory / (stem + ".json")
     if image_path.exists() or json_path.exists():
         raise FileExistsError(stem)
@@ -2461,15 +1739,14 @@ def save_detection_frame(directory, source_image, image, row, timestamp, key,
                      date_captured=captured.strftime("%Y-%m-%dT%H:%M:%SZ"))],
         annotations=annotations,
         gps=dict(latitude_deg=gps.get("latitude_deg"), longitude_deg=gps.get("longitude_deg")),
-        lidar=dict(pcap_files=[dict(name=f["name"]) for f in lidar.get("pcap_files", [])]),
+        lidar=dict(pcap_files=[dict(name=f["name"]) for f in pcap_files]),
     )
     atomic_json(json_path, clean(payload))
     return [image_path, json_path]
 
 
-def detection_frame_stem(row, timestamp):
-    timestamp_ns = int(row.get("timestamp_ns") or round(timestamp * 1e9))
-    return f"frame_{timestamp_ns}_{int(row['frame_index']):08d}"
+def detection_frame_stem(row):
+    return f"frame_{int(row['timestamp_ns'])}_{int(row['frame_index']):08d}"
 
 
 def save_scan_pcap(destination, sources, start, end):
@@ -2666,19 +1943,6 @@ class RoadPlaneSettings:
     height_min_m: float = -2.5
     height_max_m: float = -0.8
     cell_size_m: float = 0.35
-    min_cell_points: int = 8
-    min_cells: int = 24
-    max_angle_deg: float = 15.0
-    support_distance_m: float = 0.04
-    max_p75_m: float = 0.04
-    max_negative_p10_m: float = 0.075
-    min_support_fraction: float = 0.75
-
-
-class RoadPlaneUnavailable(ValueError):
-    def __init__(self, reason, info):
-        super().__init__("plane_unavailable: " + reason)
-        self.plane_info = info
 
 
 def prior_rotation(settings):
@@ -2694,10 +1958,10 @@ def prior_rotation(settings):
     return np.array([x, np.cross(n, x), n])
 
 
-def fit_spatial_road_plane(xyz, channels, settings=RoadPlaneSettings()):
+def fit_spatial_road_plane(xyz, settings=RoadPlaneSettings()):
+    """Road plane (unit normal, offset) through the median points of a grid on the road ROI."""
     xyz = np.asarray(xyz, float)
-    channels = np.asarray(channels)
-    if xyz.ndim != 2 or xyz.shape[1] != 3 or channels.shape != (len(xyz),):
+    if xyz.ndim != 2 or xyz.shape[1] != 3:
         raise ValueError("XYZ/channel shape mismatch")
     R = prior_rotation(settings)
     local = xyz @ R.T
@@ -2711,26 +1975,10 @@ def fit_spatial_road_plane(xyz, channels, settings=RoadPlaneSettings()):
         & (z <= settings.height_max_m)
     )
     points = local[keep]
-    ch = channels[keep]
-    info = dict(
-        fit_method="spatial_grid_robust_plane",
-        plane_valid=False,
-        normal_prior_source="empirical_installed_rig",
-        road_candidate_points=len(points),
-    )
-
-    def fail(reason):
-        raise RoadPlaneUnavailable(reason, info)
-
     if len(points) < 3 or np.linalg.matrix_rank(points - points.mean(axis=0)) < 2:
-        keep = np.isfinite(local).all(axis=1)
-        points = local[keep]
-        ch = channels[keep]
-        info["candidate_source"] = "all_finite_points"
-    else:
-        info["candidate_source"] = "road_roi"
+        points = local[np.isfinite(local).all(axis=1)]
     if len(points) < 3 or np.linalg.matrix_rank(points - points.mean(axis=0)) < 2:
-        fail("fewer than three non-collinear finite points")
+        raise ValueError("plane_unavailable: fewer than three non-collinear finite points")
     keys = np.floor(points[:, :2] / settings.cell_size_m).astype(np.int64)
     _, inverse = np.unique(keys, axis=0, return_inverse=True)
     cells = []
@@ -2738,10 +1986,8 @@ def fit_spatial_road_plane(xyz, channels, settings=RoadPlaneSettings()):
         group = points[inverse == i]
         cells.append(np.median(group, axis=0))
     cells = np.asarray(cells, float).reshape(-1, 3)
-    info["grid_cells"] = len(cells)
     if len(cells) < 3 or np.linalg.matrix_rank(cells - cells.mean(axis=0)) < 2:
         cells = points.copy()
-        info["representative_fallback"] = "raw_points"
     A = np.column_stack([cells[:, :2], np.ones(len(cells))])
     target = cells[:, 2]
     rng = np.random.default_rng(20260907)
@@ -2768,50 +2014,7 @@ def fit_spatial_road_plane(xyz, channels, settings=RoadPlaneSettings()):
     scale = np.sqrt(1 + beta[:2] @ beta[:2])
     normal = np.array([-beta[0], -beta[1], 1.0]) @ R / scale
     offset = -float(beta[2]) / scale
-    cell_residual = (target - A @ beta) / scale
-    support = abs(cell_residual) <= settings.support_distance_m
-    support_cells = cells[support]
-    angle = float(np.degrees(np.arctan(np.linalg.norm(beta[:2]))))
-    q = np.quantile(abs(cell_residual), [0.5, 0.75, 0.9])
-    left = int(np.sum(support_cells[:, 0] < -0.4))
-    right = int(np.sum(support_cells[:, 0] > 0.4))
-    span = np.ptp(support_cells[:, :2], axis=0) if len(support_cells) else np.zeros(2)
-    raw_support = (
-        abs(points @ np.array([-beta[0], -beta[1], 1.0]) / scale + offset)
-        <= settings.support_distance_m
-    )
-    channel_count = len(np.unique(ch[raw_support]))
-    check = dict(
-        normal_angle_deg=angle,
-        support_points=int(raw_support.sum()),
-        left_support=left,
-        right_support=right,
-        support_channels=channel_count,
-        support_cells=int(support.sum()),
-        support_fraction=float(support.mean()),
-        lateral_span_m=float(span[0]),
-        forward_span_m=float(span[1]),
-        cell_p50_abs_m=float(q[0]),
-        cell_p75_abs_m=float(q[1]),
-        cell_p90_abs_m=float(q[2]),
-        cell_signed_p10_m=float(np.quantile(cell_residual, 0.1)),
-    )
-    info.update(
-        road_support_validation=check,
-        selected_candidate=dict(
-            source="spatial_grid",
-            cell_count=len(cells),
-            cell_p90_abs_m=float(q[2]),
-            cell_median_abs_m=float(q[0]),
-            left_support=left,
-            right_support=right,
-            normal_angle_deg=angle,
-        ),
-        final_plane_normal=normal.tolist(),
-        final_plane_offset_m=offset,
-    )
-    info["plane_valid"] = True
-    return (normal, offset, info)
+    return (normal, offset)
 
 
 def measure_mask_local_depth(road, pixels, visible_indices, indices, mask, exclusion):
@@ -2857,10 +2060,6 @@ lidar___DETECTION_CHANNEL_SET = frozenset(lidar__DETECTION_CHANNEL_IDS)
 
 lidar__GPS_MAX_TIME_ERROR_SEC = 1.5
 
-lidar__PLANE_FALLBACK_CENTRAL_FIRING_FRACTION = 0.6
-
-lidar__PLANE_FIRING_QUALITY_BIN_COUNT = 6
-
 lidar__RETURN_SELECTION = "last"
 
 lidar__APPLY_FIRETIME = True
@@ -2883,24 +2082,17 @@ lidar__XT32_CHANNELS = 32
 
 lidar__XT32_TAIL_OFFSET = 1052
 
-lidar__DEFAULT_ELEVATION_DEG = [float(v) for v in range(15, -17, -1)]
-
-lidar__DEFAULT_AZIMUTH_OFFSET_DEG = [0.0] * lidar__XT32_CHANNELS
-
 lidar__XT32_LASER_FIRETIME_US = [1.512 * i + 0.368 for i in range(32)]
 
 lidar__XT_COORD_H_M = 0.0315
 
 lidar__XT_COORD_B_M = 0.013
 
-lidar__DUAL_RETURN_MODES = {57, 59, 60}
-
 
 @dataclass(frozen=True)
 class lidar__Calibration:
     elevation_deg: list[float]
     azimuth_offset_deg: list[float]
-    source: str
 
 
 @dataclass(frozen=True)
@@ -2910,20 +2102,7 @@ class lidar__PcapRecord:
     frame: bytes
 
 
-@dataclass(frozen=True)
-class lidar__UdpPacket:
-    payload: bytes
-    src_port: int
-    dst_port: int
-
-
-def lidar__load_calibration(path: Optional[Path]) -> lidar__Calibration:
-    if path is None:
-        return lidar__Calibration(
-            elevation_deg=lidar__DEFAULT_ELEVATION_DEG.copy(),
-            azimuth_offset_deg=lidar__DEFAULT_AZIMUTH_OFFSET_DEG.copy(),
-            source="Hesai PandarXT32 nominal calibration",
-        )
+def lidar__load_calibration(path: Path) -> lidar__Calibration:
     path = path.expanduser().resolve()
     elevations: list[Optional[float]] = [None] * lidar__XT32_CHANNELS
     azimuths: list[Optional[float]] = [None] * lidar__XT32_CHANNELS
@@ -2952,7 +2131,6 @@ def lidar__load_calibration(path: Optional[Path]) -> lidar__Calibration:
     return lidar__Calibration(
         elevation_deg=[float(v) for v in elevations],
         azimuth_offset_deg=[float(v) for v in azimuths],
-        source=str(path),
     )
 
 
@@ -2994,7 +2172,8 @@ def lidar__iter_pcap(path: Path) -> Iterator[lidar__PcapRecord]:
             packet_index += 1
 
 
-def lidar__decode_udp(frame: bytes) -> lidar__UdpPacket:
+def lidar__decode_udp(frame: bytes) -> bytes:
+    """UDP payload of an Ethernet/IPv4 frame."""
     if len(frame) < 42:
         raise ValueError("Ethernet frame is too short")
     if struct.unpack("!H", frame[12:14])[0] != 2048:
@@ -3004,9 +2183,8 @@ def lidar__decode_udp(frame: bytes) -> lidar__UdpPacket:
     if ihl < 20 or frame[ip_start + 9] != 17:
         raise ValueError("IPv4 payload is not valid UDP")
     udp_start = ip_start + ihl
-    src_port, dst_port, udp_len, _ = struct.unpack("!HHHH", frame[udp_start : udp_start + 8])
-    payload = frame[udp_start + 8 : udp_start + udp_len]
-    return lidar__UdpPacket(payload=payload, src_port=src_port, dst_port=dst_port)
+    _, _, udp_len, _ = struct.unpack("!HHHH", frame[udp_start : udp_start + 8])
+    return frame[udp_start + 8 : udp_start + udp_len]
 
 
 def lidar__return_label(mode: int, block_index: int) -> str:
@@ -3047,10 +2225,7 @@ def _channel_geometry(elevation_deg, azimuth_offset_deg, height, baseline):
 class ScanPoints:
     """Decoded points of one scan, in packet, block, channel order."""
 
-    sequence: np.ndarray  # packet tail sequence
     timestamp: np.ndarray  # PCAP record time of the packet
-    block: np.ndarray  # 1-based block within the packet
-    return_mode: np.ndarray
     channel: np.ndarray  # 1-based laser channel
     xyz: np.ndarray  # sensor coordinates in metres, shape (n, 3)
 
@@ -3068,7 +2243,7 @@ def decode_xt32_records(records, calibration: lidar__Calibration) -> ScanPoints:
     """
     payloads, times = [], []
     for rec in records:
-        payload = lidar__decode_udp(rec.frame).payload
+        payload = lidar__decode_udp(rec.frame)
         if len(payload) != lidar__XT32_PAYLOAD_LEN or payload[:4] != b"\xee\xff\x06\x01":
             continue
         if payload[6] != 32 or payload[7] != 8:
@@ -3083,8 +2258,7 @@ def decode_xt32_records(records, calibration: lidar__Calibration) -> ScanPoints:
     tail = data[:, lidar__XT32_TAIL_OFFSET:]
     return_mode = tail[:, 10]
     spin_speed_rpm = tail[:, 11] | tail[:, 12] << 8
-    sequence = tail[:, 24] | tail[:, 25] << 8 | tail[:, 26] << 16 | tail[:, 27] << 24
-    blocks = data[:, lidar__XT32_BODY_OFFSET : lidar__XT32_TAIL_OFFSET].reshape(
+    blocks =data[:, lidar__XT32_BODY_OFFSET : lidar__XT32_TAIL_OFFSET].reshape(
         count, lidar__XT32_BLOCKS, lidar__XT32_BLOCK_LEN
     )
     raw_az100 = blocks[:, :, 0] | blocks[:, :, 1] << 8
@@ -3092,8 +2266,7 @@ def decode_xt32_records(records, calibration: lidar__Calibration) -> ScanPoints:
     distance_m = (lasers[..., 0] | lasers[..., 1] << 8) * data[:, 9, None, None] / 1000.0
 
     selected = {
-        mode: [lidar__RETURN_SELECTION == "all"
-               or lidar__return_label(int(mode), b) == lidar__RETURN_SELECTION
+        mode: [lidar__return_label(int(mode), b) == lidar__RETURN_SELECTION
                for b in range(lidar__XT32_BLOCKS)]
         for mode in set(return_mode.tolist())
     }
@@ -3104,30 +2277,23 @@ def decode_xt32_records(records, calibration: lidar__Calibration) -> ScanPoints:
             & (distance_m > 0.1) & (distance_m <= 200.0))
 
     offset_deg = np.asarray(calibration.azimuth_offset_deg, dtype=np.float64)
-    firetime_deg = np.zeros((count, lidar__XT32_CHANNELS))
-    if lidar__APPLY_FIRETIME:
-        firetime_deg = spin_speed_rpm[:, None] * np.asarray(lidar__XT32_LASER_FIRETIME_US) * 6e-06
+    # Laser fire times (lidar__APPLY_FIRETIME) and the optical-centre correction
+    # (lidar__COORDINATE_CORRECTION) are always applied.
+    firetime_deg = spin_speed_rpm[:, None] * np.asarray(lidar__XT32_LASER_FIRETIME_US) * 6e-06
     az100 = (offset_deg * 100.0 + raw_az100[:, :, None] + (firetime_deg * 100.0)[:, None, :])
     az100 = az100.astype(np.int64) % 36000
     sin_table, cos_table = _azimuth_table()
     sin_az, cos_az = (sin_table[az100], cos_table[az100])
-    if lidar__COORDINATE_CORRECTION:
-        cos_el, sin_el, correction = np.array([
-            _channel_geometry(calibration.elevation_deg[c], calibration.azimuth_offset_deg[c],
-                              lidar__XT_COORD_H_M, lidar__XT_COORD_B_M)
-            for c in range(lidar__XT32_CHANNELS)
-        ]).T
-        corrected_distance = distance_m - correction
-        xy = corrected_distance * cos_el
-        x = xy * sin_az - lidar__XT_COORD_B_M * cos_az + lidar__XT_COORD_H_M * sin_az
-        y = xy * cos_az + lidar__XT_COORD_B_M * sin_az + lidar__XT_COORD_H_M * cos_az
-        z = corrected_distance * sin_el
-    else:
-        elevations = [math.radians(e) for e in calibration.elevation_deg]
-        cos_el = np.array([math.cos(e) for e in elevations])
-        xy = distance_m * cos_el
-        x, y = (xy * sin_az, xy * cos_az)
-        z = distance_m * np.array([math.sin(e) for e in elevations])
+    cos_el, sin_el, correction = np.array([
+        _channel_geometry(calibration.elevation_deg[c], calibration.azimuth_offset_deg[c],
+                          lidar__XT_COORD_H_M, lidar__XT_COORD_B_M)
+        for c in range(lidar__XT32_CHANNELS)
+    ]).T
+    corrected_distance = distance_m - correction
+    xy = corrected_distance * cos_el
+    x = xy * sin_az - lidar__XT_COORD_B_M * cos_az + lidar__XT_COORD_H_M * sin_az
+    y = xy * cos_az + lidar__XT_COORD_B_M * sin_az + lidar__XT_COORD_H_M * cos_az
+    z = corrected_distance * sin_el
 
     shape = keep.shape
 
@@ -3135,89 +2301,10 @@ def decode_xt32_records(records, calibration: lidar__Calibration) -> ScanPoints:
         return np.broadcast_to(np.asarray(values).reshape(axes), shape)[keep]
 
     return ScanPoints(
-        sequence=per_point(sequence, (count, 1, 1)),
         timestamp=per_point(np.asarray(times, dtype=np.float64), (count, 1, 1)),
-        block=per_point(np.arange(1, lidar__XT32_BLOCKS + 1), (1, lidar__XT32_BLOCKS, 1)),
-        return_mode=per_point(return_mode, (count, 1, 1)),
         channel=per_point(np.arange(1, lidar__XT32_CHANNELS + 1), (1, 1, lidar__XT32_CHANNELS)),
         xyz=np.column_stack([x[keep], y[keep], z[keep]]),
     )
-
-
-def lidar___channel_plane_quality(
-    signed_residual_m: np.ndarray, channels: np.ndarray
-) -> tuple[float, float, dict[int, float]]:
-    """Measure whether one fitted plane is centred on every scanline.
-
-    In the measured failure frames, raw RANSAC inlier count could still look
-    plausible because a shoulder plane contained many points.  The decisive
-    symptom was different: the median return in nearly every channel sat
-    10-20 cm on the same side of the fitted plane.  A real road plane keeps the
-    median of those per-channel medians close to zero.
-    """
-    signed = np.asarray(signed_residual_m, dtype=np.float64)
-    channel_values = np.asarray(channels, dtype=np.int16)
-    if signed.shape != channel_values.shape:
-        raise ValueError("signed_residual_m/channels shape mismatch")
-    medians: dict[int, float] = {}
-    for channel in sorted((int(value) for value in np.unique(channel_values))):
-        values = signed[channel_values == channel]
-        values = values[np.isfinite(values)]
-        if values.size:
-            medians[channel] = float(np.median(values))
-    if not medians:
-        return (float("nan"), float("nan"), medians)
-    values = np.asarray(list(medians.values()), dtype=np.float64)
-    return (float(np.median(values)), float(np.percentile(np.abs(values), 90)), medians)
-
-
-def lidar___firing_plane_quality(
-    signed_residual_m: np.ndarray,
-    firing_key_array: np.ndarray,
-    fraction: float = lidar__PLANE_FALLBACK_CENTRAL_FIRING_FRACTION,
-    bin_count: int = lidar__PLANE_FIRING_QUALITY_BIN_COUNT,
-) -> dict:
-    """Measure smooth horizontal plane drift without using roadside edges."""
-    signed = np.asarray(signed_residual_m, dtype=np.float64)
-    keys = np.asarray(firing_key_array, dtype=np.int64)
-    empty = {
-        "span_m": float("nan"),
-        "endpoint_delta_m": float("nan"),
-        "linear_r2": float("nan"),
-        "bin_medians_m": [],
-    }
-    if signed.ndim != 1 or keys.shape != (len(signed), 3) or (not len(signed)):
-        return empty
-    positions, inverse = np.unique(keys[:, :2], axis=0, return_inverse=True)
-    keep_fraction = min(1.0, max(0.05, float(fraction)))
-    keep_count = min(len(positions), max(3, int(round(len(positions) * keep_fraction))))
-    central_start = max(0, (len(positions) - keep_count) // 2)
-    actual_bin_count = min(max(3, int(bin_count)), keep_count)
-    if actual_bin_count < 3:
-        return empty
-    medians: list[float] = []
-    for bin_index in range(actual_bin_count):
-        start = central_start + int(round(bin_index * keep_count / actual_bin_count))
-        stop = central_start + int(round((bin_index + 1) * keep_count / actual_bin_count))
-        mask = (inverse >= start) & (inverse < stop)
-        values = signed[mask]
-        values = values[np.isfinite(values)]
-        if not values.size:
-            return empty
-        medians.append(float(np.median(values)))
-    values = np.asarray(medians, dtype=np.float64)
-    x = np.arange(len(values), dtype=np.float64)
-    coefficients = np.polyfit(x, values, 1)
-    predicted = np.polyval(coefficients, x)
-    total = float(np.sum((values - np.mean(values)) ** 2))
-    unexplained = float(np.sum((values - predicted) ** 2))
-    linear_r2 = 1.0 - unexplained / total if total > 1e-12 else 0.0
-    return {
-        "span_m": float(np.ptp(values)),
-        "endpoint_delta_m": float(values[-1] - values[0]),
-        "linear_r2": float(linear_r2),
-        "bin_medians_m": medians,
-    }
 
 
 def lidar__road_alignment_transform(
@@ -3277,55 +2364,6 @@ def lidar__road_aligned_xyz(
     rotation_rows, plane_origin = lidar__road_alignment_transform(normal, offset)
     corrected = (xyz - plane_origin[None, :]) @ rotation_rows.T
     return (corrected, rotation_rows, plane_origin)
-
-
-def lidar__firing_keys(points: ScanPoints) -> np.ndarray:
-    """
-    One identity per laser firing.
-
-    Dual-return data stores Last and First for the same firing in adjacent
-    blocks, so block index is halved to make both returns share a key. This is
-    what makes MIN_CLUSTER_POINTS a count of real firings rather than rows.
-    """
-    block = points.block - 1
-    dual = np.isin(points.return_mode, sorted(lidar__DUAL_RETURN_MODES))
-    return np.column_stack(
-        [points.sequence, np.where(dual, block // 2, block), points.channel]
-    ).astype(np.int64)
-
-
-def lidar__load_gps_streams(
-    dataset_root: Path,
-) -> tuple[Optional[Path], dict[str, tuple[np.ndarray, list[dict]]]]:
-    """Load timestamp-sorted GGA/RMC records used by the camera overlay."""
-    candidates = [dataset_root / "gps" / "gps.jsonl", dataset_root / "gps.jsonl"]
-    gps_path = next((path for path in candidates if path.is_file()), None)
-    if gps_path is None:
-        found = list(dataset_root.rglob("gps.jsonl"))
-        gps_path = found[0] if found else None
-    if gps_path is None:
-        return (None, {})
-    grouped: dict[str, list[dict]] = {"GGA": [], "RMC": []}
-    with gps_path.open("r", encoding="utf-8", errors="replace") as f:
-        for line_no, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                item = json.loads(line)
-                sentence_type = str(item.get("sentence_type", "")).upper()
-                timestamp = float(item["timestamp"])
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                print(f"[WARN] skip malformed gps.jsonl line {line_no}")
-                continue
-            if sentence_type in grouped and np.isfinite(timestamp):
-                grouped[sentence_type].append(item)
-    streams: dict[str, tuple[np.ndarray, list[dict]]] = {}
-    for sentence_type, records in grouped.items():
-        records.sort(key=lambda item: float(item["timestamp"]))
-        times = np.asarray([float(item["timestamp"]) for item in records], dtype=np.float64)
-        streams[sentence_type] = (times, records)
-    return (gps_path, streams)
 
 
 def lidar__nearest_gps_record(
@@ -3481,10 +2519,9 @@ def pcap_scan_time_bounds(path: Path, gap_sec: float = 0.005) -> list[tuple[floa
     previous_timestamp: Optional[float] = None
     for rec in lidar__iter_pcap(path):
         try:
-            udp = lidar__decode_udp(rec.frame)
+            payload = lidar__decode_udp(rec.frame)
         except ValueError:
             continue
-        payload = udp.payload
         if len(payload) != lidar__XT32_PAYLOAD_LEN or payload[:4] != b"\xee\xff\x06\x01":
             continue
         timestamp = float(rec.timestamp)
@@ -3526,41 +2563,24 @@ def merge_scan_fragments(fragments, gap_sec=0.005):
     return merged
 
 
-def flatten(points, frame_id):
+def flatten(points):
     if len(points) < 3:
         raise ValueError("insufficient_lidar_points")
-    xyz, channels = (points.xyz, points.channel)
-    normal, offset, info = fit_spatial_road_plane(xyz, channels)
-    signed = xyz @ normal + offset
-    center, p90, _ = lidar___channel_plane_quality(signed, channels)
-    info.update(
-        channel_center_error_m=float(center),
-        channel_p90_abs_m=float(p90),
-        final_firing_quality=lidar___firing_plane_quality(signed, lidar__firing_keys(points)),
-        residual_std_m=float(np.std(signed[np.abs(signed) <= 0.04])),
-        all_residual_std_m=float(np.std(signed)),
-    )
-    road, rotation, origin = lidar__road_aligned_xyz(xyz, normal, offset)
+    xyz = points.xyz
+    normal, offset = fit_spatial_road_plane(xyz)
+    road, rotation, _ = lidar__road_aligned_xyz(xyz, normal, offset)
     return dict(
         points=points,
         point_timestamps=points.timestamp,
         sensor_xyz_m=xyz,
         road_xyz_m=road,
         plane_normal=normal,
-        plane_offset=offset,
-        plane_info=info,
         road_rotation=rotation,
-        road_origin_sensor_m=origin,
     )
 
 
-def validate_objects(
-    detections, result, camera, threshold_m=POTHOLE_DEPTH_M, active_intervals=None
-):
+def validate_objects(detections, result, camera, threshold_m=POTHOLE_DEPTH_M):
     """Accept a pothole when any finite mask point reaches the depth threshold."""
-    import time
-
-    active_start = time.monotonic_ns()
     if not np.isfinite(threshold_m) or threshold_m <= 0:
         raise ValueError("invalid depth threshold")
     pixels, visible = (
@@ -3607,8 +2627,6 @@ def validate_objects(
         )
         local = {}
         if int(d.class_id) == 1 and len(indices):
-            if active_intervals is not None:
-                active_intervals.append((active_start, time.monotonic_ns()))
             channels = result["points"].channel
             _, _, _, local = local_depth__evaluate(
                 result["road_xyz_m"],
@@ -3620,7 +2638,6 @@ def validate_objects(
                 channels,
                 threshold_m,
             )
-            active_start = time.monotonic_ns()
         global_maximum = maximum
         if int(d.class_id) == 1 and len(indices):
             measured, measurement = measure_mask_local_depth(
@@ -3640,8 +2657,6 @@ def validate_objects(
                 if maximum is None
                 else "depth_pass" if keep else "depth_below_threshold"
             )
-        if active_intervals is not None:
-            active_intervals.append((active_start, time.monotonic_ns()))
         evidence = dict(
             method="model_only" if d.class_id == 0 else "model_mask_local_max_depth",
             accepted=keep,
@@ -3678,70 +2693,34 @@ def validate_objects(
                     validation=evidence,
                 )
             )
-        active_start = time.monotonic_ns()
-    if active_intervals is not None:
-        active_intervals.append((active_start, time.monotonic_ns()))
     return (accepted, objects, audit)
 
 
-def scan_candidates(pcaps, pcap_dir, center, frame_bounds, cache, args):
-    candidates = []
+def scan_candidates(pcaps, center, cache):
+    """(|delta|, sources, start, end, delta) of each scan near center; pcaps hold absolute paths."""
     fragments = []
     for item in pcaps:
         if (
-            float(item["last_timestamp"]) < center - args.scan_search_half_window_sec
-            or float(item["first_timestamp"]) > center + args.scan_search_half_window_sec
+            float(item["last_timestamp"]) < center - SCAN_SEARCH_HALF_WINDOW_SEC
+            or float(item["first_timestamp"]) > center + SCAN_SEARCH_HALF_WINDOW_SEC
         ):
             continue
         p = Path(item["path"])
-        if not p.is_absolute():
-            p = pcap_dir / p
-        if p.name in frame_bounds:
-            start, end = frame_bounds[p.name]
-            delta = (start + end) * 0.5 - center
-            if abs(delta) <= args.scan_search_half_window_sec:
-                candidates.append((abs(delta), (p,), start, end, delta))
-            continue
         if str(p) not in cache:
-            cache[str(p)] = pcap_scan_time_bounds(p, args.scan_gap_sec)
+            cache[str(p)] = pcap_scan_time_bounds(p, SCAN_GAP_SEC)
         fragments.extend(((p, start, end) for (start, end) in cache[str(p)]))
-    for sources, start, end in merge_scan_fragments(fragments, args.scan_gap_sec):
+    candidates = []
+    for sources, start, end in merge_scan_fragments(fragments, SCAN_GAP_SEC):
         delta = (start + end) * 0.5 - center
-        if abs(delta) <= args.scan_search_half_window_sec:
+        if abs(delta) <= SCAN_SEARCH_HALF_WINDOW_SEC:
             candidates.append((abs(delta), sources, start, end, delta))
     return candidates
 
 
 class RecordingAlignment:
-    """Reproduce the selected new_data trial without mutating cached raw scans."""
+    """GPS speeds of a run, to compensate vehicle motion between LiDAR packets and the image."""
 
-    def __init__(self, frames, gps_streams):
-        self.mode = CAMERA_TIMING_MODE
-        if self.mode not in ("recorded", "uniform_source_clock"):
-            raise ValueError("Unknown camera timing mode")
-        self.clock = None
-        if self.mode == "uniform_source_clock":
-            ordered = sorted(frames, key=lambda f: float(f["timestamp"]))
-            ids = np.asarray([f["source_frame_id"] for f in ordered], dtype=float)
-            times = np.asarray([f["timestamp"] for f in ordered], dtype=float)
-            if (
-                len(ids) < 2
-                or not np.isfinite(ids).all()
-                or not np.isfinite(times).all()
-                or np.any(np.diff(ids) <= 0)
-            ):
-                raise ValueError("Uniform camera clock requires ordered source frame IDs")
-            period, intercept = np.polyfit(ids - ids[0], times - times[0], 1)
-            if not np.isfinite(period) or period <= 0:
-                raise ValueError("Invalid fitted frame period")
-            self.clock = dict(
-                schema="uniform_source_clock_v1",
-                first_source_frame_id=int(ids[0]),
-                reference_epoch_sec=float(times[0] + intercept),
-                period_sec=float(period),
-                fit_frame_count=len(ids),
-                estimated_not_measured_exposure=True,
-            )
+    def __init__(self, gps_streams):
         speed_records = []
         stream = gps_streams.get("RMC")
         for record in (() if stream is None else stream[1]):
@@ -3755,28 +2734,7 @@ class RecordingAlignment:
                 speed_records.append(row)
         self.speeds = np.asarray(sorted(speed_records), dtype=float).reshape(-1, 2)
 
-    def image_time(self, record):
-        if self.clock is None:
-            return float(record.get("capture_timestamp", record["timestamp"]))
-        return (
-            self.clock["reference_epoch_sec"]
-            + (int(record["source_frame_id"]) - self.clock["first_source_frame_id"])
-            * self.clock["period_sec"]
-        )
-
-    def timing_metadata(self, record):
-        return dict(
-            profile_id=ALIGNMENT_PROFILE_ID,
-            mode=self.mode,
-            clock=self.clock,
-            source_frame_id=record.get("source_frame_id"),
-            recorded_epoch_sec=float(record["timestamp"]),
-            alignment_camera_epoch_sec=self.image_time(record),
-        )
-
     def compensate(self, raw, camera, target):
-        if not LIDAR_MOTION_ENABLED:
-            return raw
         k = int(np.searchsorted(self.speeds[:, 0], target))
         if k == 0 or k == len(self.speeds) or self.speeds[k, 0] - self.speeds[k - 1, 0] > 1.5:
             raise ValueError("Motion compensation requires bracketing valid GPS speeds")
@@ -3815,22 +2773,6 @@ class RecordingAlignment:
         )
 
 
-def box(row):
-    b = [float(row[k]) for k in ["x1", "y1", "x2", "y2"]]
-    import math
-
-    if not all(map(math.isfinite, b)) or b[2] <= b[0] or b[3] <= b[1]:
-        raise ValueError("Invalid bounding box")
-    return b
-
-
-def configure_live(offset_sec=0.0):
-    """Configure the embedded recorded-clock pipeline in this interpreter."""
-    global OFFSET_SEC
-    OFFSET_SEC = offset_sec
-    cv2.setNumThreads(FUSION_OPENCV_THREADS)
-
-
 def atomic_json(path, value, durable=True):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -3843,15 +2785,10 @@ def atomic_json(path, value, durable=True):
     os.replace(tmp, path)
 
 
-def frame_time(row, mode="ptp"):
-    if mode == "ptp":
-        if row.get("timestamp_source") != "camera_ptp_rtcp_utc" or not row.get("timestamp_ns"):
-            raise ValueError(
-                "PTP camera timestamp missing; select --timestamp-mode recorded explicitly for legacy data"
-            )
-        value = int(row["timestamp_ns"]) / 1000000000.0
-    else:
-        value = float(row.get("capture_timestamp", row["timestamp"]))
+def frame_time(row):
+    if row.get("timestamp_source") != "camera_ptp_rtcp_utc" or not row.get("timestamp_ns"):
+        raise ValueError("PTP camera timestamp missing")
+    value = int(row["timestamp_ns"]) / 1000000000.0
     if not math.isfinite(value):
         raise ValueError("Invalid camera timestamp")
     return value
@@ -3861,10 +2798,7 @@ class GpsTail:
     """Read newly committed NMEA rows once, retaining only GGA/RMC."""
 
     def __init__(self, run):
-        self.path = next(
-            (p for p in (run / "gps/gps.jsonl", run / "gps.jsonl") if p.exists()),
-            run / "gps/gps.jsonl",
-        )
+        self.path = run / "gps/gps.jsonl"
         self.position = 0
         self.grouped = {"GGA": [], "RMC": []}
         self.identity = None
@@ -3909,12 +2843,11 @@ class GpsTail:
 IMAGE_PREFETCH = 4  # JPEGs decoded ahead in a thread; cv2.imread releases the GIL
 
 
-def lidar_stage(detections, index, target, scan, camera, angles, alignment, motion_option, cache):
+def lidar_stage(detections, target, scan, camera, angles, alignment, cache):
     """LiDAR part of one frame: decode the selected scan, fit the road plane,
     compensate vehicle motion and validate the detections.
 
-    The result depends only on the arguments (the cache only keeps values it would
-    recompute), so it is the same in the analysis process and in a LiDAR worker.
+    The cache only keeps decoded scans it would otherwise decode again.
     scan is None or (sources, start, end, delta) from LiveProcessor.frame_scan.
     """
     result, points, error = None, [], ""
@@ -3930,7 +2863,7 @@ def lidar_stage(detections, index, target, scan, camera, angles, alignment, moti
                     points = decode_scan(sources, angles, start - 1e-06, end + 1e-06)
                     plane_error = ""
                     try:
-                        plane = flatten(points, index)
+                        plane = flatten(points)
                     except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
                         plane, plane_error = None, str(exc)
                     cache[cache_key] = (points, plane, plane_error)
@@ -3941,20 +2874,15 @@ def lidar_stage(detections, index, target, scan, camera, angles, alignment, moti
                 if plane_error:
                     raise ValueError(plane_error)
                 status = "ok"
-                motion = dict(applied=False, reason="disabled")
-                if motion_option != "off":
-                    try:
-                        result = alignment.compensate(result, camera, target)
-                        motion = dict(applied=True, **result.get("motion_compensation", {}))
-                    except ValueError as exc:
-                        if motion_option == "required":
-                            raise
-                        motion = dict(applied=False, reason=str(exc))
+                try:
+                    result = alignment.compensate(result, camera, target)
+                    motion = dict(applied=True, **result.get("motion_compensation", {}))
+                except ValueError as exc:
+                    motion = dict(applied=False, reason=str(exc))
             except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
                 result = None
                 status, error = ("plane_or_scan_invalid", str(exc))
-    accepted, objects, audit = validate_objects(detections, result, camera, POTHOLE_MIN_DEPTH_M)
-    # Only what the commit needs travels back from a worker: not the per-point dicts.
+    accepted, objects, audit = validate_objects(detections, result, camera, POTHOLE_DEPTH_M)
     return dict(
         status=status,
         error=error,
@@ -3968,56 +2896,11 @@ def lidar_stage(detections, index, target, scan, camera, angles, alignment, moti
     )
 
 
-def pack_detection(d):
-    """A detection for a LiDAR worker; the full-size mask travels as bits."""
-    mask = None if d.mask is None else (d.mask.shape, np.packbits(d.mask))
-    return (d.class_id, d.confidence, d.box_xyxy, d.mask_coefficients, mask)
-
-
-def unpack_detection(packed):
-    class_id, confidence, box, coefficients, mask = packed
-    if mask is not None:
-        shape, bits = mask
-        mask = np.unpackbits(bits, count=shape[0] * shape[1]).reshape(shape).astype(bool)
-    return Detection(class_id=class_id, confidence=confidence, box_xyxy=box,
-                     mask_coefficients=coefficients, mask=mask)
-
-
-_LIDAR_WORKER = {}
-
-
-def _lidar_worker_init(parent_pid, offset_sec):
-    """Set up one LiDAR worker process (spawned: it shares nothing with the NPU runtime)."""
-    # Stops go to the analysis process, which ends its workers; die with it too.
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    try:
-        import ctypes
-
-        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
-    except (OSError, AttributeError):
-        pass
-    if os.getppid() != parent_pid:
-        os._exit(0)
-    configure_live(offset_sec)
-    cv2.setNumThreads(1)
-    _LIDAR_WORKER.update(camera=LiDAR2Camera(CAMERA_CALIBRATION),
-                         angles=lidar__load_calibration(LIDAR_CALIBRATION), cache=OrderedDict())
-
-
-def _lidar_worker_task(packed, index, target, scan, speeds, motion_option):
-    alignment = RecordingAlignment([], {})
-    alignment.speeds = speeds
-    return lidar_stage([unpack_detection(d) for d in packed], index, target, scan,
-                       _LIDAR_WORKER["camera"], _LIDAR_WORKER["angles"], alignment, motion_option,
-                       _LIDAR_WORKER["cache"])
-
-
 class LiveProcessor:
 
-    def __init__(self, options):
-        self.options = options
-        configure_live(options.offset_sec)
+    def __init__(self, output, upload):
+        self.output, self.upload = (output, upload)
+        cv2.setNumThreads(FUSION_OPENCV_THREADS)
         self.camera = LiDAR2Camera(CAMERA_CALIBRATION)
         self.angles = lidar__load_calibration(LIDAR_CALIBRATION)
         self.detector = DXNNDetector(MODEL_PATH, CONFIDENCE_THRESHOLD)
@@ -4031,46 +2914,32 @@ class LiveProcessor:
         self.alignment = None
         self.gps = None
         self.closed = False
-        # JPEGs are decoded ahead in a thread and per-frame LiDAR work runs in
-        # worker processes; tracking and commits stay here, in source order.
+        # JPEGs are decoded ahead in a thread; everything else stays in source order here.
         self.loader = ThreadPoolExecutor(1, thread_name_prefix="live-image")
-        context = multiprocessing.get_context("spawn")
-        self.workers = [
-            ProcessPoolExecutor(1, mp_context=context, initializer=_lidar_worker_init,
-                                initargs=(os.getpid(), options.offset_sec))
-            for _ in range(options.lidar_workers)
-        ]
-        self.worker_routes = OrderedDict()
-        self.next_worker = 0
         self.unsynced = False  # frames committed without fsync since the last flush()
 
     def flush(self):
         """Make the frames committed without fsync durable (see commit)."""
         if self.unsynced:
-            syncfs(self.options.output)
+            syncfs(self.output)
             self.unsynced = False
 
     def close(self):
         if not self.closed:
             self.closed = True
-            for pool in self.workers:
-                pool.shutdown(wait=True, cancel_futures=True)
             self.loader.shutdown(wait=True, cancel_futures=True)
             self.detector.dispose()
 
     def refresh_run(self, run):
         if self.run != run:
             self.run = run
-            work = self.options.output / ".work"
-            self.exporter = DamageArtifactExporter(
-                work, work / "no_recording_input", save_images=SAVE_IMAGES, camera=self.camera
-            )
+            self.exporter = DamageArtifactExporter(self.camera)
             self.gps = GpsTail(run)
-            self.alignment = RecordingAlignment([], {})
+            self.alignment = RecordingAlignment({})
         streams = self.gps.read()
         if streams is not None:
             self.exporter.gps_streams = streams
-            self.alignment = RecordingAlignment([], streams)
+            self.alignment = RecordingAlignment(streams)
 
     def prune_pcaps(self, pcaps):
         paths = {str(Path(row["path"])) for row in pcaps}
@@ -4105,82 +2974,49 @@ class LiveProcessor:
 
         return self.detector.iter_detect(records, load_image)
 
-    def frame_scan(self, run, row, detections, pcaps):
+    def frame_scan(self, row, detections, pcaps):
         """Camera time, LiDAR target time and the nearest scan (None if there is none)."""
         if any(int(d.class_id) not in SUSPECT_CLASS_IDS for d in detections):
             raise ValueError("This terminal supports only Crack/Pothole classes 0/1")
-        timestamp = frame_time(row, self.options.timestamp_mode)
-        target = timestamp - self.options.offset_sec
+        timestamp = frame_time(row)
+        target = timestamp - OFFSET_SEC
         scan = None
         if detections:
-            args = SimpleNamespace(
-                scan_search_half_window_sec=SCAN_SEARCH_HALF_WINDOW_SEC, scan_gap_sec=SCAN_GAP_SEC
-            )
-            candidates = scan_candidates(pcaps, run, target, {}, self.scan_bounds, args)
+            candidates = scan_candidates(pcaps, target, self.scan_bounds)
             if candidates:
                 _, sources, start, end, delta = min(candidates, key=lambda item: item[0])
                 scan = (sources, start, end, delta)
         return (timestamp, target, scan)
 
     def submit(self, run, row, image, detections, pcaps):
-        """Start one frame. A scan to decode goes to a LiDAR worker, every frame of
-        one scan to the same worker so its scan cache is reused; the rest runs here."""
+        """LiDAR part of one frame (see lidar_stage); commit() does the rest."""
         started = time.monotonic()
-        timestamp, target, scan = self.frame_scan(run, row, detections, pcaps)
-        index = int(row["frame_index"])
-        if self.workers and scan is not None and abs(scan[3]) <= MAX_SCAN_CENTER_DELTA_SEC:
-            route = (tuple(map(str, scan[0])), scan[1], scan[2])
-            if route not in self.worker_routes:
-                self.worker_routes[route] = self.next_worker
-                self.next_worker = (self.next_worker + 1) % len(self.workers)
-                while len(self.worker_routes) > 64:
-                    self.worker_routes.popitem(last=False)
-            lidar = self.workers[self.worker_routes[route]].submit(
-                _lidar_worker_task, [pack_detection(d) for d in detections], index, target,
-                scan, self.alignment.speeds, self.options.motion,
-            )
-        else:
-            lidar = lidar_stage(detections, index, target, scan, self.camera, self.angles,
-                                self.alignment, self.options.motion, self.scan_cache)
+        timestamp, target, scan = self.frame_scan(row, detections, pcaps)
+        lidar = lidar_stage(detections, target, scan, self.camera, self.angles, self.alignment,
+                            self.scan_cache)
         return SimpleNamespace(row=row, image=image, detections=detections, timestamp=timestamp,
                                target=target, scan=scan, lidar=lidar, started=started)
-
-    def process(self, run, key, row, image, detections, pcaps):
-        return self.commit(run, key, self.submit(run, row, image, detections, pcaps))
 
     def analyse(self, run, key, stream, pcaps, stopping):
         """Commit the frames of an inference stream in source order, yielding each summary.
 
-        While the oldest frame waits for its LiDAR worker, later frames are started,
-        so the workers run in parallel. A frame counts only once committed; frames
-        still in flight at a stop or crash are analysed again after the restart.
+        A frame counts only once committed; frames in flight at a stop or crash
+        are analysed again after the restart.
         """
-        inflight = deque()
-        try:
-            for row, image, detections in stream:
-                if stopping():
-                    return
-                inflight.append(self.submit(run, row, image, detections, pcaps))
-                while inflight and (isinstance(inflight[0].lidar, dict) or inflight[0].lidar.done()):
-                    if stopping():
-                        return
-                    wait_for_collector(stopping)
-                    yield self.commit(run, key, inflight.popleft())
-            while inflight:
-                if stopping():
-                    return
-                wait_for_collector(stopping)
-                yield self.commit(run, key, inflight.popleft())
-        finally:
-            for frame in inflight:
-                if not isinstance(frame.lidar, dict):
-                    frame.lidar.cancel()
+        for row, image, detections in stream:
+            if stopping():
+                return
+            frame = self.submit(run, row, image, detections, pcaps)
+            if stopping():
+                return
+            wait_for_collector(stopping)
+            yield self.commit(run, key, frame)
 
     def commit(self, run, key, frame):
         """Track, export and commit one submitted frame; callers keep source order."""
         row, image, detections = (frame.row, frame.image, frame.detections)
         timestamp, target, scan, started = (frame.timestamp, frame.target, frame.scan, frame.started)
-        lidar = frame.lidar if isinstance(frame.lidar, dict) else frame.lidar.result()
+        lidar = frame.lidar
         index = int(row["frame_index"])
         image_path = Path(row["path"])
         if not image_path.is_absolute():
@@ -4191,7 +3027,7 @@ class LiveProcessor:
         accepted = [detections[i] for i in lidar["accepted"]]
         objects, audit = (lidar["objects"], lidar["audit"])
         self.sequence += 1
-        tracked, _ = self.tracker.update(
+        tracked = self.tracker.update(
             self.sequence,
             image,
             [
@@ -4218,7 +3054,7 @@ class LiveProcessor:
                         )
                     )
                 accepted_index += 1
-        folder = self.options.output / "runs" / key / "frames" / f"{index:08d}"
+        folder = self.output / "runs" / key / "frames" / f"{index:08d}"
         if folder.exists():
             raise FileExistsError(f"Frame already committed: {folder}")
         stage = folder.with_name("." + folder.name + "." + uuid.uuid4().hex + ".pending")
@@ -4226,38 +3062,33 @@ class LiveProcessor:
         try:
             self.exporter.directory = stage / "certifcate"
             self.exporter.directory.mkdir()
-            self.exporter.pcap_cache.clear()
-            damage_payloads = []
-            artifacts = self.exporter.save(
-                index,
+            damage_payloads, artifacts = [], []
+            self.exporter.save(
                 timestamp,
-                image_path,
                 report_detections,
                 report_objects,
                 lidar["point_count"],
                 lidar["road_xyz_m"],
                 scan_time if lidar["has_result"] else None,
-                pcap_sources=sources,
+                damage_payloads,
                 scan_start=start,
                 scan_end=end,
-                scan_status=status,
                 target_lidar_timestamp=target,
                 camera_timing=dict(
                     profile_id=ALIGNMENT_PROFILE_ID,
-                    mode=self.options.timestamp_mode,
+                    mode="ptp",
                     timestamp_ns=row.get("timestamp_ns"),
                     timestamp_source=row.get("timestamp_source"),
                     recorded_epoch_sec=timestamp,
                     alignment_camera_epoch_sec=timestamp,
                 ),
                 motion_compensation=motion,
-                payloads=damage_payloads,
             )
             for payload in damage_payloads:
                 if payload.get("tracking"):
                     payload["tracking"]["scope"] = "live_process_session_across_run_rotation"
             if report_detections:
-                pcap_path = self.exporter.directory / (detection_frame_stem(row, timestamp) + ".pcap")
+                pcap_path = self.exporter.directory / (detection_frame_stem(row) + ".pcap")
                 pcap_metadata = save_scan_pcap(
                     pcap_path, sources,
                     None if start is None else start - 1e-6,
@@ -4271,27 +3102,10 @@ class LiveProcessor:
                         pcap_files=pcap_files, status=status if pcap_files else "pcap_unavailable",
                         pcap_copy_policy="selected_scan_raw_records_unchanged",
                     )
-                lidar_metadata = dict(
-                    status="available" if lidar["point_count"] else "unavailable",
-                    analysis_status=status, scan_start_epoch_sec=start, scan_end_epoch_sec=end,
-                    scan_reference_epoch_sec=scan_time,
-                    camera_lidar_delta_ms=None if delta is None else delta * 1000,
-                    delta_definition="scan_midpoint_minus_alignment_target",
-                    timestamp_basis="pcap_record_sensor_utc", point_count=lidar["point_count"],
-                    pcap_attached=bool(pcap_files),
-                    pcap_files=pcap_files,
-                    pcap_copy_policy="selected_scan_raw_records_unchanged",
-                    source_pcap_files=[dict(name=Path(p).name, source_run=str(Path(p).parent.parent))
-                                       for p in sources],
-                    calibration_files=self.exporter.calibration_ids,
-                    camera_extrinsics=self.exporter.camera_extrinsics,
-                    motion_compensation=motion,
-                )
                 pair = save_detection_frame(
-                    self.exporter.directory, image_path, image, row, timestamp, key,
+                    self.exporter.directory, image_path, image, row, key,
                     report_detections, damage_payloads,
-                    matched_gps_metadata(self.exporter.gps_streams, timestamp),
-                    lidar_metadata,
+                    matched_gps_position(self.exporter.gps_streams, timestamp), pcap_files,
                 )
                 artifacts.extend(pair)
             files = {p.name: dict(bytes=p.stat().st_size, sha256=sha(p)) for p in artifacts}
@@ -4316,7 +3130,7 @@ class LiveProcessor:
                 camera_timestamp=timestamp,
                 camera_timestamp_ns=row.get("timestamp_ns"),
                 target_lidar_timestamp=target,
-                offset_sec=self.options.offset_sec,
+                offset_sec=OFFSET_SEC,
                 scan_start=start,
                 scan_end=end,
                 scan_delta_ms=None if delta is None else delta * 1000,
@@ -4334,7 +3148,7 @@ class LiveProcessor:
                 live_sequence=self.sequence,
                 live_session_id=self.session_id,
                 motion_compensation=motion,
-                upload_enabled=self.options.upload,
+                upload_enabled=self.upload,
                 upload_manifest=manifest,
                 upload_blocked_reason=triplet_error(files) if files else "",
                 processing_seconds=time.monotonic() - started,
@@ -4347,8 +3161,8 @@ class LiveProcessor:
                 fsync_dir(folder.parent)
             else:
                 self.unsynced = True
-            if self.options.upload and manifest:
-                queue_upload(self.options.output, key, folder)
+            if self.upload and manifest:
+                queue_upload(self.output, key, folder)
             return summary
         except BaseException:
             if stage.exists():
@@ -4558,12 +3372,7 @@ class Run:
         self.path = Path(path)
         self.frames = JsonlTail(self.path / "frames/frames.jsonl")
         self.events = JsonlTail(self.path / "meta/run_meta.jsonl")
-        layouts = [
-            self.path / "lidar",
-            self.path / "lidar/lidar_pcap",
-            self.path / "lidar/lidar_pcap_all",
-        ]
-        self.pcap_dir = next((p for p in layouts if (p / "pcaps.jsonl").exists()), layouts[0])
+        self.pcap_dir = self.path / "lidar"
         self.pcaps = JsonlTail(self.pcap_dir / "pcaps.jsonl")
         self.closed = False
         self.validated_rows = 0
@@ -4592,20 +3401,17 @@ class Run:
             yield dict(row, path=str(path))
 
 
-def ready_frames(run, count, pcaps, options, allow_tail):
+def ready_frames(run, count, pcaps, allow_tail):
     watermark = max((float(p["last_timestamp"]) for p in pcaps), default=float("-inf"))
     selected = []
     for row in run.frames.rows[count:]:
-        timestamp = frame_time(row, options.timestamp_mode)
-        if (
-            not allow_tail
-            and timestamp - options.offset_sec + SCAN_SEARCH_HALF_WINDOW_SEC > watermark
-        ):
+        timestamp = frame_time(row)
+        if not allow_tail and timestamp - OFFSET_SEC + SCAN_SEARCH_HALF_WINDOW_SEC > watermark:
             break
         selected.append(row)
-        if len(selected) >= options.batch_size:
+        if len(selected) >= BATCH_SIZE:
             break
-    return list(selected)
+    return selected
 
 
 def count_manifest(path, entry):
@@ -4695,43 +3501,24 @@ def wait_for_collector(stopping):
     raise InterruptedError("Live analysis stopping")
 
 
-def discover(root, mode="ptp"):
+def discover(root):
+    """PTP recordings under root/YYYYMMDD/<run>; others (e.g. new_data) are skipped."""
     result = set()
-    for pattern in ("*/frames/frames.jsonl", "*/*/frames/frames.jsonl"):
-        for path in root.glob(pattern):
-            if mode == "ptp":
-                with path.open("rb") as stream:
-                    first = stream.readline()
-                if first.endswith(b"\n") and first.strip():
-                    if json.loads(first).get("timestamp_source") != "camera_ptp_rtcp_utc":
-                        continue
-            result.add(path.parent.parent.resolve())
+    for path in root.glob("*/*/frames/frames.jsonl"):
+        with path.open("rb") as stream:
+            first = stream.readline()
+        if first.endswith(b"\n") and first.strip():
+            if json.loads(first).get("timestamp_source") != "camera_ptp_rtcp_utc":
+                continue
+        result.add(path.parent.parent.resolve())
     return sorted(result, key=lambda p: str(p))
 
 
-# This known previous build has the same analysis rules, but kept metadata at
-# the output root. Only that build may resume through the layout migration.
-LEGACY_LAYOUT_CODE_SHA256 = "6eb2b3507263a16f00d32223f6b93074d87e73098f5035cd64ac1b918b1ecee0"
-PRE_FRAME_EXPORT_CODE_SHA256 = "8ae0b269b564f59b632e1516daed0e1a93d6cfdff6310476433a33bddeca8141"
-
-# Migration metadata only: this previous model is never opened or inferred.
-PREVIOUS_DUAL_CODE_SHA256 = "72a6d05fecd2ae712dec75448fa9d33ee9d9ef0075709672b0d20c02f0b33ac6"
-PRE_TRIPLET_CODE_SHA256 = "2d8e64973a5d7b6c9f23b599e7b3a774c51994a357c0dff2c7f50ef40334af3a"
-PREVIOUS_EXTRA_MODEL_HASHES = {
-    "pothole_best2.dxnn": "559bf8a7776ab373307ea1ce8b14a16c73f12ef075ae363aa806249a77160086"
-}
-
-
-def analysis_signature(options):
+def analysis_signature(root):
     return dict(
-        root=str(options.root.resolve()),
-        run=None if options.run is None else str(options.run.resolve()),
-        timestamp_mode=options.timestamp_mode,
-        offset_sec=options.offset_sec,
-        motion=options.motion,
+        root=str(root),
         code_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        model_hashes={p.name: sha(p) if p.is_file() else None
-                      for p in (MODEL_PATH,)},
+        model_hashes={MODEL_PATH.name: sha(MODEL_PATH) if MODEL_PATH.is_file() else None},
     )
 
 
@@ -4740,100 +3527,29 @@ class OutputSettingsChanged(ValueError):
 
 
 def prepare_run_metadata(output, signature):
-    """Move old metadata under runs, preserving frame paths and queue positions.
-
-    Caller holds worker.lock, shared with the previous version. Each move is
-    atomic; a restart can finish a partially completed migration. Conflicting
-    files or incompatible analysis settings are rejected before any moves.
-    """
-    output = Path(output)
-    destination = output / "runs"
-    old_state, state_path = output / "state.json", destination / "state.json"
-    state = None
-    for path in (state_path, old_state):
-        if not path.exists():
-            continue
-        candidate = json.loads(path.read_text())
-        expected = dict(signature)
-        if candidate.get("schema_version") == 3:
-            expected["code_sha256"] = LEGACY_LAYOUT_CODE_SHA256
-            expected.pop("model_hashes", None)
-        elif candidate.get("schema_version") == 4:
-            expected["code_sha256"] = PRE_FRAME_EXPORT_CODE_SHA256
-            expected.pop("model_hashes", None)
-        elif candidate.get("schema_version") == 5:
-            expected["code_sha256"] = PREVIOUS_DUAL_CODE_SHA256
-            expected["model_hashes"] = {**signature["model_hashes"], **PREVIOUS_EXTRA_MODEL_HASHES}
-        elif candidate.get("schema_version") == 6:
-            expected["code_sha256"] = PRE_TRIPLET_CODE_SHA256
-        elif candidate.get("schema_version") != 7:
-            raise ValueError(f"Unsupported live checkpoint: {path}")
-        if candidate.get("configuration") != expected:
-            raise OutputSettingsChanged(
-                "Live output has different source/settings; choose a new --output"
-            )
-        if state is not None and candidate != state:
-            raise ValueError("Conflicting root and runs checkpoints; no files were moved")
-        state = candidate
-
-    moves = []
-    for name in ("state.json", "status.json", "upload_status.json"):
-        source = output / name
-        if source.exists():
-            moves.append((source, destination / name))
-    old_outbox = output / "outbox"
-    if old_outbox.exists():
-        for source in sorted(old_outbox.rglob("*")):
-            if source.is_file():
-                moves.append((source, destination / "outbox" / source.relative_to(old_outbox)))
-    for source, target in moves:
-        if source.is_symlink() or target.is_symlink():
-            raise ValueError("Metadata migration does not follow symbolic links")
-        if target.exists() and (not target.is_file() or source.read_bytes() != target.read_bytes()):
-            raise ValueError(f"Conflicting metadata destination: {target}")
-    destination.mkdir(parents=True, exist_ok=True)
-    for source, target in moves:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-            source.unlink()  # Identical duplicate, checked above.
-        else:
-            source.replace(target)
-        fsync_dir(target.parent)
-        fsync_dir(source.parent)
-    if old_outbox.exists():
-        for directory in sorted(old_outbox.rglob("*"), key=lambda p: len(p.parts), reverse=True):
-            if directory.is_dir():
-                directory.rmdir()
-        old_outbox.rmdir()
-        fsync_dir(output)
-    if state is not None and state["schema_version"] in (3, 4, 5, 6):
-        state.setdefault("upgrades", []).append(dict(
-            at_epoch_sec=time.time(), previous_schema=state["schema_version"],
-            previous_configuration=state["configuration"],
-            processed_rows_at_upgrade={key: row.get("processed_rows", 0)
-                                       for key, row in state.get("runs", {}).items()},
-            policy="triplet_upload_preserve_previous_results_and_upload_queue",
-        ))
-        state["schema_version"] = 7
-        state["configuration"] = signature
-        atomic_json(state_path, state)
-        fsync_dir(destination)
+    """This output's checkpoint, or None for a new output."""
+    state_path = Path(output) / "runs" / "state.json"
+    if not state_path.exists():
+        return None
+    state = json.loads(state_path.read_text())
+    if state.get("schema_version") != 7 or state.get("configuration") != signature:
+        raise OutputSettingsChanged("Live output was written by other code or settings")
     return state
 
 
-def run_service(options, processor_factory=LiveProcessor):
+def run_service(root=ROOT, output=OUTPUT, upload=True, max_frames=0):
+    """Analyse every new recording under root until stopped (max_frames: tests)."""
     import fcntl
     from contextlib import ExitStack
 
-    root, output = (options.root.resolve(), options.output.resolve())
-    options.output = output
+    root, output = (Path(root).resolve(), Path(output).resolve())
     if not root.is_dir():
         raise FileNotFoundError(f"Recording root is unavailable: {root}")
     if str(output).startswith("/mnt/ssd/") and (not os.path.ismount("/mnt/ssd")):
         raise RuntimeError("SSD is not mounted")
     output.mkdir(parents=True, exist_ok=True)
     state_path = output / "runs" / "state.json"
-    signature = analysis_signature(options)
+    signature = analysis_signature(root)
     stopping = False
 
     def stop(*_):
@@ -4850,9 +3566,9 @@ def run_service(options, processor_factory=LiveProcessor):
         try:
             state = prepare_run_metadata(output, signature)
         except OutputSettingsChanged:
-            # main_live.py, its settings, input or model changed since this output
-            # was written. Keep those results in a dated folder (the old lock stays
-            # held) and start a fresh output, as a new --output would.
+            # main_live.py, its input root or model changed since this output was
+            # written. Keep those results in a dated folder (the old lock stays
+            # held) and start a fresh output.
             stamp = time.strftime("%Y%m%d_%H%M%S")
             previous_output = output.with_name(f"{output.name}_{stamp}")
             suffix = 1
@@ -4869,12 +3585,10 @@ def run_service(options, processor_factory=LiveProcessor):
             )
             state = None
             # Uploads still queued there keep going from the moved folder.
-            if options.upload and any((previous_output / "runs" / "outbox").glob("**/*.json")):
+            if upload and any((previous_output / "runs" / "outbox").glob("**/*.json")):
                 previous_uploader = UploadWorker(previous_output)
         if state is None:
-            paths = (
-                [options.run.resolve()] if options.run else discover(root, options.timestamp_mode)
-            )
+            paths = discover(root)
             latest = (
                 max(paths, key=lambda p: (p / "frames/frames.jsonl").stat().st_mtime)
                 if paths
@@ -4889,10 +3603,10 @@ def run_service(options, processor_factory=LiveProcessor):
                 runs={},
             )
             atomic_json(state_path, state)
-        if options.nice:
-            os.nice(options.nice)
-            if shutil.which("ionice"):
-                subprocess.run(["ionice", "-c", "3", "-p", str(os.getpid())], check=False)
+        # The recorder always comes first: lowest CPU share and idle-class disk I/O.
+        os.nice(10)
+        if shutil.which("ionice"):
+            subprocess.run(["ionice", "-c", "3", "-p", str(os.getpid())], check=False)
         processor = uploader = None
         failure = ""
         runs = {}
@@ -4903,16 +3617,12 @@ def run_service(options, processor_factory=LiveProcessor):
         previous_pending = None
         source_finished_at = None
         print(
-            f"[LIVE] root={root} output={output} upload={options.upload} timestamp={options.timestamp_mode} offset={options.offset_sec}s motion={options.motion}; disk-backed FIFO, no skipped frames",
+            f"[LIVE] root={root} output={output} upload={upload}; disk-backed FIFO, no skipped frames",
             flush=True,
         )
         try:
             while not stopping:
-                paths = (
-                    [options.run.resolve()]
-                    if options.run
-                    else discover(root, options.timestamp_mode)
-                )
+                paths = discover(root)
                 for path in paths:
                     key = str(path.relative_to(root))
                     if key not in state["runs"]:
@@ -4942,14 +3652,12 @@ def run_service(options, processor_factory=LiveProcessor):
                     if entry["first_frame_sha256"] not in (None, first_hash):
                         raise ValueError(f"Source recording was replaced: {run.path}")
                     entry["first_frame_sha256"] = first_hash
-                    count = recover_committed(
-                        output, key, run, entry["processed_rows"], options.upload
-                    )
+                    count = recover_committed(output, key, run, entry["processed_rows"], upload)
                     if count > len(run.frames.rows):
                         raise ValueError(f"Source manifest shrank since checkpoint: {key}")
                     entry["processed_rows"] = count
                 extra = []
-                if runs and (not options.run):
+                if runs:
                     first_path = runs[min(runs)].path
                     before = [p for p in paths if str(p) < str(first_path)]
                     if before:
@@ -4970,7 +3678,7 @@ def run_service(options, processor_factory=LiveProcessor):
                 source_finished_at = source_finished_at or time.monotonic() if closed else None
                 allow_tail = (
                     source_finished_at is not None
-                    and time.monotonic() - source_finished_at >= options.poll_seconds
+                    and time.monotonic() - source_finished_at >= POLL_SECONDS
                 )
                 did_work = False
                 for key in sorted(runs):
@@ -4979,23 +3687,23 @@ def run_service(options, processor_factory=LiveProcessor):
                     if count == len(run.frames.rows):
                         entry["complete"] = run.closed
                         continue
-                    ready = ready_frames(run, count, pcaps, options, allow_tail and run.closed)
+                    ready = ready_frames(run, count, pcaps, allow_tail and run.closed)
                     if not ready:
                         break
-                    if shutil.disk_usage(output).free < options.min_free_gb * 1024**3:
+                    if shutil.disk_usage(output).free < MIN_FREE_GB * 1024**3:
                         print(
                             "[LIVE] paused: insufficient free space for analysis output", flush=True
                         )
                         break
                     wait_for_collector(lambda: stopping)
                     if processor is None:
-                        processor = processor_factory(options)
+                        processor = LiveProcessor(output, upload)
                     processor.prune_pcaps(pcaps)
-                    if options.upload and uploader is None:
+                    if upload and uploader is None:
                         uploader = UploadWorker(output)
                     processor.refresh_run(run.path)
-                    if options.max_frames:
-                        ready = ready[: options.max_frames - processed]
+                    if max_frames:
+                        ready = ready[: max_frames - processed]
                     stream = processor.infer(run.path, ready)
                     committed = processor.analyse(run.path, key, stream, pcaps, lambda: stopping)
                     try:
@@ -5003,7 +3711,7 @@ def run_service(options, processor_factory=LiveProcessor):
                             entry["processed_rows"] += 1
                             processed += 1
                             did_work = True
-                            if options.max_frames and processed >= options.max_frames:
+                            if max_frames and processed >= max_frames:
                                 stopping = True
                                 break
                     finally:
@@ -5023,10 +3731,7 @@ def run_service(options, processor_factory=LiveProcessor):
                 )
                 oldest = next(
                     (
-                        frame_time(
-                            run.frames.rows[state["runs"][key]["processed_rows"]],
-                            options.timestamp_mode,
-                        )
+                        frame_time(run.frames.rows[state["runs"][key]["processed_rows"]])
                         for key, run in sorted(runs.items())
                         if state["runs"][key]["processed_rows"] < len(run.frames.rows)
                     ),
@@ -5061,25 +3766,14 @@ def run_service(options, processor_factory=LiveProcessor):
                             flush=True,
                         )
                     previous_pending, last_status = (pending, now)
-                if (
-                    options.upload
-                    and uploader is None
-                    and any((output / "runs" / "outbox").glob("**/*.json"))
-                ):
+                if upload and uploader is None and any((output / "runs" / "outbox").glob("**/*.json")):
                     uploader = UploadWorker(output)
                 if uploader is not None and (not uploader.thread.is_alive()):
                     raise RuntimeError(
                         f"Upload worker stopped; pending files retained: {uploader.error}"
                     )
-                if (
-                    options.once
-                    and pending == 0
-                    and state["runs"]
-                    and all((entry["complete"] for entry in state["runs"].values()))
-                ):
-                    break
                 if not did_work:
-                    time.sleep(options.poll_seconds)
+                    time.sleep(POLL_SECONDS)
         except InterruptedError:
             if not stopping:
                 raise
@@ -5092,9 +3786,9 @@ def run_service(options, processor_factory=LiveProcessor):
             if processor:
                 processor.close()
             if uploader:
-                uploader.close(options.drain_seconds)
+                uploader.close()
             if previous_uploader:
-                previous_uploader.close(options.drain_seconds)
+                previous_uploader.close()
             atomic_json(
                 output / "runs" / "status.json",
                 dict(
@@ -5120,65 +3814,5 @@ def run_service(options, processor_factory=LiveProcessor):
             )
 
 
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(
-        description="Standalone PTP camera/LiDAR FIFO analysis and server upload."
-    )
-    p.add_argument("--root", type=Path, default=Path("/mnt/ssd/porthole_runs"))
-    p.add_argument("--run", type=Path, help="Follow one recording instead of discovering new runs")
-    p.add_argument("--output", type=Path, default=Path("/mnt/ssd/porthole_live_analysis"))
-    p.add_argument("--upload", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--timestamp-mode", choices=["ptp", "recorded"], default="ptp")
-    p.add_argument("--offset-sec", type=float, default=0.0)
-    p.add_argument("--motion", choices=["auto", "required", "off"], default="auto")
-    p.add_argument("--batch-size", type=int, default=16,
-                   help="Frames started per batch; all of them can be in flight at once")
-    # With the vectorised decoder, workers add about 6% CPU per frame for ~15%
-    # more throughput; on the fanless unit the lower CPU matters more.
-    p.add_argument("--lidar-workers", type=int, default=0,
-                   help="Processes for per-frame LiDAR work (0: all in the analysis process)")
-    p.add_argument("--poll-seconds", type=float, default=0.5)
-    p.add_argument("--min-free-gb", type=float, default=10)
-    p.add_argument("--nice", type=int, default=10)
-    p.add_argument("--max-frames", type=int, default=0)
-    p.add_argument(
-        "--once",
-        action="store_true",
-        help="Exit when the selected recordings have ended and drained",
-    )
-    p.add_argument("--drain-seconds", type=float, default=10)
-    options = p.parse_args(argv)
-    if options.timestamp_mode == "ptp" and options.offset_sec != 0:
-        p.error("PTP mode requires zero empirical time offset")
-    if (
-        not all(
-            (
-                math.isfinite(x)
-                for x in (
-                    options.offset_sec,
-                    options.poll_seconds,
-                    options.min_free_gb,
-                    options.drain_seconds,
-                )
-            )
-        )
-        or options.batch_size < 1
-        or options.poll_seconds <= 0
-        or (options.max_frames < 0)
-        or (options.min_free_gb < 0)
-        or (options.drain_seconds < 0)
-        or (not 0 <= options.nice <= 19)
-        or (not 0 <= options.lidar_workers <= 8)
-    ):
-        p.error("Invalid batch, polling, frame limit, disk reserve, nice or LiDAR worker setting")
-    if options.run:
-        options.run.resolve().relative_to(options.root.resolve())
-    return options
-
-
-def main():
-    run_service(parse_args())
-
-
 if __name__ == "__main__":
-    main()
+    run_service()
