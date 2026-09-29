@@ -890,19 +890,22 @@ class Detection:
 
 
 def letterbox_rgb_uint8(
-    image_bgr: np.ndarray, size: int = 640
+    image_bgr: np.ndarray, size: int = 640, out: Optional[np.ndarray] = None
 ) -> tuple[np.ndarray, LetterboxContext]:
-    """Return contiguous NHWC RGB uint8 without keeping an original-image copy."""
+    """Return contiguous NHWC RGB uint8 without keeping an original-image copy.
+
+    ``out``, a (1, size, size, 3) uint8 array, is filled in place when given.
+    """
     height, width = image_bgr.shape[:2]
     scale = min(size / width, size / height)
     resized_width = max(1, min(size, int(round(width * scale))))
     resized_height = max(1, min(size, int(round(height * scale))))
     resized = cv2.resize(image_bgr, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
-    canvas = np.full((size, size, 3), 114, dtype=np.uint8)
     pad_x = (size - resized_width) // 2
     pad_y = (size - resized_height) // 2
-    canvas[pad_y : pad_y + resized_height, pad_x : pad_x + resized_width] = resized
-    input_nhwc = np.ascontiguousarray(canvas[:, :, ::-1][None, ...])
+    input_nhwc = np.empty((1, size, size, 3), dtype=np.uint8) if out is None else out
+    input_nhwc.fill(114)
+    input_nhwc[0, pad_y : pad_y + resized_height, pad_x : pad_x + resized_width] = resized[:, :, ::-1]
     context = LetterboxContext(
         original_width=width,
         original_height=height,
@@ -1060,6 +1063,10 @@ class DXNNDetector:
                 engine.dispose()
             raise
         self.engine = self.engines[0]
+        # DXRT 3.3 keeps about 400 KB for every request made with a new input
+        # array (none when one is reused), so requests take their input from
+        # fixed buffers: one per request in flight, plus one for detect().
+        self.inputs = [np.empty((1, 640, 640, 3), dtype=np.uint8) for _ in range(4)]
         self.core_totals = [dict(completed=0, npu_us=0, latency_us=0) for _ in self.engines]
         self.core_report_at = time.monotonic()
         self.core_report_totals = [dict(row) for row in self.core_totals]
@@ -1098,7 +1105,7 @@ class DXNNDetector:
         return detections
 
     def detect(self, frame):
-        tensor, context = letterbox_rgb_uint8(frame)
+        tensor, context = letterbox_rgb_uint8(frame, out=self.inputs[3])
         outputs = self.engine.run(tensor)
         self._record_completion(self.engine)
         return self.decode(outputs, context)
@@ -1113,9 +1120,10 @@ class DXNNDetector:
         pending = deque()
         exhausted = False
         next_engine = 0
+        submitted = 0
 
         def submit_one():
-            nonlocal exhausted, next_engine
+            nonlocal exhausted, next_engine, submitted
             try:
                 record = next(source)
             except StopIteration:
@@ -1123,7 +1131,10 @@ class DXNNDetector:
                 return
             wait_for_collector()
             image = load_image(record)
-            tensor, context = letterbox_rgb_uint8(image)
+            # At most three requests are pending, so a buffer comes round
+            # again only after its request has been waited for.
+            tensor, context = letterbox_rgb_uint8(image, out=self.inputs[submitted % 3])
+            submitted += 1
             engine = self.engines[next_engine]
             next_engine = (next_engine + 1) % len(self.engines)
             job_id = engine.run_async(tensor)
