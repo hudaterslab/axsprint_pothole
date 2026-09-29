@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import concurrent.futures
+import ctypes
 import fcntl
 import json
 import math
@@ -287,6 +288,49 @@ def udp_payload(frame, linktype=1):
     return source, destination, frame[udp + 8 : udp + length]
 
 
+# Classic BPF run by the kernel before a frame reaches the Announce listener.
+# The LiDAR's 5000 datagrams a second share enp1s0; without it each one woke
+# the listener only to be discarded.  It keeps IPv4 UDP to port 319/320 and
+# anything VLAN-tagged, a superset of what udp_payload() + the port check accept.
+PTP_FRAME_FILTER = (
+    (0x28, 0, 0, 12),  # ldh [12]             EtherType
+    (0x15, 8, 0, 0x8100),  # jeq 802.1Q       -> keep
+    (0x15, 7, 0, 0x88A8),  # jeq 802.1ad      -> keep
+    (0x15, 0, 7, 0x0800),  # not IPv4         -> drop
+    (0x30, 0, 0, 23),  # ldb [23]             IP protocol
+    (0x15, 0, 5, 17),  # not UDP              -> drop
+    (0xB1, 0, 0, 14),  # ldxb 4*([14]&0xf)    IP header length
+    (0x48, 0, 0, 16),  # ldh [x + 16]         UDP destination port
+    (0x15, 1, 0, 319),  # jeq 319             -> keep
+    (0x15, 0, 1, 320),  # jeq 320             -> keep, else drop
+    (0x06, 0, 0, 0x40000),  # keep the whole frame
+    (0x06, 0, 0, 0),  # drop
+)
+
+SO_ATTACH_FILTER = getattr(socket, "SO_ATTACH_FILTER", 26)
+
+
+class _BpfInstruction(ctypes.Structure):
+    _fields_ = [
+        ("code", ctypes.c_uint16),
+        ("jt", ctypes.c_uint8),
+        ("jf", ctypes.c_uint8),
+        ("k", ctypes.c_uint32),
+    ]
+
+
+class _BpfProgram(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_uint16), ("filter", ctypes.POINTER(_BpfInstruction))]
+
+
+def attach_filter(sock, program=PTP_FRAME_FILTER):
+    """Attach a classic BPF program; the kernel copies it during the call."""
+    instructions = (_BpfInstruction * len(program))(*(_BpfInstruction(*row) for row in program))
+    sock.setsockopt(
+        socket.SOL_SOCKET, SO_ATTACH_FILTER, bytes(_BpfProgram(len(program), instructions))
+    )
+
+
 class PtpGuard:
     def __init__(self):
         self.lock = threading.Lock()
@@ -395,6 +439,11 @@ class PtpGuard:
         self.phc_fds = [os.open("/dev/ptp" + str(n), os.O_RDONLY | os.O_CLOEXEC) for n in (0, 1)]
         self.phc_ids = [(~fd << 3) | 3 for fd in self.phc_fds]
         self.socket = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
+        try:
+            attach_filter(self.socket)
+        except OSError as exc:
+            # Unfiltered still works; it only costs CPU.
+            print("[PTP WARN] packet filter not attached: " + repr(exc), flush=True)
         self.socket.bind(("enp1s0", 0))
         self.socket.settimeout(0.5)
         self.threads = [
