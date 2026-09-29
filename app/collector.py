@@ -89,6 +89,8 @@ GPS_BAUDRATE = int(config.get("gps_baudrate", 115200))
 GPS_CONNECTION_TIMEOUT_SEC = float(config.get("gps_connection_timeout_sec", 3.0))
 GPS_RECONNECT_INITIAL_SEC = float(config.get("gps_reconnect_initial_sec", 1.0))
 GPS_RECONNECT_MAX_SEC = float(config.get("gps_reconnect_max_sec", 30.0))
+# A power cut loses at most about this much of the GPS log.
+GPS_SYNC_SEC = 2.0
 
 # Folders rotate on calendar-aligned boundaries of this many minutes.
 RUN_ROTATION_MINUTES = float(config.get("run_rotation_minutes", 60.0))
@@ -650,6 +652,17 @@ class GpsNmeaRecorder:
             except OSError:
                 pass
 
+    def _storage_failed(self, handle, exc):
+        with self.lock:
+            self.storage_errors.append(f"{type(exc).__name__}: {exc}")
+            self.storage_disabled = True
+        print(f"[GPS WARN] GPS logging disabled after storage error: {exc}", flush=True)
+        try:
+            handle.close()
+        except OSError:
+            pass
+        return None
+
     def _record(self, record: dict, handle):
         if handle is None or self.storage_disabled:
             return handle
@@ -657,18 +670,18 @@ class GpsNmeaRecorder:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             return handle
         except OSError as exc:
-            with self.lock:
-                self.storage_errors.append(f"{type(exc).__name__}: {exc}")
-                self.storage_disabled = True
-            print(
-                f"[GPS WARN] GPS logging disabled after storage error: {exc}",
-                flush=True,
-            )
-            try:
-                handle.close()
-            except OSError:
-                pass
+            return self._storage_failed(handle, exc)
+
+    def _sync(self, handle):
+        """Make the log durable, so a power cut loses at most GPS_SYNC_SEC of it."""
+        if handle is None:
             return None
+        try:
+            handle.flush()
+            os.fsync(handle.fileno())
+            return handle
+        except OSError as exc:
+            return self._storage_failed(handle, exc)
 
     def _switch_log(self, handle, recorder):
         self.recorder = recorder
@@ -737,6 +750,7 @@ class GpsNmeaRecorder:
 
         buffer = bytearray()
         reconnect_attempt = 0
+        next_sync = time.monotonic() + GPS_SYNC_SEC
         try:
             while not self.stop_event.is_set():
                 if self.fd is None:
@@ -759,8 +773,13 @@ class GpsNmeaRecorder:
                         continue
 
                 try:
-                    readable, _, _ = select.select([self.fd], [], [], 0.5)
+                    readable, _, _ = select.select([self.fd], [], [], 0.2)
                     if not readable:
+                        # NMEA arrives in one burst per fix. Syncing in the quiet
+                        # gap after a burst never delays a sentence's receive time.
+                        if time.monotonic() >= next_sync:
+                            handle = self._sync(handle)
+                            next_sync = time.monotonic() + GPS_SYNC_SEC
                         continue
                     chunk = os.read(self.fd, 4096)
                     if not chunk:
@@ -781,6 +800,7 @@ class GpsNmeaRecorder:
                             self.transport_errors = self.transport_errors[-20:]
                     self._close()
                     buffer.clear()
+                    handle = self._sync(handle)
         finally:
             self._close()
             if handle is not None:
@@ -1012,6 +1032,45 @@ class RunRecorder:
         self.frames_jsonl.touch(exist_ok=True)
         self.gps_jsonl.touch(exist_ok=True)
         GUARD.add_run(self)
+
+
+def close_interrupted_runs(save_dir: Path):
+    """Give a closing record to run folders that an earlier collector left open.
+
+    A power cut or crash stops the collector before it writes run_finished, and
+    main_live only moves past a folder that has one; two such folders stall it.
+    This runs under the collector lock, so nothing still writes to them. A
+    record torn by the power cut is cut off first: followed by the new record it
+    would become an unparseable line.
+    """
+    for frames in sorted(save_dir.glob("[0-9]" * 8 + "/*/frames/frames.jsonl")):
+        run_dir = frames.parent.parent
+        meta = run_dir / "meta" / "run_meta.jsonl"
+        try:
+            text = meta.read_bytes() if meta.exists() else b""
+            complete = text[: text.rfind(b"\n") + 1]
+            if b'"run_finished"' in complete:
+                continue
+            with frames.open("rb") as handle:
+                saved = sum(1 for line in handle if line.endswith(b"\n") and line.strip())
+            record = {
+                "event": "run_finished",
+                "run_id": run_dir.name,
+                "timestamp": time.time(),
+                "entrypoint": "collect_data.py",
+                "status": "interrupted",
+                "reason": "the collector stopped without closing this folder (power cut or crash)",
+                "saved_frames": saved,
+            }
+            meta.parent.mkdir(exist_ok=True)
+            with meta.open("ab") as handle:
+                handle.truncate(len(complete))
+                handle.write((json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            print(f"[RECOVER] {run_dir.name}: closed after an unclean stop ({saved} frames)", flush=True)
+        except OSError as exc:
+            print(f"[RECOVER WARN] {run_dir}: {exc}", flush=True)
 
 
 # meta/lidar_clock.bin row: sensor UTC ns, receive UTC ns, native PTP ns,
@@ -1931,6 +1990,7 @@ def _run_collector(stop: threading.Event):
                 flush=True,
             )
 
+    close_interrupted_runs(SAVE_DIR)
     recorder = RunRecorder(SAVE_DIR)
     run_sequence = 0
     next_run_rotation_at = next_rotation_time(time.time())
