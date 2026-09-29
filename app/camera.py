@@ -1,7 +1,10 @@
 """CU22 hardware decoding, RTCP timestamps and a bounded frame queue.
 
 The GStreamer worker runs this module with --worker and PYTHONNOUSERSITE=1.
-OpenCV/numpy are loaded only by the collector when it converts NV12 pixels.
+Given a JPEG quality, the worker also encodes each frame to JPEG on the GPU
+(vaapijpegenc) and the collector stores those bytes unchanged. Without one, or
+without the encoder, raw NV12 frames go to the collector, which converts and
+encodes them with OpenCV (loaded only there).
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ from ptp import GUARD, NS, RtpClock, sender_reports
 
 
 class CameraStream:
-    def __init__(self, url):
+    def __init__(self, url, jpeg_quality=None):
         import gi
 
         gi.require_version("Gst", "1.0")
@@ -40,21 +43,33 @@ class CameraStream:
         from gi.repository import GstVideo
 
         self.GstVideo = GstVideo
+        # GPU JPEG: decoder and encoder from the same VA-API plugin keep frames in
+        # GPU memory; the NV12 path keeps the original decoder preference.
+        self.jpeg = jpeg_quality is not None and all(
+            Gst.ElementFactory.find(n) for n in ("vaapih264dec", "vaapijpegenc")
+        )
         decoder = next(
-            (n for n in ("vah264dec", "vaapih264dec") if Gst.ElementFactory.find(n)), None
+            (n for n in (("vaapih264dec",) if self.jpeg else ("vah264dec", "vaapih264dec"))
+             if Gst.ElementFactory.find(n)),
+            None,
         )
         if decoder is None:
             raise RuntimeError("No hardware H264 decoder available")
         print(
-            "[camera] hardware_decode=" + decoder + " output=NV12 pts=RTP",
+            "[camera] hardware_decode=" + decoder
+            + (f" output=JPEG(vaapijpegenc q{int(jpeg_quality)})" if self.jpeg else " output=NV12")
+            + " pts=RTP",
             file=sys.stderr,
             flush=True,
         )
-        output = (
-            decoder
-            + (" ! vaapipostproc" if decoder == "vaapih264dec" else "")
-            + " ! video/x-raw,format=NV12"
-        )
+        if self.jpeg:
+            output = decoder + f" ! vaapijpegenc quality={int(jpeg_quality)} ! image/jpeg"
+        else:
+            output = (
+                decoder
+                + (" ! vaapipostproc" if decoder == "vaapih264dec" else "")
+                + " ! video/x-raw,format=NV12"
+            )
         self.pipeline = Gst.parse_launch(
             "rtspsrc name=source protocols=tcp latency=50 buffer-mode=none tcp-timeout=3000000 ! rtph264depay name=depay ! h264parse config-interval=-1 ! "
             + output
@@ -139,23 +154,26 @@ class CameraStream:
             reports = self.reports
             self.reports = []
         payload = b.extract_dup(0, b.get_size())
-        extra = {}
-        info = self.GstVideo.VideoInfo.new_from_caps(sample.get_caps())
-        w, h = info.width, info.height
-        meta = self.GstVideo.buffer_get_video_meta(b)
-        stride = meta.stride if meta else info.stride
-        offset = meta.offset if meta else info.offset
-        if info.finfo.name != "NV12" or w % 2 or h % 2:
-            raise RuntimeError("Invalid NV12 format")
-        if stride[0] == w and stride[1] == w and offset[1] == offset[0] + w * h:
-            payload = payload[offset[0] : offset[0] + w * h * 3 // 2]
+        if self.jpeg:
+            caps = sample.get_caps().get_structure(0)
+            extra = dict(width=caps.get_value("width"), height=caps.get_value("height"), format="jpeg")
         else:
-            payload = b"".join(
-                payload[offset[p] + r * stride[p] : offset[p] + r * stride[p] + w]
-                for p, rows in ((0, h), (1, h // 2))
-                for r in range(rows)
-            )
-        extra = dict(width=w, height=h)
+            info = self.GstVideo.VideoInfo.new_from_caps(sample.get_caps())
+            w, h = info.width, info.height
+            meta = self.GstVideo.buffer_get_video_meta(b)
+            stride = meta.stride if meta else info.stride
+            offset = meta.offset if meta else info.offset
+            if info.finfo.name != "NV12" or w % 2 or h % 2:
+                raise RuntimeError("Invalid NV12 format")
+            if stride[0] == w and stride[1] == w and offset[1] == offset[0] + w * h:
+                payload = payload[offset[0] : offset[0] + w * h * 3 // 2]
+            else:
+                payload = b"".join(
+                    payload[offset[p] + r * stride[p] : offset[p] + r * stride[p] + w]
+                    for p, rows in ((0, h), (1, h // 2))
+                    for r in range(rows)
+                )
+            extra = dict(width=w, height=h, format="nv12")
         return dict(
             payload=payload,
             pts_ns=pts,
@@ -179,11 +197,12 @@ HEADER = struct.Struct("<II")
 
 
 class GstFrame:
-    def __init__(self, pts, width, height, arrival, mono, payload):
+    def __init__(self, pts, width, height, arrival, mono, payload, jpeg=False):
         self.pts = None if pts < 0 else pts
         self.width, self.height = width, height
         self.arrival, self.arrival_monotonic = arrival, mono
         self.payload = payload
+        self.jpeg = jpeg  # payload is a GPU-encoded JPEG, not NV12 pixels
 
     def to_ndarray(self, format="bgr24"):
         import cv2
@@ -196,7 +215,7 @@ class GstFrame:
 
 
 class GstContainer:
-    def __init__(self, url, timeout=15):
+    def __init__(self, url, timeout=15, jpeg_quality=None):
         env = os.environ.copy()
         # System gi and VA drivers run without user OpenCV/FFmpeg libraries.
         env["PYTHONNOUSERSITE"] = "1"
@@ -215,9 +234,12 @@ class GstContainer:
         self.first = None
         self.decoder = "GStreamer VA-API (see startup log)"
         try:
-            self.process.stdin.write((json.dumps({"url": url}) + "\n").encode())
+            self.process.stdin.write(
+                (json.dumps({"url": url, "jpeg_quality": jpeg_quality}) + "\n").encode()
+            )
             self.process.stdin.close()
             self.first = self._frame(timeout)
+            self.encoder = "vaapijpegenc" if self.first.jpeg else "opencv_cpu"
             self.stream = SimpleNamespace(
                 time_base=1e-9,
                 thread_type=None,
@@ -257,9 +279,13 @@ class GstContainer:
         h = metadata["height"]
         arrival = metadata["arrival_utc_ns"] / 1e9
         mono = metadata["arrival_monotonic_ns"] / 1e9
-        if not (0 < w <= 8192 and 0 < h <= 8192 and w % 2 == h % 2 == 0 and size == w * h * 3 // 2):
+        jpeg = metadata.get("format") == "jpeg"
+        if not (
+            0 < w <= 8192 and 0 < h <= 8192 and w % 2 == h % 2 == 0
+            and (0 < size <= w * h * 3 if jpeg else size == w * h * 3 // 2)
+        ):
             raise RuntimeError("Invalid hardware frame header")
-        frame = GstFrame(pts, w, h, arrival, mono, self._read(size, deadline))
+        frame = GstFrame(pts, w, h, arrival, mono, self._read(size, deadline), jpeg=jpeg)
         frame.metadata = metadata
         return frame
 
@@ -290,8 +316,10 @@ class CameraCapture:
 
     nonblocking_read = True
 
-    def __init__(self, url, buffer_size=8, watchdog_sec=5.0, connection_timeout_sec=1.0):
+    def __init__(self, url, buffer_size=8, watchdog_sec=5.0, connection_timeout_sec=1.0,
+                 jpeg_quality=None):
         self.url = url
+        self.jpeg_quality = jpeg_quality
         self.watchdog_sec = watchdog_sec
         self.connection_timeout_sec = connection_timeout_sec
         self.lock = threading.Lock()
@@ -366,6 +394,7 @@ class CameraCapture:
             result = {
                 "mode": "gstreamer_vaapi_ptp",
                 "hardware_decoder": getattr(self.container, "decoder", None),
+                "jpeg_encoder": getattr(self.container, "encoder", None),
                 "decoded_frames": self.decoded_count,
                 "delivered_frames": self.delivered_count,
                 "selected_frames": self.selected_count,
@@ -410,7 +439,8 @@ class CameraCapture:
             self.thread.join(timeout=6.0)
 
     def _open(self):
-        container = GstContainer(self.url, timeout=max(15.0, self.connection_timeout_sec * 5))
+        container = GstContainer(self.url, timeout=max(15.0, self.connection_timeout_sec * 5),
+                                 jpeg_quality=self.jpeg_quality)
         return container, container.stream
 
     def _run(self):
@@ -433,7 +463,8 @@ class CameraCapture:
                 if self.last_emitted_capture is not None and utc <= self.last_emitted_capture:
                     self.timestamp_backstep_dropped_count += 1
                     continue
-                image = frame.to_ndarray()
+                # GPU-encoded frames stay JPEG bytes, which the collector stores as is.
+                image = bytes(frame.payload) if frame.jpeg else frame.to_ndarray()
                 self.startup_settled = True
                 info = dict(
                     capture_timestamp=utc / NS,
@@ -472,7 +503,7 @@ class CameraCapture:
 
 def worker_main():
     request = json.loads(sys.stdin.readline())
-    stream = CameraStream(request["url"])
+    stream = CameraStream(request["url"], request.get("jpeg_quality"))
     out = sys.stdout.buffer
     stream.start()
     try:

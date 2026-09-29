@@ -25,6 +25,7 @@ camera_manifest_timestamp: capture
 camera_durable_writes: true
 camera_warmup_sec: 1.5
 jpeg_quality: 80
+camera_gpu_jpeg: true
 bbox_flip_x: false
 display_flip_x: false
 bbox_source_size: 640x480

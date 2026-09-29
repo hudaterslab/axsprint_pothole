@@ -25,7 +25,7 @@ live_detection/
   deploy/          install.sh가 설치하는 시스템 파일 원본
   app/
     collector.py   수집 루프·GPS·JPEG 저장·재연결·10분 폴더 전환
-    camera.py      하드웨어 카메라 디코딩·PTP 프레임 큐 (별도 worker 포함)
+    camera.py      하드웨어 카메라 디코딩·GPU JPEG 인코딩·PTP 프레임 큐 (별도 worker 포함)
     lidar.py       XT32 패킷 해석·진단·PCAP 저장
     ptp.py         PTP 상태 검사·센서 제어·RTP/RTCP 시각 변환
   var/             실행 중 생성되는 PTP 설정·상태·로그
@@ -84,6 +84,10 @@ PTP 기준 시계는 계속 동작합니다. 분석 프로세스 자동 실행�
 PCAP와 목록 파일은 `lidar/00000000.pcap`, `lidar/pcaps.jsonl`처럼 `lidar` 바로 아래에
 저장합니다. `lidar_pcap` 하위 폴더는 새로 만들지 않습니다. 변경 전 run의 파일은 기존 위치를 유지합니다.
 10분마다 새 run으로 전환합니다. 카메라 30fps, 라이다 20Hz 설정을 유지합니다.
+카메라 JPEG은 카메라 worker 안에서 GPU(VA-API `vaapijpegenc`, 품질 `jpeg_quality`)로 만들고,
+수집기는 그 JPEG을 그대로 저장합니다. CPU로 인코딩할 때보다 수집기 CPU가 절반 정도로 줄어듭니다.
+GPU 인코더는 동영상 색 범위(16~235)를 그대로 담아서, CPU(OpenCV) 인코딩보다 명암이 약 12% 낮고
+검은색이 조금 떠 보입니다. `config.yaml`의 `camera_gpu_jpeg: false`로 두면 이전처럼 CPU로 인코딩합니다.
 라이다는 내장 LAN `enp1s0`, 카메라는 `enp2s0`에 연결합니다.
 NetworkManager의 `ptp-pothole-lidar` 설정은 `enp1s0`/`48:21:0B:72:DC:48`,
 `porthole-camera` 설정은 `enp2s0`/`48:21:0B:72:DC:47`에 고정되어 있습니다(첫 단말기 기준이며,

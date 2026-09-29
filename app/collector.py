@@ -117,6 +117,9 @@ CAMERA_CONNECTION_TIMEOUT_SEC = float(config.get("camera_connection_timeout_sec"
 CAMERA_RECONNECT_INITIAL_SEC = float(config.get("camera_reconnect_initial_sec", 1.0))
 CAMERA_RECONNECT_MAX_SEC = float(config.get("camera_reconnect_max_sec", 30.0))
 JPEG_QUALITY = int(config.get("jpeg_quality", 80))
+# Encode JPEG on the GPU in the camera worker (vaapijpegenc) when available;
+# false keeps OpenCV CPU encoding in the collector.
+CAMERA_GPU_JPEG = config_bool("camera_gpu_jpeg", True)
 FRAME_SAVE_FPS = float(config.get("frame_save_fps", 5.0))
 CAMERA_ASYNC_WRITE = config_bool("camera_async_write", True)
 CAMERA_WRITE_QUEUE_SIZE = int(config.get("camera_write_queue_size", 128))
@@ -1659,6 +1662,7 @@ def open_capture(url: str):
         buffer_size=CAMERA_FRAME_BUFFER_SIZE,
         watchdog_sec=CAMERA_WATCHDOG_SEC,
         connection_timeout_sec=CAMERA_CONNECTION_TIMEOUT_SEC,
+        jpeg_quality=JPEG_QUALITY if CAMERA_GPU_JPEG else None,
     )
 
 
@@ -1814,6 +1818,7 @@ class CameraFrameWriter:
         self.encode_queue_block_count = 0
         self.timings = {}
         self.encoded_frames = 0
+        self.gpu_encoded_frames = 0
         self.written_frames = 0
         self.written_bytes = 0
         self.queue_high_watermark = 0
@@ -1937,14 +1942,20 @@ class CameraFrameWriter:
                     return
                 self._raise_if_failed()
                 if "callback" not in job:
-                    started = time.perf_counter()
-                    ok, encoded = cv2.imencode(
-                        ".jpg", job.pop("frame"), [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
-                    )
-                    if not ok:
-                        raise RuntimeError(f"failed to encode frame {job['frame_index']}")
-                    job["jpeg"] = encoded.tobytes()
-                    self._timing("jpeg_encode", started)
+                    frame = job.pop("frame")
+                    if isinstance(frame, bytes):  # already a JPEG from the GPU encoder
+                        job["jpeg"] = frame
+                        with self.lock:
+                            self.gpu_encoded_frames += 1
+                    else:
+                        started = time.perf_counter()
+                        ok, encoded = cv2.imencode(
+                            ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+                        )
+                        if not ok:
+                            raise RuntimeError(f"failed to encode frame {job['frame_index']}")
+                        job["jpeg"] = encoded.tobytes()
+                        self._timing("jpeg_encode", started)
                     with self.lock:
                         self.encoded_frames += 1
                 started = time.perf_counter()
@@ -2117,6 +2128,7 @@ class CameraFrameWriter:
                     for k, v in self.timings.items()
                 },
                 "encoded_frames": self.encoded_frames,
+                "gpu_encoded_frames": self.gpu_encoded_frames,
                 "written_frames": self.written_frames,
                 "written_bytes": self.written_bytes,
                 "queue_high_watermark": self.queue_high_watermark,
@@ -2145,12 +2157,9 @@ def save_camera_frame_record(
     """Save one camera frame using the collector's canonical run schema."""
     frame_name = f"{int(frame_index):08d}.jpg"
     frame_path = recorder.frames_dir / frame_name
-    saved = cv2.imwrite(
-        str(frame_path),
-        frame,
-        [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY],
-    )
-    if not saved:
+    if isinstance(frame, bytes):  # already a JPEG from the GPU encoder
+        frame_path.write_bytes(frame)
+    elif not cv2.imwrite(str(frame_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]):
         raise RuntimeError(f"failed to save camera frame: {frame_path}")
     saved_timestamp = time.time()
     frame_record = build_camera_frame_record(
