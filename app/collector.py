@@ -19,6 +19,7 @@ from collections import deque
 from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict
 
@@ -32,7 +33,7 @@ import yaml
 import lidar as xt32_packet
 from camera import CameraCapture
 from ptp import GUARD, NS, native_to_utc
-from lidar import LinkHeaderBuilder, PcapLidarWriter, xt32_timestamp
+from lidar import LinkHeaderBuilder, PcapLidarWriter, xt32_clock
 
 CONFIG_PATH = os.environ.get(
     "CONFIG_PATH", str(Path(__file__).resolve().parents[1] / "config.yaml")
@@ -999,6 +1000,19 @@ def _kernel_receive_time(ancdata) -> float | None:
     return None
 
 
+# The eight block azimuths of a full 1080-byte datagram, 130 bytes apart.
+_BLOCK_AZIMUTHS = struct.Struct("<" + "H128x" * 7 + "H")
+
+
+@lru_cache(maxsize=4)
+def _fov_table(forward_offset_deg: float, h_margin_deg: float) -> bytes:
+    """1 for every raw azimuth word (0.01 degree units) inside the window."""
+    return bytes(
+        abs(normalize_angle_deg(raw / 100.0 - forward_offset_deg)) <= h_margin_deg
+        for raw in range(1 << 16)
+    )
+
+
 def lidar_payload_within_fov(
     payload: bytes,
     forward_offset_deg: float,
@@ -1016,6 +1030,13 @@ def lidar_payload_within_fov(
     an average of 1077 of 1080 bytes.  Dropping by datagram gives the same
     saving and leaves every stored packet intact.
     """
+    if len(payload) == xt32_packet.FULL_PACKET_SIZE:
+        # Same test as the loop below, looked up per raw azimuth word.
+        inside = _fov_table(forward_offset_deg, h_margin_deg)
+        for azimuth in _BLOCK_AZIMUTHS.unpack_from(payload, xt32_packet.PACKET_HEADER_SIZE):
+            if inside[azimuth]:
+                return True
+        return False
     header_size = xt32_packet.PACKET_HEADER_SIZE
     block_size = xt32_packet.BLOCK_SIZE
     body_end = len(payload)
@@ -1168,6 +1189,11 @@ class RunRecorder:
         GUARD.add_run(self)
 
 
+# meta/lidar_clock.bin row: sensor UTC ns, receive UTC ns, native PTP ns,
+# sequence, UTC offset seconds.
+LIDAR_CLOCK_RECORD = struct.Struct("<QQQII")
+
+
 class LidarRawRecorder:
     """LiDAR UDP raw packet만 파일에 덤프한다. 파싱/좌표변환은 하지 않는다."""
 
@@ -1211,6 +1237,12 @@ class LidarRawRecorder:
         self.storage_lock = threading.Lock()
         self.first_packet_timestamp = None
         self.last_packet_timestamp = None
+        self.received_packet_count = 0
+        self.last_receive_timestamp = 0.0
+        self.last_ptp_ns = None
+        self.clock_recorder = None
+        self.clock_path = None
+        self.clock_file = None
 
     def _open_storage(self):
         if self.recorder is None or not SAVE_LIDAR_RAW:
@@ -1341,7 +1373,7 @@ class LidarRawRecorder:
             except Exception as exc:
                 self.storage_errors.append(repr(exc))
                 print(f"[LiDAR] pcap writer close failed: {exc}")
-        if getattr(self, "clock_file", None):
+        if self.clock_file:
             self.clock_file.close()
             self.clock_file = None
 
@@ -1394,15 +1426,15 @@ class LidarRawRecorder:
         else:
             result["storage_format"] = "pcap"
         with self.lock:
-            result["received_packet_count"] = getattr(self, "received_packet_count", 0)
-            result["last_receive_timestamp"] = getattr(self, "last_receive_timestamp", 0.0)
+            result["received_packet_count"] = self.received_packet_count
+            result["last_receive_timestamp"] = self.last_receive_timestamp
         return result
 
     def latest_packet_timestamp(self):
         # Connection health describes UDP reception, even while PTP admission
         # pauses storage. Never substitute this host time for sensor timestamps.
         with self.lock:
-            return getattr(self, "last_receive_timestamp", 0.0)
+            return self.last_receive_timestamp
 
     def fatal_error_message(self) -> str | None:
         with self.lock:
@@ -1425,55 +1457,50 @@ class LidarRawRecorder:
         """Accept only monotonic, PTP-qualified sensor time, then apply the whole-packet FoV."""
         with self.lock:
             self.last_receive_timestamp = timestamp
-            self.received_packet_count = getattr(self, "received_packet_count", 0) + 1
-        self.update_transport_stats(kernel_drop_count=kernel_drop_count)
+            self.received_packet_count += 1
+        if kernel_drop_count is not None:
+            self.update_transport_stats(kernel_drop_count=kernel_drop_count)
         okay, reason = GUARD.qualification()
         if not okay:
             GUARD.reject("lidar_" + reason)
             return
         try:
-            meta = xt32_timestamp(data)
+            native, sequence, sensor_ts = xt32_clock(data)
             announce = GUARD.status()[1]
-            utc = native_to_utc(meta["native_timestamp_ns"], "ptp", announce)
+            utc = native_to_utc(native, "ptp", announce)
         except ValueError:
             GUARD.reject("lidar_invalid_clock")
             return
         arrival = round(timestamp * NS)
-        if not -5_000_000 <= GUARD.master_time_ns() - meta["native_timestamp_ns"] <= NS:
+        if not -5_000_000 <= GUARD.master_time_ns() - native <= NS:
             GUARD.reject("lidar_invalid_epoch")
             return
-        if getattr(self, "last_ptp_ns", None) is not None and utc <= self.last_ptp_ns:
+        if self.last_ptp_ns is not None and utc <= self.last_ptp_ns:
             GUARD.reject("lidar_nonmonotonic")
             return
         self.last_ptp_ns = utc
         recorder = GUARD.recorder(utc)
-        path = recorder.meta_dir / "lidar_clock.bin" if recorder else None
-        if path != getattr(self, "clock_path", None):
-            if getattr(self, "clock_file", None):
-                self.clock_file.close()
-            self.clock_path = path
-            self.clock_file = path.open("ab", buffering=1 << 20) if path else None
-        if getattr(self, "clock_file", None):
+        if recorder is not self.clock_recorder:
+            # A run's meta_dir never changes, so neither does its clock file.
+            self.clock_recorder = recorder
+            path = recorder.meta_dir / "lidar_clock.bin" if recorder else None
+            if path != self.clock_path:
+                if self.clock_file:
+                    self.clock_file.close()
+                self.clock_path = path
+                self.clock_file = path.open("ab", buffering=1 << 20) if path else None
+        if self.clock_file:
             self.clock_file.write(
-                struct.pack(
-                    "<QQQII",
-                    utc,
-                    arrival,
-                    meta["native_timestamp_ns"],
-                    meta["sequence"],
-                    announce["current_utc_offset"],
+                LIDAR_CLOCK_RECORD.pack(
+                    utc, arrival, native, sequence, announce["current_utc_offset"]
                 )
             )
         timestamp = utc / NS
-        tail = xt32_packet.parse_tail(data)
-        sensor_ts = None if tail is None else xt32_packet.sensor_timestamp_from_tail(tail)
+        # xt32_clock() only accepts full packets, so the tail is always there.
         with self.lock:
-            if tail is None:
-                self.tail_missing_count += 1
-            else:
-                self.tail_present_count += 1
-                self.sequence_tracker.update(tail["sequence"])
-                self.clock_tracker.update(timestamp, sensor_ts)
+            self.tail_present_count += 1
+            self.sequence_tracker.update(sequence)
+            self.clock_tracker.update(timestamp, sensor_ts)
         save_data = data
         if LIDAR_FOV_FILTER_ENABLED and not lidar_payload_within_fov(
             data, LIDAR_CAMERA_FORWARD_OFFSET_DEG, LIDAR_H_MARGIN_DEG

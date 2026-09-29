@@ -331,10 +331,14 @@ class PtpGuard:
         )
 
     def recorder(self, utc_ns=None):
+        """The latest run started by this time (the first of equals), or None."""
         ts = (time.time_ns() if utc_ns is None else utc_ns) / NS
+        best = None
         with self.lock:
-            eligible = [r for r in self.runs if r.started_at <= ts]
-        return max(eligible, key=lambda r: r.started_at) if eligible else None
+            for run in self.runs:
+                if run.started_at <= ts and (best is None or run.started_at > best.started_at):
+                    best = run
+        return best
 
     def log(self, name, data, utc_ns=None):
         recorder = self.recorder(utc_ns)
@@ -348,6 +352,8 @@ class PtpGuard:
 
     def qualification(self):
         state = self.current_qualification()
+        if self.startup_ready:  # only ever turns True, so no lock needed
+            return state
         now = time.monotonic_ns()
         with self.lock:
             if self.startup_ready:

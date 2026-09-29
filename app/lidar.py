@@ -26,16 +26,6 @@ _TAIL_MOTOR = struct.Struct("<H")
 
 _TAIL_U32 = struct.Struct("<I")
 
-RETURN_MODE_NAMES = {
-    0x33: "first",
-    0x37: "strongest",
-    0x38: "last_strongest",
-    0x39: "dual",
-    0x3B: "last",
-    0x3C: "last_first",
-    0x3D: "first_strongest",
-}
-
 
 def has_tail(payload: bytes) -> bool:
     """True when the payload still carries a 28-byte tail after whole blocks."""
@@ -50,67 +40,6 @@ def block_count(payload: bytes) -> int:
 
 
 _TAIL_FIELDS = struct.Struct("<10xBH6sIBI")
-
-
-def parse_tail(payload: bytes) -> dict | None:
-    """Decode the tail, or return ``None`` when the payload has none.
-
-    This runs on every datagram at 5000 packets per second, so it reads the
-    fixed-offset fields in one struct pass instead of a dozen slices.
-    """
-    if not has_tail(payload):
-        return None
-    start = len(payload) - TAIL_SIZE
-    (
-        return_mode,
-        motor_speed,
-        utc,  # 6 raw bytes: year-1900, month, day, h, m, s
-        timestamp_us,
-        factory_info,
-        sequence,
-    ) = _TAIL_FIELDS.unpack_from(payload, start)
-    return {
-        "return_mode": return_mode,
-        "return_mode_name": RETURN_MODE_NAMES.get(return_mode, f"0x{return_mode:02x}"),
-        "motor_speed_rpm": motor_speed,
-        "utc": utc,
-        "timestamp_us": timestamp_us,
-        "factory_info": factory_info,
-        "sequence": sequence,
-    }
-
-
-_UTC_SECONDS_CACHE: dict[tuple, float | None] = {}
-
-
-def sensor_timestamp_from_tail(tail: dict) -> float | None:
-    """Sensor clock as a UNIX timestamp, from an already-parsed tail.
-
-    The sensor's calendar fields are only meaningful once it has been given a
-    time source (GPS/PTP).  Without one it free-runs from a factory date, so
-    treat this as a *rate-accurate relative* clock and fit an offset against the
-    host clock per run.  Do not assume it is absolute.
-
-    ``calendar.timegm`` costs about 15 us, which is real money at 5000 packets
-    per second, and its input only changes once per second - so the conversion
-    is memoised on the calendar tuple.
-    """
-    if tail is None:
-        return None
-    key = tail["utc"]
-    base = _UTC_SECONDS_CACHE.get(key, 0)
-    if base == 0:
-        year, month, day, hour, minute, second = key
-        try:
-            base = float(calendar.timegm((1900 + year, month, day, hour, minute, second, 0, 0, 0)))
-        except (ValueError, OverflowError):
-            base = None
-        if len(_UTC_SECONDS_CACHE) > 4096:
-            _UTC_SECONDS_CACHE.clear()
-        _UTC_SECONDS_CACHE[key] = base
-    if base is None:
-        return None
-    return base + tail["timestamp_us"] / 1e6
 
 
 class SequenceTracker:
@@ -219,26 +148,38 @@ class ClockOffsetTracker:
         }
 
 
-def xt32_timestamp(payload: bytes) -> dict:
-    """Hesai protocol 6.1: full 32-channel, 8-block datagram and native UTC tail."""
+_CALENDAR_SECONDS: dict[bytes, int] = {}
+
+
+def _calendar_seconds(utc: bytes) -> int:
+    """UNIX seconds of the tail's six date bytes; ValueError if not a date.
+
+    The conversion costs more than the rest of a packet's checks and its input
+    changes once a second, so valid dates are memoised.
+    """
+    seconds = _CALENDAR_SECONDS.get(utc)
+    if seconds is None:
+        year, month, day, hour, minute, second = utc
+        date = datetime(1900 + year, month, day, hour, minute, second, tzinfo=timezone.utc)
+        seconds = calendar.timegm(date.utctimetuple())
+        if len(_CALENDAR_SECONDS) > 4096:
+            _CALENDAR_SECONDS.clear()
+        _CALENDAR_SECONDS[utc] = seconds
+    return seconds
+
+
+def xt32_clock(payload: bytes) -> tuple[int, int, float]:
+    """Hesai protocol 6.1: full 32-channel, 8-block datagram and native UTC tail.
+
+    Returns (native ns, sequence, native seconds); the tail is unpacked once.
+    """
     if len(payload) != 1080 or payload[:4] != b"\xee\xff\x06\x01" or payload[6:8] != b"\x20\x08":
         raise ValueError("Expected a complete PandarXT 32-channel packet")
-    return_mode, rpm, utc, microseconds, factory, sequence = struct.unpack_from(
-        "<10xBH6sIBI", payload, 1052
-    )
+    _mode, _rpm, utc, microseconds, _factory, sequence = _TAIL_FIELDS.unpack_from(payload, 1052)
     if microseconds >= 1_000_000:
         raise ValueError("Invalid LiDAR microseconds")
-    year, month, day, hour, minute, second = utc
-    date = datetime(1900 + year, month, day, hour, minute, second, tzinfo=timezone.utc)
-    seconds = calendar.timegm(date.utctimetuple())
-    return dict(
-        native_timestamp_ns=seconds * NS + microseconds * 1000,
-        sequence=sequence,
-        motor_rpm=rpm,
-        return_mode=return_mode,
-        azimuth_first=struct.unpack_from("<H", payload, 12)[0] / 100,
-        azimuth_last=struct.unpack_from("<H", payload, 12 + 7 * 130)[0] / 100,
-    )
+    seconds = _calendar_seconds(utc)
+    return seconds * NS + microseconds * 1000, sequence, seconds + microseconds / 1e6
 
 
 PCAP_MAGIC_USEC = 0xA1B2C3D4
@@ -464,7 +405,8 @@ class PcapLidarWriter:
         self.peer.set_peer(src_ip, src_port, dst_ip, dst_port)
 
     def write_packet(self, timestamp: float, payload: bytes):
-        self._raise_if_writer_failed()
+        if self.writer_errors:
+            self._raise_if_writer_failed()
         if self.closed:
             raise RuntimeError("pcap writer is already closed")
         if not payload:
