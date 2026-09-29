@@ -4,6 +4,8 @@ Run: python3 -u main_live.py
 Input: /mnt/ssd/porthole_runs/YYYYMMDD/run/{frames,lidar,gps,meta}
 Every committed frame is processed in FIFO order; checkpoints and upload retries
 survive restarts. No other project Python file is imported or executed.
+--lidar-workers N moves per-frame LiDAR work to N processes (default 0: all here);
+tracking and commits always stay in source order in the main process.
 Model/calibration files and installed NumPy/OpenCV/DEEPX runtime are data/runtime
 dependencies. PTP synchronizes clocks; GPS speed, when available, compensates
 vehicle motion between LiDAR packets and the image (--motion auto, the default).
@@ -22,6 +24,8 @@ for _thread_env in (
     os.environ.setdefault(_thread_env, "1")
 from collections import OrderedDict
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import datetime
@@ -35,10 +39,10 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 import csv
 import cv2
-import dx_engine
 import hashlib
 import json
 import math
+import multiprocessing
 import numpy as np
 import re
 import select
@@ -1037,6 +1041,9 @@ def attach_masks(
 class DXNNDetector:
     def __init__(self, model_path, confidence=0.25, nms_iou=0.45, mask_threshold=0.5,
                  class_names=model_infer__CLASS_NAMES, selected_class_ids=SUSPECT_CLASS_IDS):
+        # Imported here so LiDAR worker processes never load the NPU runtime.
+        import dx_engine
+
         self.model_path = Path(model_path).expanduser().resolve()
         self.class_names = tuple(class_names)
         self.selected_class_ids = frozenset(selected_class_ids)
@@ -2220,8 +2227,7 @@ class DamageArtifactExporter:
         source_image,
         detections,
         fused,
-        points,
-        sensor_xyz,
+        point_count,
         road_xyz,
         lidar_timestamp,
         pcap_sources=(),
@@ -2250,7 +2256,7 @@ class DamageArtifactExporter:
             scan_end_epoch_sec=None if scan_end is None else scan_end + 1e-6,
             target_epoch_sec=target_lidar_timestamp,
             camera_lidar_offset_sec=OFFSET_SEC,
-            terminal_scan_point_count=len(points),
+            terminal_scan_point_count=point_count,
             return_selection=lidar__RETURN_SELECTION,
             channels=sorted(lidar___DETECTION_CHANNEL_SET),
             apply_firetime=lidar__APPLY_FIRETIME,
@@ -2834,8 +2840,6 @@ lidar__APPLY_FIRETIME = True
 
 lidar__COORDINATE_CORRECTION = True
 
-lidar__MAX_FRAMES: Optional[int] = None
-
 lidar__PCAP_GLOBAL_LEN = 24
 
 lidar__PCAP_RECORD_LEN = 16
@@ -2993,47 +2997,11 @@ def lidar__return_label(mode: int, block_index: int) -> str:
     return f"0x{mode:02X}"
 
 
-def lidar__corrected_azimuth_deg(
-    raw_az100: int, channel_index: int, spin_speed_rpm: float, azimuth_offset_deg: float
-) -> float:
-    firetime_deg = 0.0
-    if lidar__APPLY_FIRETIME:
-        firetime_deg = spin_speed_rpm * lidar__XT32_LASER_FIRETIME_US[channel_index] * 6e-06
-    az100 = int(azimuth_offset_deg * 100.0 + raw_az100 + firetime_deg * 100.0) % 36000
-    return az100 / 100.0
-
-
-def lidar__xyz_standard(
-    distance_m: float, azimuth_deg: float, elevation_deg: float
-) -> tuple[float, float, float]:
-    az = math.radians(azimuth_deg)
-    el = math.radians(elevation_deg)
-    xy = distance_m * math.cos(el)
-    return (xy * math.sin(az), xy * math.cos(az), distance_m * math.sin(el))
-
-
-def lidar__xyz_coordinate_corrected(
-    distance_m: float,
-    azimuth_deg: float,
-    elevation_deg: float,
-    azimuth_offset_deg: float,
-) -> tuple[float, float, float]:
-    sin_az, cos_az = _azimuth_trig(azimuth_deg)
-    cos_el, sin_el, correction = _channel_geometry(
-        elevation_deg, azimuth_offset_deg, lidar__XT_COORD_H_M, lidar__XT_COORD_B_M
-    )
-    corrected_distance = distance_m - correction
-    xy = corrected_distance * cos_el
-    x = xy * sin_az - lidar__XT_COORD_B_M * cos_az + lidar__XT_COORD_H_M * sin_az
-    y = xy * cos_az + lidar__XT_COORD_B_M * sin_az + lidar__XT_COORD_H_M * cos_az
-    z = corrected_distance * sin_el
-    return (x, y, z)
-
-
-@lru_cache(maxsize=36000)
-def _azimuth_trig(azimuth_deg):
-    az = math.radians(azimuth_deg)
-    return (math.sin(az), math.cos(az))
+@lru_cache(maxsize=1)
+def _azimuth_table():
+    """math.sin/cos of every 0.01-degree azimuth an XT32 point can have."""
+    radians = [math.radians(k / 100.0) for k in range(36000)]
+    return (np.array([math.sin(a) for a in radians]), np.array([math.cos(a) for a in radians]))
 
 
 @lru_cache(maxsize=256)
@@ -3048,90 +3016,105 @@ def _channel_geometry(elevation_deg, azimuth_offset_deg, height, baseline):
     )
 
 
-def decode_records_to_frames(records, calibration: lidar__Calibration) -> list[list[dict]]:
-    """
-    Recover frames from UDP sequence reset.
+@dataclass(frozen=True)
+class ScanPoints:
+    """Decoded points of one scan, in packet, block, channel order."""
 
-    The earlier frame-PCAP writer resets tail sequence to 0 at each frame,
-    so the merged PCAP has a clear boundary whenever sequence decreases.
+    sequence: np.ndarray  # packet tail sequence
+    timestamp: np.ndarray  # PCAP record time of the packet
+    block: np.ndarray  # 1-based block within the packet
+    return_mode: np.ndarray
+    channel: np.ndarray  # 1-based laser channel
+    xyz: np.ndarray  # sensor coordinates in metres, shape (n, 3)
+
+    def __len__(self):
+        return len(self.channel)
+
+
+def decode_xt32_records(records, calibration: lidar__Calibration) -> ScanPoints:
+    """Decode XT32 packets into points, all firings of all packets at once.
+
+    Filters, operation order and sin/cos values follow the per-point formulas
+    (azimuth: offset + raw + fire time, truncated to 0.01 degree; coordinates
+    corrected for the sensor's optical centre), so every value is bit-identical
+    to computing them one point at a time.
     """
-    frames: list[list[dict]] = []
-    current_points: list[dict] = []
-    previous_sequence: Optional[int] = None
+    payloads, times = [], []
     for rec in records:
-        udp = lidar__decode_udp(rec.frame)
-        payload = udp.payload
-        if len(payload) != lidar__XT32_PAYLOAD_LEN:
+        payload = lidar__decode_udp(rec.frame).payload
+        if len(payload) != lidar__XT32_PAYLOAD_LEN or payload[:4] != b"\xee\xff\x06\x01":
             continue
-        if payload[:4] != b"\xee\xff\x06\x01":
-            continue
-        laser_num = payload[6]
-        block_num = payload[7]
-        dist_unit_mm = payload[9]
-        if laser_num != 32 or block_num != 8:
+        if payload[6] != 32 or payload[7] != 8:
             raise ValueError(
-                f"Packet {rec.packet_index}: expected XT32 32/8, got {laser_num}/{block_num}"
+                f"Packet {rec.packet_index}: expected XT32 32/8, got {payload[6]}/{payload[7]}"
             )
-        tail = payload[lidar__XT32_TAIL_OFFSET : lidar__XT32_TAIL_OFFSET + 28]
-        return_mode = tail[10]
-        spin_speed_rpm = struct.unpack_from("<H", tail, 11)[0]
-        sequence = struct.unpack_from("<I", tail, 24)[0]
-        if previous_sequence is not None and sequence < previous_sequence and current_points:
-            frames.append(current_points)
-            current_points = []
-            if lidar__MAX_FRAMES is not None and len(frames) >= lidar__MAX_FRAMES:
-                return frames
-        previous_sequence = sequence
-        for block_index in range(lidar__XT32_BLOCKS):
-            start = lidar__XT32_BODY_OFFSET + block_index * lidar__XT32_BLOCK_LEN
-            block = payload[start : start + lidar__XT32_BLOCK_LEN]
-            raw_az100 = struct.unpack_from("<H", block, 0)[0]
-            rlabel = lidar__return_label(return_mode, block_index)
-            if lidar__RETURN_SELECTION != "all" and rlabel != lidar__RETURN_SELECTION:
-                continue
-            for channel_index in range(lidar__XT32_CHANNELS):
-                channel_id = channel_index + 1
-                if channel_id not in lidar___DETECTION_CHANNEL_SET:
-                    continue
-                off = 2 + channel_index * 4
-                distance_raw = struct.unpack_from("<H", block, off)[0]
-                intensity = block[off + 2]
-                confidence = block[off + 3]
-                distance_m = distance_raw * dist_unit_mm / 1000.0
-                if not 0.1 < distance_m <= 200.0:
-                    continue
-                elevation_deg = calibration.elevation_deg[channel_index]
-                az_offset_deg = calibration.azimuth_offset_deg[channel_index]
-                azimuth_deg = lidar__corrected_azimuth_deg(
-                    raw_az100, channel_index, spin_speed_rpm, az_offset_deg
-                )
-                if lidar__COORDINATE_CORRECTION:
-                    x, y, z = lidar__xyz_coordinate_corrected(
-                        distance_m, azimuth_deg, elevation_deg, az_offset_deg
-                    )
-                else:
-                    x, y, z = lidar__xyz_standard(distance_m, azimuth_deg, elevation_deg)
-                current_points.append(
-                    {
-                        "packet_index": rec.packet_index,
-                        "sequence": sequence,
-                        "timestamp": rec.timestamp,
-                        "block": block_index + 1,
-                        "return": rlabel,
-                        "return_mode": return_mode,
-                        "channel": channel_id,
-                        "azimuth_deg": azimuth_deg,
-                        "distance_m": distance_m,
-                        "x_m": x,
-                        "y_m": y,
-                        "z_m": z,
-                        "intensity": intensity,
-                        "confidence": confidence,
-                    }
-                )
-    if current_points and (lidar__MAX_FRAMES is None or len(frames) < lidar__MAX_FRAMES):
-        frames.append(current_points)
-    return frames
+        payloads.append(payload)
+        times.append(rec.timestamp)
+    count = len(payloads)
+    data = np.frombuffer(b"".join(payloads), dtype=np.uint8)
+    data = data.reshape(count, lidar__XT32_PAYLOAD_LEN).astype(np.int64)
+    tail = data[:, lidar__XT32_TAIL_OFFSET:]
+    return_mode = tail[:, 10]
+    spin_speed_rpm = tail[:, 11] | tail[:, 12] << 8
+    sequence = tail[:, 24] | tail[:, 25] << 8 | tail[:, 26] << 16 | tail[:, 27] << 24
+    blocks = data[:, lidar__XT32_BODY_OFFSET : lidar__XT32_TAIL_OFFSET].reshape(
+        count, lidar__XT32_BLOCKS, lidar__XT32_BLOCK_LEN
+    )
+    raw_az100 = blocks[:, :, 0] | blocks[:, :, 1] << 8
+    lasers = blocks[:, :, 2:].reshape(count, lidar__XT32_BLOCKS, lidar__XT32_CHANNELS, 4)
+    distance_m = (lasers[..., 0] | lasers[..., 1] << 8) * data[:, 9, None, None] / 1000.0
+
+    selected = {
+        mode: [lidar__RETURN_SELECTION == "all"
+               or lidar__return_label(int(mode), b) == lidar__RETURN_SELECTION
+               for b in range(lidar__XT32_BLOCKS)]
+        for mode in set(return_mode.tolist())
+    }
+    block_ok = np.array([selected[mode] for mode in return_mode.tolist()], dtype=bool)
+    channel_ok = np.array([c + 1 in lidar___DETECTION_CHANNEL_SET
+                           for c in range(lidar__XT32_CHANNELS)])
+    keep = (block_ok.reshape(count, lidar__XT32_BLOCKS, 1) & channel_ok
+            & (distance_m > 0.1) & (distance_m <= 200.0))
+
+    offset_deg = np.asarray(calibration.azimuth_offset_deg, dtype=np.float64)
+    firetime_deg = np.zeros((count, lidar__XT32_CHANNELS))
+    if lidar__APPLY_FIRETIME:
+        firetime_deg = spin_speed_rpm[:, None] * np.asarray(lidar__XT32_LASER_FIRETIME_US) * 6e-06
+    az100 = (offset_deg * 100.0 + raw_az100[:, :, None] + (firetime_deg * 100.0)[:, None, :])
+    az100 = az100.astype(np.int64) % 36000
+    sin_table, cos_table = _azimuth_table()
+    sin_az, cos_az = (sin_table[az100], cos_table[az100])
+    if lidar__COORDINATE_CORRECTION:
+        cos_el, sin_el, correction = np.array([
+            _channel_geometry(calibration.elevation_deg[c], calibration.azimuth_offset_deg[c],
+                              lidar__XT_COORD_H_M, lidar__XT_COORD_B_M)
+            for c in range(lidar__XT32_CHANNELS)
+        ]).T
+        corrected_distance = distance_m - correction
+        xy = corrected_distance * cos_el
+        x = xy * sin_az - lidar__XT_COORD_B_M * cos_az + lidar__XT_COORD_H_M * sin_az
+        y = xy * cos_az + lidar__XT_COORD_B_M * sin_az + lidar__XT_COORD_H_M * cos_az
+        z = corrected_distance * sin_el
+    else:
+        elevations = [math.radians(e) for e in calibration.elevation_deg]
+        cos_el = np.array([math.cos(e) for e in elevations])
+        xy = distance_m * cos_el
+        x, y = (xy * sin_az, xy * cos_az)
+        z = distance_m * np.array([math.sin(e) for e in elevations])
+
+    shape = keep.shape
+
+    def per_point(values, axes):
+        return np.broadcast_to(np.asarray(values).reshape(axes), shape)[keep]
+
+    return ScanPoints(
+        sequence=per_point(sequence, (count, 1, 1)),
+        timestamp=per_point(np.asarray(times, dtype=np.float64), (count, 1, 1)),
+        block=per_point(np.arange(1, lidar__XT32_BLOCKS + 1), (1, lidar__XT32_BLOCKS, 1)),
+        return_mode=per_point(return_mode, (count, 1, 1)),
+        channel=per_point(np.arange(1, lidar__XT32_CHANNELS + 1), (1, 1, lidar__XT32_CHANNELS)),
+        xyz=np.column_stack([x[keep], y[keep], z[keep]]),
+    )
 
 
 def lidar___channel_plane_quality(
@@ -3269,7 +3252,7 @@ def lidar__road_aligned_xyz(
     return (corrected, rotation_rows, plane_origin)
 
 
-def lidar__firing_keys(points: list[dict]) -> np.ndarray:
+def lidar__firing_keys(points: ScanPoints) -> np.ndarray:
     """
     One identity per laser firing.
 
@@ -3277,21 +3260,11 @@ def lidar__firing_keys(points: list[dict]) -> np.ndarray:
     blocks, so block index is halved to make both returns share a key. This is
     what makes MIN_CLUSTER_POINTS a count of real firings rather than rows.
     """
-    return np.asarray(
-        [
-            (
-                int(p["sequence"]),
-                (
-                    (int(p["block"]) - 1) // 2
-                    if int(p["return_mode"]) in lidar__DUAL_RETURN_MODES
-                    else int(p["block"]) - 1
-                ),
-                int(p["channel"]),
-            )
-            for p in points
-        ],
-        dtype=np.int64,
-    )
+    block = points.block - 1
+    dual = np.isin(points.return_mode, sorted(lidar__DUAL_RETURN_MODES))
+    return np.column_stack(
+        [points.sequence, np.where(dual, block // 2, block), points.channel]
+    ).astype(np.int64)
 
 
 def lidar__load_gps_streams(
@@ -3380,12 +3353,46 @@ def lidar__gps_values_for_camera(
 def decode_scan(source, calibration, start, end):
     records = iter_scan_records(source, start, end)
     try:
-        frames = decode_records_to_frames(records, calibration)
-        for _ in records:
-            pass
+        return decode_xt32_records(records, calibration)
     finally:
         records.close()
-    return [point for frame in frames for point in frame]
+
+
+@lru_cache(maxsize=16)
+def _pcap_record_index(path, size, mtime_ns):
+    """Global header plus payload offset, length and time of every record of a
+    classic PCAP. Parsed once per file version: size and mtime are in the key."""
+    formats = {
+        b"\xd4\xc3\xb2\xa1": ("<", 1000000.0),
+        b"\xa1\xb2\xc3\xd4": (">", 1000000.0),
+        b"M<\xb2\xa1": ("<", 1000000000.0),
+        b"\xa1\xb2<M": (">", 1000000000.0),
+    }
+    with open(path, "rb") as stream:
+        header = stream.read(lidar__PCAP_GLOBAL_LEN)
+        if len(header) != lidar__PCAP_GLOBAL_LEN or header[:4] not in formats:
+            raise ValueError("Invalid classic PCAP header")
+        endian, divisor = formats[header[:4]]
+        network = struct.unpack(endian + "IHHIIII", header)[-1]
+        if network != 1:
+            raise ValueError(f"Only Ethernet PCAP is supported (DLT={network})")
+        offsets, sizes, seconds, fractions, truncated = ([], [], [], [], False)
+        while True:
+            record = stream.read(lidar__PCAP_RECORD_LEN)
+            if not record:
+                break
+            if len(record) != lidar__PCAP_RECORD_LEN:
+                truncated = True
+                break
+            second, fraction, length, _ = struct.unpack(endian + "IIII", record)
+            offsets.append(stream.tell())
+            sizes.append(length)
+            seconds.append(second)
+            fractions.append(fraction)
+            stream.seek(length, 1)
+    # Same value as seconds + fraction / divisor for each record.
+    times = np.asarray(seconds, dtype=np.float64) + np.asarray(fractions, dtype=np.float64) / divisor
+    return (header, offsets, sizes, times, truncated)
 
 
 def iter_scan_records(source, start, end):
@@ -3394,44 +3401,30 @@ def iter_scan_records(source, start, end):
     Indices are relative to the selected records, including non-XT32 packets,
     and continue across source files. Never stop at a high timestamp: a single
     source is allowed to contain out-of-order packets, as in the legacy path.
+    Only records in [start, end] are read, located with the per-file index.
     """
     sources = [source] if isinstance(source, (str, os.PathLike)) else list(source)
     if not sources:
         raise ValueError("No PCAP sources")
-    formats = {
-        b"\xd4\xc3\xb2\xa1": ("<", 1000000.0),
-        b"\xa1\xb2\xc3\xd4": (">", 1000000.0),
-        b"M<\xb2\xa1": ("<", 1000000000.0),
-        b"\xa1\xb2<M": (">", 1000000000.0),
-    }
     global_header = None
     previous_timestamp = None
     packet_index = 0
     for path in sources:
+        stat = os.stat(path)
+        header, offsets, sizes, times, truncated = _pcap_record_index(
+            str(path), stat.st_size, stat.st_mtime_ns
+        )
+        if global_header is not None and header != global_header:
+            raise ValueError("Incompatible PCAP headers across scan sources")
+        global_header = header
+        if truncated:
+            raise ValueError("Truncated PCAP record header")
         with Path(path).open("rb") as stream:
-            header = stream.read(lidar__PCAP_GLOBAL_LEN)
-            if len(header) != lidar__PCAP_GLOBAL_LEN or header[:4] not in formats:
-                raise ValueError("Invalid classic PCAP header")
-            endian, divisor = formats[header[:4]]
-            network = struct.unpack(endian + "IHHIIII", header)[-1]
-            if network != 1:
-                raise ValueError(f"Only Ethernet PCAP is supported (DLT={network})")
-            if global_header is not None and header != global_header:
-                raise ValueError("Incompatible PCAP headers across scan sources")
-            global_header = header
-            while True:
-                record = stream.read(lidar__PCAP_RECORD_LEN)
-                if not record:
-                    break
-                if len(record) != lidar__PCAP_RECORD_LEN:
-                    raise ValueError("Truncated PCAP record header")
-                seconds, fraction, size, _ = struct.unpack(endian + "IIII", record)
-                timestamp = seconds + fraction / divisor
-                if not start <= timestamp <= end:
-                    stream.seek(size, 1)
-                    continue
-                payload = stream.read(size)
-                if len(payload) != size:
+            for i in np.flatnonzero((times >= start) & (times <= end)).tolist():
+                timestamp = float(times[i])
+                stream.seek(offsets[i])
+                payload = stream.read(sizes[i])
+                if len(payload) != sizes[i]:
                     raise ValueError("Truncated PCAP packet")
                 if (
                     len(sources) > 1
@@ -3509,8 +3502,7 @@ def merge_scan_fragments(fragments, gap_sec=0.005):
 def flatten(points, frame_id):
     if len(points) < 3:
         raise ValueError("insufficient_lidar_points")
-    xyz = np.asarray([[p["x_m"], p["y_m"], p["z_m"]] for p in points], dtype=float)
-    channels = np.asarray([p["channel"] for p in points])
+    xyz, channels = (points.xyz, points.channel)
     normal, offset, info = fit_spatial_road_plane(xyz, channels)
     signed = xyz @ normal + offset
     center, p90, _ = lidar___channel_plane_quality(signed, channels)
@@ -3524,7 +3516,7 @@ def flatten(points, frame_id):
     road, rotation, origin = lidar__road_aligned_xyz(xyz, normal, offset)
     return dict(
         points=points,
-        point_timestamps=np.asarray([p["timestamp"] for p in points], dtype=float),
+        point_timestamps=points.timestamp,
         sensor_xyz_m=xyz,
         road_xyz_m=road,
         plane_normal=normal,
@@ -3590,7 +3582,7 @@ def validate_objects(
         if int(d.class_id) == 1 and len(indices):
             if active_intervals is not None:
                 active_intervals.append((active_start, time.monotonic_ns()))
-            channels = np.asarray([p["channel"] for p in result["points"]])
+            channels = result["points"].channel
             _, _, _, local = local_depth__evaluate(
                 result["road_xyz_m"],
                 pixels,
@@ -3886,6 +3878,113 @@ class GpsTail:
         return streams
 
 
+IMAGE_PREFETCH = 4  # JPEGs decoded ahead in a thread; cv2.imread releases the GIL
+
+
+def lidar_stage(detections, index, target, scan, camera, angles, alignment, motion_option, cache):
+    """LiDAR part of one frame: decode the selected scan, fit the road plane,
+    compensate vehicle motion and validate the detections.
+
+    The result depends only on the arguments (the cache only keeps values it would
+    recompute), so it is the same in the analysis process and in a LiDAR worker.
+    scan is None or (sources, start, end, delta) from LiveProcessor.frame_scan.
+    """
+    result, points, error = None, [], ""
+    status = "no_model_detection" if not detections else "lidar_scan_missing"
+    motion = dict(applied=False, reason="not_required")
+    if detections and scan is not None:
+        sources, start, end, delta = scan
+        status = "lidar_scan_too_far"
+        if abs(delta) <= MAX_SCAN_CENTER_DELTA_SEC:
+            try:
+                cache_key = (tuple(map(str, sources)), start, end)
+                if cache_key not in cache:
+                    points = decode_scan(sources, angles, start - 1e-06, end + 1e-06)
+                    plane_error = ""
+                    try:
+                        plane = flatten(points, index)
+                    except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
+                        plane, plane_error = None, str(exc)
+                    cache[cache_key] = (points, plane, plane_error)
+                points, result, plane_error = cache[cache_key]
+                cache.move_to_end(cache_key)
+                while len(cache) > 4:
+                    cache.popitem(last=False)
+                if plane_error:
+                    raise ValueError(plane_error)
+                status = "ok"
+                motion = dict(applied=False, reason="disabled")
+                if motion_option != "off":
+                    try:
+                        result = alignment.compensate(result, camera, target)
+                        motion = dict(applied=True, **result.get("motion_compensation", {}))
+                    except ValueError as exc:
+                        if motion_option == "required":
+                            raise
+                        motion = dict(applied=False, reason=str(exc))
+            except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
+                result = None
+                status, error = ("plane_or_scan_invalid", str(exc))
+    accepted, objects, audit = validate_objects(detections, result, camera, POTHOLE_MIN_DEPTH_M)
+    # Only what the commit needs travels back from a worker: not the per-point dicts.
+    return dict(
+        status=status,
+        error=error,
+        motion=motion,
+        point_count=len(points),
+        has_result=result is not None,
+        road_xyz_m=None if result is None else result["road_xyz_m"],
+        accepted=[i for i, row in enumerate(audit) if row["accepted"]],
+        objects=objects,
+        audit=audit,
+    )
+
+
+def pack_detection(d):
+    """A detection for a LiDAR worker; the full-size mask travels as bits."""
+    mask = None if d.mask is None else (d.mask.shape, np.packbits(d.mask))
+    return (d.class_id, d.confidence, d.box_xyxy, d.mask_coefficients, mask)
+
+
+def unpack_detection(packed):
+    class_id, confidence, box, coefficients, mask = packed
+    if mask is not None:
+        shape, bits = mask
+        mask = np.unpackbits(bits, count=shape[0] * shape[1]).reshape(shape).astype(bool)
+    return Detection(class_id=class_id, confidence=confidence, box_xyxy=box,
+                     mask_coefficients=coefficients, mask=mask)
+
+
+_LIDAR_WORKER = {}
+
+
+def _lidar_worker_init(parent_pid, offset_sec):
+    """Set up one LiDAR worker process (spawned: it shares nothing with the NPU runtime)."""
+    # Stops go to the analysis process, which ends its workers; die with it too.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+    except (OSError, AttributeError):
+        pass
+    if os.getppid() != parent_pid:
+        os._exit(0)
+    configure_live(offset_sec)
+    cv2.setNumThreads(1)
+    _LIDAR_WORKER.update(camera=LiDAR2Camera(CAMERA_CALIBRATION),
+                         angles=lidar__load_calibration(LIDAR_CALIBRATION), cache=OrderedDict())
+
+
+def _lidar_worker_task(packed, index, target, scan, speeds, motion_option):
+    alignment = RecordingAlignment([], {})
+    alignment.speeds = speeds
+    return lidar_stage([unpack_detection(d) for d in packed], index, target, scan,
+                       _LIDAR_WORKER["camera"], _LIDAR_WORKER["angles"], alignment, motion_option,
+                       _LIDAR_WORKER["cache"])
+
+
 class LiveProcessor:
 
     def __init__(self, options):
@@ -3904,10 +4003,24 @@ class LiveProcessor:
         self.alignment = None
         self.gps = None
         self.closed = False
+        # JPEGs are decoded ahead in a thread and per-frame LiDAR work runs in
+        # worker processes; tracking and commits stay here, in source order.
+        self.loader = ThreadPoolExecutor(1, thread_name_prefix="live-image")
+        context = multiprocessing.get_context("spawn")
+        self.workers = [
+            ProcessPoolExecutor(1, mp_context=context, initializer=_lidar_worker_init,
+                                initargs=(os.getpid(), options.offset_sec))
+            for _ in range(options.lidar_workers)
+        ]
+        self.worker_routes = OrderedDict()
+        self.next_worker = 0
 
     def close(self):
         if not self.closed:
             self.closed = True
+            for pool in self.workers:
+                pool.shutdown(wait=True, cancel_futures=True)
+            self.loader.shutdown(wait=True, cancel_futures=True)
             self.detector.dispose()
 
     def refresh_run(self, run):
@@ -3932,7 +4045,7 @@ class LiveProcessor:
 
     def infer(self, run, records):
 
-        def load_image(row):
+        def read_image(row):
             path = Path(row["path"])
             path = path if path.is_absolute() else run / path
             image = cv2.imread(str(path))
@@ -3940,66 +4053,108 @@ class LiveProcessor:
                 raise FileNotFoundError(path)
             return image
 
+        # iter_detect loads records strictly in order; decode the next few ahead.
+        records = list(records)
+        upcoming, queued = iter(records), deque()
+
+        def load_image(row):
+            while len(queued) < IMAGE_PREFETCH:
+                following = next(upcoming, None)
+                if following is None:
+                    break
+                queued.append((following, self.loader.submit(read_image, following)))
+            queued_row, image = queued.popleft()
+            if queued_row is not row:
+                raise RuntimeError("Image prefetch lost the frame order")
+            return image.result()
+
         return self.detector.iter_detect(records, load_image)
 
-    def process(self, run, key, row, image, detections, pcaps):
-        started = time.monotonic()
+    def frame_scan(self, run, row, detections, pcaps):
+        """Camera time, LiDAR target time and the nearest scan (None if there is none)."""
         if any(int(d.class_id) not in SUSPECT_CLASS_IDS for d in detections):
             raise ValueError("This terminal supports only Crack/Pothole classes 0/1")
         timestamp = frame_time(row, self.options.timestamp_mode)
         target = timestamp - self.options.offset_sec
+        scan = None
+        if detections:
+            args = SimpleNamespace(
+                scan_search_half_window_sec=SCAN_SEARCH_HALF_WINDOW_SEC, scan_gap_sec=SCAN_GAP_SEC
+            )
+            candidates = scan_candidates(pcaps, run, target, {}, self.scan_bounds, args)
+            if candidates:
+                _, sources, start, end, delta = min(candidates, key=lambda item: item[0])
+                scan = (sources, start, end, delta)
+        return (timestamp, target, scan)
+
+    def submit(self, run, row, image, detections, pcaps):
+        """Start one frame. A scan to decode goes to a LiDAR worker, every frame of
+        one scan to the same worker so its scan cache is reused; the rest runs here."""
+        started = time.monotonic()
+        timestamp, target, scan = self.frame_scan(run, row, detections, pcaps)
+        index = int(row["frame_index"])
+        if self.workers and scan is not None and abs(scan[3]) <= MAX_SCAN_CENTER_DELTA_SEC:
+            route = (tuple(map(str, scan[0])), scan[1], scan[2])
+            if route not in self.worker_routes:
+                self.worker_routes[route] = self.next_worker
+                self.next_worker = (self.next_worker + 1) % len(self.workers)
+                while len(self.worker_routes) > 64:
+                    self.worker_routes.popitem(last=False)
+            lidar = self.workers[self.worker_routes[route]].submit(
+                _lidar_worker_task, [pack_detection(d) for d in detections], index, target,
+                scan, self.alignment.speeds, self.options.motion,
+            )
+        else:
+            lidar = lidar_stage(detections, index, target, scan, self.camera, self.angles,
+                                self.alignment, self.options.motion, self.scan_cache)
+        return SimpleNamespace(row=row, image=image, detections=detections, timestamp=timestamp,
+                               target=target, scan=scan, lidar=lidar, started=started)
+
+    def process(self, run, key, row, image, detections, pcaps):
+        return self.commit(run, key, self.submit(run, row, image, detections, pcaps))
+
+    def analyse(self, run, key, stream, pcaps, stopping):
+        """Commit the frames of an inference stream in source order, yielding each summary.
+
+        While the oldest frame waits for its LiDAR worker, later frames are started,
+        so the workers run in parallel. A frame counts only once committed; frames
+        still in flight at a stop or crash are analysed again after the restart.
+        """
+        inflight = deque()
+        try:
+            for row, image, detections in stream:
+                if stopping():
+                    return
+                inflight.append(self.submit(run, row, image, detections, pcaps))
+                while inflight and (isinstance(inflight[0].lidar, dict) or inflight[0].lidar.done()):
+                    if stopping():
+                        return
+                    wait_for_collector(stopping)
+                    yield self.commit(run, key, inflight.popleft())
+            while inflight:
+                if stopping():
+                    return
+                wait_for_collector(stopping)
+                yield self.commit(run, key, inflight.popleft())
+        finally:
+            for frame in inflight:
+                if not isinstance(frame.lidar, dict):
+                    frame.lidar.cancel()
+
+    def commit(self, run, key, frame):
+        """Track, export and commit one submitted frame; callers keep source order."""
+        row, image, detections = (frame.row, frame.image, frame.detections)
+        timestamp, target, scan, started = (frame.timestamp, frame.target, frame.scan, frame.started)
+        lidar = frame.lidar if isinstance(frame.lidar, dict) else frame.lidar.result()
         index = int(row["frame_index"])
         image_path = Path(row["path"])
         if not image_path.is_absolute():
             image_path = run / image_path
-        args = SimpleNamespace(
-            scan_search_half_window_sec=SCAN_SEARCH_HALF_WINDOW_SEC, scan_gap_sec=SCAN_GAP_SEC
-        )
-        result = None
-        points, sources = ([], ())
-        start = end = scan_time = delta = None
-        error = ""
-        status = "no_model_detection" if not detections else "lidar_scan_missing"
-        motion = dict(applied=False, reason="not_required")
-        if detections:
-            candidates = scan_candidates(pcaps, run, target, {}, self.scan_bounds, args)
-            if candidates:
-                _, sources, start, end, delta = min(candidates, key=lambda item: item[0])
-                scan_time = (start + end) * 0.5
-                status = "lidar_scan_too_far"
-                if abs(delta) <= MAX_SCAN_CENTER_DELTA_SEC:
-                    try:
-                        cache_key = (tuple(map(str, sources)), start, end)
-                        if cache_key not in self.scan_cache:
-                            points = decode_scan(sources, self.angles, start - 1e-06, end + 1e-06)
-                            plane_error = ""
-                            try:
-                                plane = flatten(points, index)
-                            except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
-                                plane, plane_error = None, str(exc)
-                            self.scan_cache[cache_key] = (points, plane, plane_error)
-                        points, result, plane_error = self.scan_cache[cache_key]
-                        self.scan_cache.move_to_end(cache_key)
-                        while len(self.scan_cache) > 4:
-                            self.scan_cache.popitem(last=False)
-                        if plane_error:
-                            raise ValueError(plane_error)
-                        status = "ok"
-                        motion = dict(applied=False, reason="disabled")
-                        if self.options.motion != "off":
-                            try:
-                                result = self.alignment.compensate(result, self.camera, target)
-                                motion = dict(applied=True, **result.get("motion_compensation", {}))
-                            except ValueError as exc:
-                                if self.options.motion == "required":
-                                    raise
-                                motion = dict(applied=False, reason=str(exc))
-                    except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
-                        result = None
-                        status, error = ("plane_or_scan_invalid", str(exc))
-        accepted, objects, audit = validate_objects(
-            detections, result, self.camera, POTHOLE_MIN_DEPTH_M
-        )
+        sources, start, end, delta = ((), None, None, None) if scan is None else scan
+        scan_time = None if scan is None else (start + end) * 0.5
+        status, error, motion = (lidar["status"], lidar["error"], lidar["motion"])
+        accepted = [detections[i] for i in lidar["accepted"]]
+        objects, audit = (lidar["objects"], lidar["audit"])
         self.sequence += 1
         tracked, _ = self.tracker.update(
             self.sequence,
@@ -4044,10 +4199,9 @@ class LiveProcessor:
                 image_path,
                 report_detections,
                 report_objects,
-                points,
-                np.empty((0, 3)) if result is None else result["sensor_xyz_m"],
-                None if result is None else result["road_xyz_m"],
-                scan_time if result is not None else None,
+                lidar["point_count"],
+                lidar["road_xyz_m"],
+                scan_time if lidar["has_result"] else None,
                 pcap_sources=sources,
                 scan_start=start,
                 scan_end=end,
@@ -4083,12 +4237,12 @@ class LiveProcessor:
                         pcap_copy_policy="selected_scan_raw_records_unchanged",
                     )
                 lidar_metadata = dict(
-                    status="available" if len(points) else "unavailable",
+                    status="available" if lidar["point_count"] else "unavailable",
                     analysis_status=status, scan_start_epoch_sec=start, scan_end_epoch_sec=end,
                     scan_reference_epoch_sec=scan_time,
                     camera_lidar_delta_ms=None if delta is None else delta * 1000,
                     delta_definition="scan_midpoint_minus_alignment_target",
-                    timestamp_basis="pcap_record_sensor_utc", point_count=len(points),
+                    timestamp_basis="pcap_record_sensor_utc", point_count=lidar["point_count"],
                     pcap_attached=bool(pcap_files),
                     pcap_files=pcap_files,
                     pcap_copy_policy="selected_scan_raw_records_unchanged",
@@ -4109,7 +4263,8 @@ class LiveProcessor:
             for path in artifacts:
                 with path.open("rb") as stream:
                     os.fsync(stream.fileno())
-            fsync_dir(self.exporter.directory)
+            if artifacts:  # an empty directory has nothing to persist; fsync_dir(stage) keeps it
+                fsync_dir(self.exporter.directory)
             manifest = dict(frame_index=index, files=files, frame_log={}) if files else None
             summary = dict(
                 schema_version=3,
@@ -4782,21 +4937,21 @@ def run_service(options, processor_factory=LiveProcessor):
                     if options.max_frames:
                         ready = ready[: options.max_frames - processed]
                     stream = processor.infer(run.path, ready)
+                    committed = processor.analyse(run.path, key, stream, pcaps, lambda: stopping)
                     try:
-                        for row, image, detections in stream:
-                            if stopping:
-                                break
-                            wait_for_collector(lambda: stopping)
-                            processor.process(run.path, key, row, image, detections, pcaps)
+                        for _ in committed:
                             entry["processed_rows"] += 1
                             processed += 1
                             did_work = True
-                            atomic_json(state_path, state)
                             if options.max_frames and processed >= options.max_frames:
                                 stopping = True
                                 break
                     finally:
+                        committed.close()
                         stream.close()
+                        # One checkpoint per batch, not per frame: frames committed
+                        # after it are found again by recover_committed, never redone.
+                        atomic_json(state_path, state)
                     break
                 pending = sum(
                     (
@@ -4913,7 +5068,12 @@ def parse_args(argv=None):
     p.add_argument("--timestamp-mode", choices=["ptp", "recorded"], default="ptp")
     p.add_argument("--offset-sec", type=float, default=0.0)
     p.add_argument("--motion", choices=["auto", "required", "off"], default="auto")
-    p.add_argument("--batch-size", type=int, default=6)
+    p.add_argument("--batch-size", type=int, default=16,
+                   help="Frames started per batch; all of them can be in flight at once")
+    # With the vectorised decoder, workers add about 6% CPU per frame for ~15%
+    # more throughput; on the fanless unit the lower CPU matters more.
+    p.add_argument("--lidar-workers", type=int, default=0,
+                   help="Processes for per-frame LiDAR work (0: all in the analysis process)")
     p.add_argument("--poll-seconds", type=float, default=0.5)
     p.add_argument("--min-free-gb", type=float, default=10)
     p.add_argument("--nice", type=int, default=10)
@@ -4945,8 +5105,9 @@ def parse_args(argv=None):
         or (options.min_free_gb < 0)
         or (options.drain_seconds < 0)
         or (not 0 <= options.nice <= 19)
+        or (not 0 <= options.lidar_workers <= 8)
     ):
-        p.error("Invalid batch, polling, frame limit, disk reserve, or nice setting")
+        p.error("Invalid batch, polling, frame limit, disk reserve, nice or LiDAR worker setting")
     if options.run:
         options.run.resolve().relative_to(options.root.resolve())
     return options
