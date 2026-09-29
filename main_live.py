@@ -38,6 +38,7 @@ from typing import Iterator
 from typing import Optional
 from zoneinfo import ZoneInfo
 import csv
+import ctypes
 import cv2
 import hashlib
 import json
@@ -235,6 +236,21 @@ def fsync_dir(path):
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+_LIBC = ctypes.CDLL(None, use_errno=True)
+
+
+def syncfs(path):
+    """Flush the whole filesystem holding path: one journal commit covers
+    every file written since, instead of one per fsync."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        if _LIBC.syncfs(fd) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), str(path))
     finally:
         os.close(fd)
 
@@ -3815,14 +3831,15 @@ def configure_live(offset_sec=0.0):
     cv2.setNumThreads(FUSION_OPENCV_THREADS)
 
 
-def atomic_json(path, value):
+def atomic_json(path, value, durable=True):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     with tmp.open("w", encoding="utf-8") as stream:
         json.dump(value, stream, ensure_ascii=False, allow_nan=False)
-        stream.flush()
-        os.fsync(stream.fileno())
+        if durable:
+            stream.flush()
+            os.fsync(stream.fileno())
     os.replace(tmp, path)
 
 
@@ -4025,6 +4042,13 @@ class LiveProcessor:
         ]
         self.worker_routes = OrderedDict()
         self.next_worker = 0
+        self.unsynced = False  # frames committed without fsync since the last flush()
+
+    def flush(self):
+        """Make the frames committed without fsync durable (see commit)."""
+        if self.unsynced:
+            syncfs(self.options.output)
+            self.unsynced = False
 
     def close(self):
         if not self.closed:
@@ -4271,10 +4295,17 @@ class LiveProcessor:
                 )
                 artifacts.extend(pair)
             files = {p.name: dict(bytes=p.stat().st_size, sha256=sha(p)) for p in artifacts}
-            for path in artifacts:
-                with path.open("rb") as stream:
-                    os.fsync(stream.fileno())
-            if artifacts:  # an empty directory has nothing to persist; fsync_dir(stage) keeps it
+            # Most frames have nothing to upload; they skip fsync, which on the
+            # SSD the collector keeps busy costs more than the analysis, and
+            # flush() makes them durable before each checkpoint. A frame with
+            # artifacts may be uploaded, so the frames before it are flushed
+            # first: recovery never finds a gap before an uploaded frame.
+            durable = bool(artifacts)
+            if durable:
+                self.flush()
+                for path in artifacts:
+                    with path.open("rb") as stream:
+                        os.fsync(stream.fileno())
                 fsync_dir(self.exporter.directory)
             manifest = dict(frame_index=index, files=files, frame_log={}) if files else None
             summary = dict(
@@ -4308,10 +4339,14 @@ class LiveProcessor:
                 upload_blocked_reason=triplet_error(files) if files else "",
                 processing_seconds=time.monotonic() - started,
             )
-            atomic_json(stage / "result.json", clean(summary))
-            fsync_dir(stage)
+            atomic_json(stage / "result.json", clean(summary), durable=durable)
+            if durable:
+                fsync_dir(stage)
             stage.replace(folder)
-            fsync_dir(folder.parent)
+            if durable:
+                fsync_dir(folder.parent)
+            else:
+                self.unsynced = True
             if self.options.upload and manifest:
                 queue_upload(self.options.output, key, folder)
             return summary
@@ -4601,14 +4636,28 @@ def count_manifest(path, entry):
 
 
 def recover_committed(output, key, run, count, upload):
-    """Recover a commit that survived a crash before the checkpoint write."""
+    """Recover commits that survived a crash before the checkpoint write.
+
+    Frames without artifacts are committed without fsync, so a power cut can
+    leave the newest of them with a missing or partial result.json. Counting
+    stops there, and that frame and the ones after it are removed to be
+    analysed again; none of them was uploaded (see LiveProcessor.commit).
+    """
     while count < len(run.frames.rows):
         row = run.frames.rows[count]
         folder = output / "runs" / key / "frames" / f"{int(row['frame_index']):08d}"
         path = folder / "result.json"
-        if not path.exists():
+        if not folder.exists():
             break
-        saved = json.loads(path.read_text())
+        try:
+            saved = json.loads(path.read_text())
+        except (FileNotFoundError, ValueError):
+            for later in run.frames.rows[count:]:
+                leftover = output / "runs" / key / "frames" / f"{int(later['frame_index']):08d}"
+                if not leftover.exists():
+                    break
+                shutil.rmtree(leftover)
+            break
         if saved["frame_index"] != int(row["frame_index"]) or saved["source_run"] != key:
             raise ValueError(f"Committed frame does not match source: {path}")
         if upload and saved.get("upload_enabled") and saved.get("upload_manifest"):
@@ -4962,6 +5011,8 @@ def run_service(options, processor_factory=LiveProcessor):
                         stream.close()
                         # One checkpoint per batch, not per frame: frames committed
                         # after it are found again by recover_committed, never redone.
+                        # The frames it counts reach the disk first.
+                        processor.flush()
                         atomic_json(state_path, state)
                     break
                 pending = sum(
@@ -5036,7 +5087,8 @@ def run_service(options, processor_factory=LiveProcessor):
             failure = str(exc)
             raise
         finally:
-            atomic_json(state_path, state)
+            if not (processor and processor.unsynced):  # never count frames a failed flush left
+                atomic_json(state_path, state)
             if processor:
                 processor.close()
             if uploader:
