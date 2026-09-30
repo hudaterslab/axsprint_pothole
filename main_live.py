@@ -1741,7 +1741,8 @@ def save_detection_frame(directory, source_image, image, row, key,
         gps=dict(latitude_deg=gps.get("latitude_deg"), longitude_deg=gps.get("longitude_deg")),
         lidar=dict(pcap_files=[dict(name=f["name"]) for f in pcap_files]),
     )
-    atomic_json(json_path, clean(payload))
+    # Indented, so the file reads well when opened on the server.
+    atomic_json(json_path, clean(payload), indent=2)
     return [image_path, json_path]
 
 
@@ -2773,12 +2774,14 @@ class RecordingAlignment:
         )
 
 
-def atomic_json(path, value, durable=True):
+def atomic_json(path, value, durable=True, indent=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     with tmp.open("w", encoding="utf-8") as stream:
-        json.dump(value, stream, ensure_ascii=False, allow_nan=False)
+        json.dump(value, stream, ensure_ascii=False, allow_nan=False, indent=indent)
+        if indent is not None:
+            stream.write("\n")
         if durable:
             stream.flush()
             os.fsync(stream.fileno())

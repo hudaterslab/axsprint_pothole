@@ -199,8 +199,10 @@ JPG·JSON·PCAP을 `/mnt/ssd/porthole_live_analysis/runs/<run>/frames/<번호>/c
 JSON은 「크랙 포트홀 서버 전송 명세서」(2026-09-28) 형식입니다. `record_id`(`단말기/run 폴더/프레임 번호`),
 `categories`, `images`, `annotations`(bbox·segmentation·크기·깊이), `gps`, `lidar.pcap_files`만 담고,
 측정값이 없으면 0 대신 null입니다. 크랙은 깊이를 재지 않으므로 `depth.median_cm`이 null입니다.
+JSON은 열어 보기 쉽게 줄바꿈과 2칸 들여쓰기로 저장합니다.
 나머지 상세 기록은 같은 프레임 폴더의 `result.json`에 남습니다.
 단말기 이름은 `.env`의 `PORTHOLE_TERMINAL_ID`이며, 비어 있으면 호스트 이름을 씁니다.
+단말기마다 다른 이름을 써야 서버가 다른 단말기의 결과를 중복으로 버리지 않습니다(첫 단말기는 `hudaters`).
 
 `.env`에 `PORTHOLE_API_URL`이 있으면 프레임마다 HTTP POST 한 번으로 보내고 SSH 설정은 쓰지 않습니다.
 
