@@ -56,7 +56,7 @@ import urllib.request
 import uuid
 import zlib
 
-POTHOLE_DEPTH_M = 0.005
+POTHOLE_DEPTH_M = 0.01  # a pothole must be at least this deep below the road around it
 
 PROJECT = Path(__file__).resolve().parent
 
@@ -94,6 +94,20 @@ SCAN_GAP_SEC = 0.005
 # firings on each side (201 firings, all 32 channels), as codecode/lcz_to_pcap.py crops
 # a scan.
 PLANE_SIDE_FIRINGS = 100
+
+# Road plane checks: fewer cells, less support or more tilt from the mount means the fit
+# locked onto something else (a truck, the bonnet), so that frame's potholes are withheld.
+PLANE_MIN_CELLS = 10
+
+PLANE_SUPPORT_M = 0.04  # a 35 cm cell supports the plane when its median is this close
+
+PLANE_MIN_SUPPORT = 0.6
+
+PLANE_MAX_TILT_DEG = 15.0  # from RoadPlaneSettings.expected_normal
+
+# Pothole depth: the road POTHOLE_RING_M (metres) around the pothole is the reference road,
+# and the pothole counts when its deepest LiDAR point is POTHOLE_DEPTH_M or more below it.
+POTHOLE_RING_M = (0.10, 0.30)
 
 
 def server_transport_source():
@@ -1826,111 +1840,6 @@ def save_scan_pcap(destination, sources, start, end):
         temporary.unlink(missing_ok=True)
 
 
-def local_depth__evaluate(
-    road, pixels, visible_indices, indices, mask, exclusion, channels, threshold
-):
-    details = dict(
-        version="local_reference_v1",
-        min_inner_points=10,
-        min_deep_points=5,
-        min_deep_channels=2,
-        min_deep_fraction=0.1,
-        ring_radius_px=20,
-        inner_erosion_px=3,
-        cell_size_m=0.05,
-        reference_is_ground_truth=False,
-    )
-
-    def stop(reason):
-        return (False, reason, None, details)
-
-    inner = cv2.erode(mask.astype(np.uint8), np.ones((7, 7), np.uint8)).astype(bool)
-    uv = pixels[indices].astype(int)
-    inside = inner[uv[:, 1], uv[:, 0]]
-    target = indices[inside]
-    details["inner_points"] = len(target)
-    if len(target) < 10:
-        return stop("insufficient_inner_support")
-    ring = cv2.dilate(mask.astype(np.uint8), np.ones((41, 41), np.uint8)).astype(bool) & ~exclusion
-    pv = pixels[visible_indices].astype(int)
-    ref = visible_indices[ring[pv[:, 1], pv[:, 0]]]
-    details["reference_points"] = len(ref)
-    if len(ref) < 30 or len(np.unique(channels[ref])) < 3:
-        return stop("local_reference_insufficient")
-    xy = road[ref, :2]
-    origin = np.median(road[target, :2], axis=0)
-    cells = np.floor((xy - origin) / 0.05).astype(int)
-    _, inverse = np.unique(cells, axis=0, return_inverse=True)
-    representatives = np.array(
-        [
-            np.median(road[ref[inverse == i]], axis=0)
-            for i in range(inverse.max() + 1)
-            if np.sum(inverse == i) >= 2
-        ]
-    )
-    details["reference_cells"] = len(representatives)
-    if len(representatives) < 12:
-        return stop("local_reference_insufficient")
-    design = np.column_stack((representatives[:, :2] - origin, np.ones(len(representatives))))
-    if np.linalg.cond(design) > 100:
-        return stop("local_reference_degenerate")
-    coef = np.linalg.lstsq(design, representatives[:, 2], rcond=None)[0]
-    for _ in range(8):
-        residual = representatives[:, 2] - design @ coef
-        scale = max(0.002, 1.4826 * np.median(abs(residual - np.median(residual))))
-        weights = np.minimum(1.0, 1.5 * scale / np.maximum(abs(residual), 1e-12))
-        coef = np.linalg.lstsq(
-            design * np.sqrt(weights[:, None]),
-            representatives[:, 2] * np.sqrt(weights),
-            rcond=None,
-        )[0]
-    norm = float(np.sqrt(1 + np.sum(coef[:2] ** 2)))
-    residual = (representatives[:, 2] - design @ coef) / norm
-    noise = float(np.quantile(abs(residual), 0.9))
-    details.update(
-        reference_p90_abs_m=noise,
-        local_coefficients=coef.tolist(),
-        local_origin_xy_m=origin.tolist(),
-        local_tilt_deg=float(np.degrees(np.arctan(np.linalg.norm(coef[:2])))),
-    )
-    if noise > threshold / 2 or details["local_tilt_deg"] > 20:
-        return stop("local_reference_unreliable")
-    support = representatives[abs(residual) <= threshold, :2]
-    hull = cv2.convexHull(support.astype(np.float32))
-    covered = np.array(
-        [cv2.pointPolygonTest(hull, tuple(map(float, p)), False) >= 0 for p in road[target, :2]]
-    )
-    details["inner_reference_hull_coverage"] = float(covered.mean())
-    if covered.mean() < 0.9:
-        return stop("local_reference_one_sided")
-    measured = road[indices].copy()
-    measured[:, 2] = (measured[:, 2] - ((measured[:, :2] - origin) @ coef[:2] + coef[2])) / norm
-    depths = -measured[inside, 2]
-    deep = depths >= threshold + noise
-    p95 = float(np.quantile(depths, 0.95))
-    details.update(
-        local_inner_p95_depth_m=p95,
-        uncertainty_margin_m=noise,
-        conservative_p95_depth_m=p95 - noise,
-        deep_inner_points=int(deep.sum()),
-        deep_inner_channels=len(np.unique(channels[target[deep]])),
-        deep_inner_fraction=float(deep.mean()),
-        local_max_depth_m=float(np.max(-measured[:, 2])),
-    )
-    keep = (
-        p95 - noise >= threshold
-        and deep.sum() >= 5
-        and (deep.mean() >= 0.1)
-        and (details["deep_inner_channels"] >= 2)
-    )
-    return (
-        bool(keep),
-        "local_depth_pass" if keep else "local_depth_insufficient",
-        measured,
-        details,
-    )
-
-
 @dataclass(frozen=True)
 class RoadPlaneSettings:
     expected_normal: tuple = (-0.016, 0.666, 0.746)
@@ -1951,8 +1860,12 @@ def prior_rotation(settings):
 
 
 def fit_spatial_road_plane(xyz, selected=None, settings=RoadPlaneSettings()):
-    """Road plane (unit normal, offset) through the median points of a grid on the
-    selected points (plane_points), or on every point when they cannot carry a plane."""
+    """Road plane (unit normal, offset, quality) through the median points of a grid on
+    the selected points (plane_points), or on every point when they cannot carry a plane.
+
+    quality: cells (grid cells that voted), support (share of cells within
+    PLANE_SUPPORT_M of the plane) and tilt_deg (angle from settings.expected_normal).
+    """
     xyz = np.asarray(xyz, float)
     if xyz.ndim != 2 or xyz.shape[1] != 3:
         raise ValueError("XYZ/channel shape mismatch")
@@ -1999,22 +1912,44 @@ def fit_spatial_road_plane(xyz, selected=None, settings=RoadPlaneSettings()):
     scale = np.sqrt(1 + beta[:2] @ beta[:2])
     normal = np.array([-beta[0], -beta[1], 1.0]) @ R / scale
     offset = -float(beta[2]) / scale
-    return (normal, offset)
+    quality = dict(
+        cells=len(cells),
+        support=float(np.mean(np.abs(A @ beta - target) / scale <= PLANE_SUPPORT_M)),
+        tilt_deg=float(np.degrees(np.arctan(np.sqrt(beta[:2] @ beta[:2])))),
+    )
+    return (normal, offset, quality)
 
 
-def measure_mask_local_depth(road, pixels, visible_indices, indices, mask, exclusion):
-    """Local surrounding reference; no interior/channel/depth-support gates."""
-    ring = cv2.dilate(mask.astype(np.uint8), np.ones((41, 41), np.uint8)).astype(bool) & ~exclusion
+def measure_mask_local_depth(road, pixels, visible_indices, indices, exclusion, threshold_m):
+    """Depth of a pothole's LiDAR points below the road around it, and whether it counts.
+
+    The reference is every visible point outside all detection masks whose distance on
+    the road to the nearest pothole point is within POTHOLE_RING_M. A robust plane through
+    their 5 cm cell medians is the local road; each pothole point's depth is its distance
+    below it. The pothole counts (info["accepted"]) when its deepest point is threshold_m
+    or more below it; small potholes may hold only a few LiDAR points. reference_noise_m
+    (robust spread of the reference road) is kept as evidence of how well it was measured.
+    """
+    near, far = POTHOLE_RING_M
     uv = pixels[visible_indices].astype(int)
-    ref = visible_indices[ring[uv[:, 1], uv[:, 0]]]
+    outside = visible_indices[~exclusion[uv[:, 1], uv[:, 0]]]
+    hole = road[indices, :2]
+    around = np.all((road[outside, :2] >= hole.min(axis=0) - far)
+                    & (road[outside, :2] <= hole.max(axis=0) + far), axis=1)
+    candidates = outside[around]
+    gap = np.full(len(candidates), np.inf)
+    for start in range(0, len(hole), 256):
+        step = road[candidates, None, :2] - hole[None, start:start + 256]
+        gap = np.minimum(gap, np.sqrt((step ** 2).sum(axis=2)).min(axis=1))
+    ref = candidates[(gap >= near) & (gap <= far)]
     info = dict(
-        depth_reference="local_surrounding_plane",
+        depth_reference="road_ring_around_pothole",
+        ring_m=[near, far],
         reference_points=len(ref),
-        ring_radius_px=20,
     )
     if len(ref) < 3:
         return (None, dict(info, error="insufficient_reference_points"))
-    origin = np.median(road[indices, :2], axis=0)
+    origin = np.median(hole, axis=0)
     cells = np.floor((road[ref, :2] - origin) / 0.05).astype(int)
     _, inv = np.unique(cells, axis=0, return_inverse=True)
     reps = np.array([np.median(road[ref[inv == i]], axis=0) for i in range(inv.max() + 1)])
@@ -2030,11 +1965,15 @@ def measure_mask_local_depth(road, pixels, visible_indices, indices, mask, exclu
     norm = np.sqrt(1 + np.sum(coef[:2] ** 2))
     measured = road[indices].copy()
     measured[:, 2] = (measured[:, 2] - ((measured[:, :2] - origin) @ coef[:2] + coef[2])) / norm
+    residual = (reps[:, 2] - A @ coef) / norm
+    depth = -measured[:, 2]
     info.update(
         local_coefficients=coef.tolist(),
         local_origin_xy_m=origin.tolist(),
-        reference_p90_abs_m=float(np.quantile(abs(reps[:, 2] - A @ coef) / norm, 0.9)),
-        max_depth_m=float(np.max(-measured[:, 2])),
+        reference_noise_m=max(0.002, 1.4826 * float(np.median(abs(residual - np.median(residual))))),
+        points_at_threshold=int(np.sum(depth >= threshold_m)),
+        max_depth_m=float(depth.max()),
+        accepted=bool(depth.max() >= threshold_m),
     )
     return (measured, info)
 
@@ -2572,10 +2511,16 @@ def plane_points(points, center_raw):
 
 
 def flatten(points, center_raw):
+    """Road-aligned points of a scan; raises ValueError when the road plane fails its checks."""
     if len(points) < 3:
         raise ValueError("insufficient_lidar_points")
     xyz = points.xyz
-    normal, offset = fit_spatial_road_plane(xyz, plane_points(points, center_raw))
+    normal, offset, quality = fit_spatial_road_plane(xyz, plane_points(points, center_raw))
+    if (quality["cells"] < PLANE_MIN_CELLS or quality["support"] < PLANE_MIN_SUPPORT
+            or quality["tilt_deg"] > PLANE_MAX_TILT_DEG):
+        raise ValueError(
+            f"plane_unreliable: {quality['cells']} cells, {quality['support']:.0%} within "
+            f"{PLANE_SUPPORT_M * 100:g} cm, tilt {quality['tilt_deg']:.1f} deg from the mount")
     road, rotation, _ = lidar__road_aligned_xyz(xyz, normal, offset)
     return dict(
         points=points,
@@ -2584,11 +2529,13 @@ def flatten(points, center_raw):
         road_xyz_m=road,
         plane_normal=normal,
         road_rotation=rotation,
+        plane_quality=quality,
     )
 
 
 def validate_objects(detections, result, camera, threshold_m=POTHOLE_DEPTH_M):
-    """Accept a pothole when any finite mask point reaches the depth threshold."""
+    """Cracks are the model's; a pothole needs enough LiDAR points below the road around it
+    (measure_mask_local_depth)."""
     if not np.isfinite(threshold_m) or threshold_m <= 0:
         raise ValueError("invalid depth threshold")
     pixels, visible = (
@@ -2634,35 +2581,22 @@ def validate_objects(detections, result, camera, threshold_m=POTHOLE_DEPTH_M):
             )
         )
         local = {}
-        if int(d.class_id) == 1 and len(indices):
-            channels = result["points"].channel
-            _, _, _, local = local_depth__evaluate(
-                result["road_xyz_m"],
-                pixels,
-                np.flatnonzero(valid),
-                indices,
-                mask,
-                exclusion,
-                channels,
-                threshold_m,
-            )
         global_maximum = maximum
         if int(d.class_id) == 1 and len(indices):
-            measured, measurement = measure_mask_local_depth(
+            measured, local = measure_mask_local_depth(
                 result["road_xyz_m"],
                 pixels,
                 np.flatnonzero(valid),
                 indices,
-                mask,
                 exclusion,
+                threshold_m,
             )
-            local["active_measurement"] = measurement
             road = np.empty((0, 3)) if measured is None else measured
-            maximum = None if measured is None else float(np.max(-measured[:, 2]))
-            keep = maximum is not None and maximum >= threshold_m
+            maximum = None if measured is None else local["max_depth_m"]
+            keep = measured is not None and local["accepted"]
             reason = (
                 "local_reference_unavailable"
-                if maximum is None
+                if measured is None
                 else "depth_pass" if keep else "depth_below_threshold"
             )
         evidence = dict(
