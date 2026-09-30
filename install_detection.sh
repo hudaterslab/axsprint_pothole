@@ -26,8 +26,8 @@ APP_HOME=/home/$APP_USER
 APP_DIR=$APP_HOME/Desktop/live_detection
 AUTOSTART=$APP_HOME/.config/autostart/porthole-analysis-terminal.desktop
 
-# main_live.py reads these next to itself (camera: 30-degree mounting).
-CALIBRATION=(camera_calib_best_effort_v30.json XT32_Angle_Correction_File.csv)
+# main_live.py reads these next to itself (camera: lens and camera pose; LiDAR: channel angles).
+CALIBRATION=(camera_calib_best_effort.json XT32_Angle_Correction_File.csv)
 UPLOAD_SETTINGS=(PORTHOLE_UPLOAD_HOST PORTHOLE_UPLOAD_USER PORTHOLE_UPLOAD_DIR PORTHOLE_UPLOAD_KEY)
 
 SRC_DIR=$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")

@@ -78,17 +78,7 @@ MODEL_PATH = PROJECT / "best_seg.dxnn"
 
 FUSION_OPENCV_THREADS = 2  # 추적 CPU 병렬화; 별도 추론 프로세스의 기본 스레드는 1개.
 
-CAMERA_CALIBRATION = PROJECT / "camera_calib_best_effort_v30.json"
-
-CAMERA_SPATIAL_CALIBRATION = {
-    "id": "stationary_trial_20260914",
-    "R_sensor_to_cam": [
-        [-0.9994184668078344, -0.03355021647665391, 0.006091894438319107],
-        [-0.005763490804555829, -0.009876448571861112, -0.9999346168311972],
-        [0.03360818913931191, -0.9993882322390921, 0.00967733872504181],
-    ],
-    "t_cam": [-0.028875, 0.139125, -0.11437500000000003],
-}
+CAMERA_CALIBRATION = PROJECT / "camera_calib_best_effort.json"  # lens and camera pose
 
 LIDAR_CALIBRATION = PROJECT / "XT32_Angle_Correction_File.csv"
 
@@ -99,6 +89,11 @@ SCAN_SEARCH_HALF_WINDOW_SEC = 0.1
 MAX_SCAN_CENTER_DELTA_SEC = 0.055
 
 SCAN_GAP_SEC = 0.005
+
+# Road plane points: the LiDAR firing nearest the camera's optical axis and this many
+# firings on each side (201 firings, all 32 channels), as codecode/lcz_to_pcap.py crops
+# a scan.
+PLANE_SIDE_FIRINGS = 100
 
 
 def server_transport_source():
@@ -796,7 +791,7 @@ class HttpUploader:
 
 
 class LiDAR2Camera:
-    """Use JSON intrinsics and configured extrinsics to project sensor XYZ."""
+    """Project sensor XYZ with the lens and camera pose of the calibration JSON."""
 
     def __init__(self, calibration_file):
         self.path = Path(calibration_file).expanduser().resolve()
@@ -807,9 +802,8 @@ class LiDAR2Camera:
         self.fx, self.fy = (float(data["fx"]), float(data["fy"]))
         self.cx, self.cy = (float(data["cx"]), float(data["cy"]))
         self.k1, self.k2 = (float(data["D"][0]), float(data["D"][1]))
-        spatial = CAMERA_SPATIAL_CALIBRATION
-        self.R = np.asarray(spatial["R_sensor_to_cam"], dtype=np.float64)
-        self.t = np.asarray(spatial["t_cam"], dtype=np.float64).reshape(3)
+        self.R = np.asarray(data["R_sensor_to_cam"], dtype=np.float64)
+        self.t = np.asarray(data["t_cam"], dtype=np.float64).reshape(3)
         if self.R.shape != (3, 3):
             raise ValueError("R_sensor_to_cam must be 3x3")
         if (
@@ -821,10 +815,12 @@ class LiDAR2Camera:
             raise ValueError("invalid camera rotation/translation")
         self.extrinsics = {
             "schema": "sensor_to_camera_extrinsics_v1",
-            "id": spatial.get("id", "calibration_file"),
+            "id": self.path.name,
             "R_sensor_to_cam": self.R.tolist(),
             "t_cam": self.t.tolist(),
         }
+        # Raw LiDAR azimuth (0.01 degree) of the optical axis; plane_points centres on it.
+        self.axis_azimuth_raw = round(math.degrees(math.atan2(self.R[2, 0], self.R[2, 1])) * 100) % 36000
 
     def convert_3D_to_camera_coords(self, sensor_xyz):
         points = np.asarray(sensor_xyz, dtype=np.float64)
@@ -1938,11 +1934,6 @@ def local_depth__evaluate(
 @dataclass(frozen=True)
 class RoadPlaneSettings:
     expected_normal: tuple = (-0.016, 0.666, 0.746)
-    lateral_limit_m: float = 1.8
-    forward_min_m: float = 1.0
-    forward_max_m: float = 3.8
-    height_min_m: float = -2.5
-    height_max_m: float = -0.8
     cell_size_m: float = 0.35
 
 
@@ -1959,25 +1950,18 @@ def prior_rotation(settings):
     return np.array([x, np.cross(n, x), n])
 
 
-def fit_spatial_road_plane(xyz, settings=RoadPlaneSettings()):
-    """Road plane (unit normal, offset) through the median points of a grid on the road ROI."""
+def fit_spatial_road_plane(xyz, selected=None, settings=RoadPlaneSettings()):
+    """Road plane (unit normal, offset) through the median points of a grid on the
+    selected points (plane_points), or on every point when they cannot carry a plane."""
     xyz = np.asarray(xyz, float)
     if xyz.ndim != 2 or xyz.shape[1] != 3:
         raise ValueError("XYZ/channel shape mismatch")
     R = prior_rotation(settings)
     local = xyz @ R.T
-    x, y, z = local.T
-    keep = (
-        np.isfinite(local).all(axis=1)
-        & (abs(x) <= settings.lateral_limit_m)
-        & (y <= -settings.forward_min_m)
-        & (y >= -settings.forward_max_m)
-        & (z >= settings.height_min_m)
-        & (z <= settings.height_max_m)
-    )
-    points = local[keep]
+    finite = np.isfinite(local).all(axis=1)
+    points = local[finite if selected is None else finite & selected]
     if len(points) < 3 or np.linalg.matrix_rank(points - points.mean(axis=0)) < 2:
-        points = local[np.isfinite(local).all(axis=1)]
+        points = local[finite]
     if len(points) < 3 or np.linalg.matrix_rank(points - points.mean(axis=0)) < 2:
         raise ValueError("plane_unavailable: fewer than three non-collinear finite points")
     keys = np.floor(points[:, :2] / settings.cell_size_m).astype(np.int64)
@@ -2229,6 +2213,8 @@ class ScanPoints:
     timestamp: np.ndarray  # PCAP record time of the packet
     channel: np.ndarray  # 1-based laser channel
     xyz: np.ndarray  # sensor coordinates in metres, shape (n, 3)
+    firing: np.ndarray  # index of the point's firing in firing_azimuth_raw
+    firing_azimuth_raw: np.ndarray  # raw azimuth (0.01 degree) of every firing, scan order
 
     def __len__(self):
         return len(self.channel)
@@ -2301,10 +2287,14 @@ def decode_xt32_records(records, calibration: lidar__Calibration) -> ScanPoints:
     def per_point(values, axes):
         return np.broadcast_to(np.asarray(values).reshape(axes), shape)[keep]
 
+    # A firing is one kept-return block (dual return: one of each block pair).
+    firing = np.cumsum(block_ok.ravel()).reshape(block_ok.shape) - 1
     return ScanPoints(
         timestamp=per_point(np.asarray(times, dtype=np.float64), (count, 1, 1)),
         channel=per_point(np.arange(1, lidar__XT32_CHANNELS + 1), (1, 1, lidar__XT32_CHANNELS)),
         xyz=np.column_stack([x[keep], y[keep], z[keep]]),
+        firing=per_point(firing, (count, lidar__XT32_BLOCKS, 1)),
+        firing_azimuth_raw=raw_az100[block_ok],
     )
 
 
@@ -2564,11 +2554,28 @@ def merge_scan_fragments(fragments, gap_sec=0.005):
     return merged
 
 
-def flatten(points):
+def plane_points(points, center_raw):
+    """Mask of the points the road plane is fitted to, or None when the scan does not
+    reach the camera's optical axis (within 1 degree).
+
+    The firing nearest center_raw (LiDAR2Camera.axis_azimuth_raw) and PLANE_SIDE_FIRINGS
+    firings on each side, every channel, as codecode/lcz_to_pcap.py selects them.
+    """
+    azimuth = points.firing_azimuth_raw
+    if not len(azimuth):
+        return None
+    error = np.abs((azimuth - center_raw + 18000) % 36000 - 18000)
+    center = int(np.argmin(error))
+    if error[center] > 100:
+        return None
+    return np.abs(points.firing - center) <= PLANE_SIDE_FIRINGS
+
+
+def flatten(points, center_raw):
     if len(points) < 3:
         raise ValueError("insufficient_lidar_points")
     xyz = points.xyz
-    normal, offset = fit_spatial_road_plane(xyz)
+    normal, offset = fit_spatial_road_plane(xyz, plane_points(points, center_raw))
     road, rotation, _ = lidar__road_aligned_xyz(xyz, normal, offset)
     return dict(
         points=points,
@@ -2866,7 +2873,7 @@ def lidar_stage(detections, target, scan, camera, angles, alignment, cache):
                     points = decode_scan(sources, angles, start - 1e-06, end + 1e-06)
                     plane_error = ""
                     try:
-                        plane = flatten(points)
+                        plane = flatten(points, camera.axis_azimuth_raw)
                     except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
                         plane, plane_error = None, str(exc)
                     cache[cache_key] = (points, plane, plane_error)

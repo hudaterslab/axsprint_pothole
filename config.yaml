@@ -30,8 +30,10 @@ lidar_reconnect_max_sec: 30.0
 lidar_pcap_seconds: 10.0
 lidar_pcap_queue_size: 8
 lidar_fov_filter_enabled: true
-camera_forward_offset_deg: -177.08
-lidar_h_margin_deg: 80.0
+# LiDAR azimuth of the camera optical axis (camera_calib_best_effort.json: 180 deg).
+# 75 deg each side keeps the whole image (108.6..243.9 deg) plus a few degrees.
+camera_forward_offset_deg: -180.0
+lidar_h_margin_deg: 75.0
 gps_device: auto
 gps_preferred_device: /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
 gps_baudrate: 115200

@@ -5,7 +5,7 @@
 ```text
 live_detection/
   main_live.py      실시간 포트홀 탐지 (카메라 탐지 + 라이다 깊이 측정)
-  camera_calib_best_effort_v30.json   카메라 렌즈 보정값 (30도 장착, main_live.py가 읽음)
+  camera_calib_best_effort.json   카메라 렌즈 보정값과 카메라 위치·방향 (라이다 바로 아래 9 cm, main_live.py가 읽음)
   XT32_Angle_Correction_File.csv      라이다 채널 각도 (main_live.py가 읽음)
   best_seg.dxnn     main_live.py 모델 (저장소에 넣지 않음, ./download_models.sh로 받음)
   download_models.sh   모델 다운로드 (Hugging Face HudatersU/road_maintanance, sha256 확인)
@@ -15,6 +15,7 @@ live_detection/
   launch_component_terminal.sh   수집 터미널 열기
   run_component_foreground.sh    수집 실행·로그·정상 종료 제어
   run_main_live.sh               main_live.py 실행, 오류로 끝나면 자동 재시작 (분석 터미널이 사용)
+  checklidarcamera.py            녹화 구간 프레임에 라이다 점을 겹쳐 저장 (코드 상단 FOLDER, START_FRAME, END_FRAME 설정)
   attach_component_terminal.sh   원격 데스크톱에서 수집 터미널 연결
   resolve_recording_storage.sh   외장 SSD와 저장 경로 확인
   config.yaml      카메라, GPS, 저장 위치 등 수집 설정
