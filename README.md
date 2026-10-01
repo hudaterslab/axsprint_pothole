@@ -246,8 +246,18 @@ python3 auto_update.py          # 코드와 모델 업데이트
 모델은 크기와 SHA-256을 검증한 후 교체합니다. 코드나 모델을 바꿔도 실행 중인 수집·분석
 프로세스를 자동으로 재시작하지 않으며, 다음 실행부터 적용됩니다.
 
-예약 실행은 별도 등록이 필요합니다. 하루 00시·12시·18시 예시:
+운영 단말기는 `hudaters` 사용자의 crontab에 한국 시간(Asia/Seoul) 00시·12시·18시로
+등록되어 있습니다. 저장소 밖에 설치한 실행 도우미가 GitLab의 `live_detection`만
+GitHub의 같은 브랜치로 보낸 뒤, `auto_update.py`로 코드와 모델을 갱신합니다.
 
 ```cron
-0 0,12,18 * * * /usr/bin/python3 /home/hudaters/Desktop/live_detection/auto_update.py >> /home/hudaters/Desktop/live_detection/update.log 2>&1
+0 0,12,18 * * * /bin/sh /home/hudaters/.local/libexec/axsprint/run_scheduled_updates.sh >> /home/hudaters/Desktop/live_detection/update.log 2>&1
 ```
+
+미러링 인증 정보는 저장소 밖의 사용자 전용 파일에 보관합니다. 다른 브랜치나 태그는 보내지
+않으며, GitHub에 별도 수정이 생겨 이력이 갈라지면 미러링은 덮어쓰지 않고 중단합니다.
+GitLab에 연결할 수 없어도 GitHub에 이미 올라온 코드와 Hugging Face 모델 확인은 계속합니다.
+예약 시각에 단말기가 켜져 있어야 실행되며, 꺼져 있던 시간의 작업을 나중에 몰아서 실행하지는 않습니다.
+
+새 단말기를 복제한 것만으로 이 예약 작업이나 실행 도우미가 설치되지는 않습니다.
+코드와 모델만 수동 확인하려면 위의 `auto_update.py` 명령을 사용하세요.
