@@ -2,8 +2,10 @@
 
 Run: python3 -u main_live.py
 Input: /mnt/ssd/porthole_runs/YYYYMMDD/run/{frames,lidar,gps,meta}
-Every committed frame is processed in FIFO order; checkpoints and upload retries
-survive restarts. No other project Python file is imported or executed.
+Only frames recorded after the start are analysed, in order; older ones are skipped.
+Detected images are listed in DETECTIONS_CSV, and their JPG/JSON/PCAP go to the server
+when it is reachable; nothing else is kept on the terminal.
+No other project Python file is imported or executed.
 Model/calibration files and installed NumPy/OpenCV/DEEPX runtime are data/runtime
 dependencies. PTP synchronizes clocks; GPS speed, when available, compensates
 vehicle motion between LiDAR packets and the image.
@@ -33,12 +35,12 @@ from typing import Iterator
 from typing import Optional
 from zoneinfo import ZoneInfo
 import csv
-import ctypes
 import cv2
 import hashlib
 import json
 import math
 import numpy as np
+import queue
 import re
 import select
 import shlex
@@ -62,13 +64,22 @@ PROJECT = Path(__file__).resolve().parent
 
 ROOT = Path("/mnt/ssd/porthole_runs")  # collector recordings
 
-OUTPUT = Path("/mnt/ssd/porthole_live_analysis")
+# The only file the analysis keeps on the terminal: time, image and damage types of each
+# frame with newly confirmed damage, whether or not the server could be reached.
+DETECTIONS_CSV = Path("/mnt/ssd/porthole_detections.csv")
 
-BATCH_SIZE = 16  # frames per checkpoint
+# A frame's JPG/JSON/PCAP wait here, in RAM (/tmp is tmpfs), only until they are sent.
+UPLOAD_STAGING = Path("/tmp/porthole_upload")
+
+REMOTE_FOLDER = "porthole_live_analysis"  # server: <PORTHOLE_UPLOAD_DIR>/<this>/<run>/certifcate
+
+UPLOAD_QUEUE_LIMIT = 100  # frames waiting to be sent; more are only listed in the CSV
+
+OFFLINE_RETRY_SEC = 30  # after a failed send, new detections are only listed in the CSV
+
+BATCH_SIZE = 16  # frames per inference batch
 
 POLL_SECONDS = 0.5
-
-MIN_FREE_GB = 10  # analysis pauses below this, so recording keeps the disk
 
 OFFSET_SEC = 0.0
 
@@ -167,7 +178,7 @@ PROTOCOL = "porthole_artifacts_v4"
 def triplet_error(files):
     """Only one same-stem JPEG/JSON/nonempty PCAP may reach the receiver."""
     if not isinstance(files, dict) or len(files) != 3:
-        return "Upload requires exactly one JPG, one JSON and one PCAP; retained locally"
+        return "Upload requires exactly one JPG, one JSON and one PCAP"
     if any(not isinstance(name, str) for name in files):
         return "Invalid artifact filename"
     if {Path(name).suffix for name in files} != {".jpg", ".json", ".pcap"}:
@@ -176,7 +187,7 @@ def triplet_error(files):
         return "JPG, JSON and PCAP must have the same basename"
     pcap = next(info for name, info in files.items() if Path(name).suffix == ".pcap")
     if not isinstance(pcap, dict) or type(pcap.get("bytes")) is not int or pcap["bytes"] <= 24:
-        return "Empty PCAP cannot be uploaded; retained locally"
+        return "Empty PCAP cannot be uploaded"
     return ""
 
 
@@ -240,21 +251,6 @@ def fsync_dir(path):
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-_LIBC = ctypes.CDLL(None, use_errno=True)
-
-
-def syncfs(path):
-    """Flush the whole filesystem holding path: one journal commit covers
-    every file written since, instead of one per fsync."""
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        if _LIBC.syncfs(fd) != 0:
-            error = ctypes.get_errno()
-            raise OSError(error, os.strerror(error), str(path))
     finally:
         os.close(fd)
 
@@ -1569,7 +1565,7 @@ def mask_polygons(mask):
 
 
 class DamageArtifactExporter:
-    """Per-damage records of one frame; commit() points directory at the frame's stage."""
+    """Per-damage records of one frame; report() points directory at the frame's upload folder."""
 
     def __init__(self, camera):
         self.directory = None
@@ -1609,7 +1605,7 @@ class DamageArtifactExporter:
         lidar_metadata = dict(
             schema="pandar_xt32_pcap_v1",
             pcap_files=[],
-            status="pcap_unavailable",  # commit() attaches the scan PCAP
+            status="pcap_unavailable",  # report() attaches the scan PCAP
             decoded_on_terminal=lidar_timestamp is not None,
             scan_start_epoch_sec=None if scan_start is None else scan_start - 1e-6,
             scan_end_epoch_sec=None if scan_end is None else scan_end + 1e-6,
@@ -1704,8 +1700,7 @@ def save_detection_frame(directory, source_image, image, row, key,
     """Frame JSON in the terminal-server data spec (단말기-서버 데이터 명세서, 2026-09-28).
 
     Only record_id, categories, images, annotations, gps and lidar.pcap_files are
-    sent; missing measurements are null, not 0. The full per-damage details stay
-    in the frame's local result.json.
+    sent; missing measurements are null, not 0.
     """
     if not damage_detections:
         return []
@@ -1884,8 +1879,9 @@ def fit_spatial_road_plane(xyz, selected=None, settings=RoadPlaneSettings()):
         group = points[inverse == i]
         cells.append(np.median(group, axis=0))
     cells = np.asarray(cells, float).reshape(-1, 3)
+    grid_cells = len(cells)
     if len(cells) < 3 or np.linalg.matrix_rank(cells - cells.mean(axis=0)) < 2:
-        cells = points.copy()
+        cells, grid_cells = points.copy(), 0  # no spread of cells: the checks withhold this plane
     A = np.column_stack([cells[:, :2], np.ones(len(cells))])
     target = cells[:, 2]
     rng = np.random.default_rng(20260907)
@@ -1913,7 +1909,7 @@ def fit_spatial_road_plane(xyz, selected=None, settings=RoadPlaneSettings()):
     normal = np.array([-beta[0], -beta[1], 1.0]) @ R / scale
     offset = -float(beta[2]) / scale
     quality = dict(
-        cells=len(cells),
+        cells=grid_cells,
         support=float(np.mean(np.abs(A @ beta - target) / scale <= PLANE_SUPPORT_M)),
         tilt_deg=float(np.degrees(np.arctan(np.sqrt(beta[:2] @ beta[:2])))),
     )
@@ -2842,8 +2838,8 @@ def lidar_stage(detections, target, scan, camera, angles, alignment, cache):
 
 class LiveProcessor:
 
-    def __init__(self, output, upload):
-        self.output, self.upload = (output, upload)
+    def __init__(self, log, uploader):
+        self.log, self.uploader = (log, uploader)
         cv2.setNumThreads(FUSION_OPENCV_THREADS)
         self.camera = LiDAR2Camera(CAMERA_CALIBRATION)
         self.angles = lidar__load_calibration(LIDAR_CALIBRATION)
@@ -2860,13 +2856,6 @@ class LiveProcessor:
         self.closed = False
         # JPEGs are decoded ahead in a thread; everything else stays in source order here.
         self.loader = ThreadPoolExecutor(1, thread_name_prefix="live-image")
-        self.unsynced = False  # frames committed without fsync since the last flush()
-
-    def flush(self):
-        """Make the frames committed without fsync durable (see commit)."""
-        if self.unsynced:
-            syncfs(self.output)
-            self.unsynced = False
 
     def close(self):
         if not self.closed:
@@ -2933,7 +2922,7 @@ class LiveProcessor:
         return (timestamp, target, scan)
 
     def submit(self, run, row, image, detections, pcaps):
-        """LiDAR part of one frame (see lidar_stage); commit() does the rest."""
+        """LiDAR part of one frame (see lidar_stage); report() does the rest."""
         started = time.monotonic()
         timestamp, target, scan = self.frame_scan(row, detections, pcaps)
         lidar = lidar_stage(detections, target, scan, self.camera, self.angles, self.alignment,
@@ -2942,11 +2931,7 @@ class LiveProcessor:
                                target=target, scan=scan, lidar=lidar, started=started)
 
     def analyse(self, run, key, stream, pcaps, stopping):
-        """Commit the frames of an inference stream in source order, yielding each summary.
-
-        A frame counts only once committed; frames in flight at a stop or crash
-        are analysed again after the restart.
-        """
+        """Report the frames of an inference stream in source order, yielding each summary."""
         for row, image, detections in stream:
             if stopping():
                 return
@@ -2954,20 +2939,24 @@ class LiveProcessor:
             if stopping():
                 return
             wait_for_collector(stopping)
-            yield self.commit(run, key, frame)
+            yield self.report(run, key, frame)
 
-    def commit(self, run, key, frame):
-        """Track, export and commit one submitted frame; callers keep source order."""
+    def report(self, run, key, frame):
+        """Track one submitted frame; callers keep source order.
+
+        A frame with newly confirmed damage is listed in the CSV and, when the uploader
+        takes it, its JPG/JSON/PCAP are made in UPLOAD_STAGING for sending.
+        """
         row, image, detections = (frame.row, frame.image, frame.detections)
-        timestamp, target, scan, started = (frame.timestamp, frame.target, frame.scan, frame.started)
+        timestamp, target, scan = (frame.timestamp, frame.target, frame.scan)
         lidar = frame.lidar
         index = int(row["frame_index"])
         image_path = Path(row["path"])
         if not image_path.is_absolute():
             image_path = run / image_path
-        sources, start, end, delta = ((), None, None, None) if scan is None else scan
+        sources, start, end, _ = ((), None, None, None) if scan is None else scan
         scan_time = None if scan is None else (start + end) * 0.5
-        status, error, motion = (lidar["status"], lidar["error"], lidar["motion"])
+        status, motion = (lidar["status"], lidar["motion"])
         accepted = [detections[i] for i in lidar["accepted"]]
         objects, audit = (lidar["objects"], lidar["audit"])
         self.sequence += 1
@@ -2998,14 +2987,17 @@ class LiveProcessor:
                         )
                     )
                 accepted_index += 1
-        folder = self.output / "runs" / key / "frames" / f"{index:08d}"
-        if folder.exists():
-            raise FileExistsError(f"Frame already committed: {folder}")
-        stage = folder.with_name("." + folder.name + "." + uuid.uuid4().hex + ".pending")
-        stage.mkdir(parents=True)
+        summary = dict(frame_index=index, status=status, model_count=len(detections),
+                       reported_count=len(report_detections))
+        if not report_detections:
+            return summary
+        self.log.add(timestamp, image_path, report_detections)
+        if self.uploader is None or not self.uploader.accepting():
+            return summary
+        folder = UPLOAD_STAGING / key / f"{index:08d}"
         try:
-            self.exporter.directory = stage / "certifcate"
-            self.exporter.directory.mkdir()
+            self.exporter.directory = folder / "certifcate"
+            self.exporter.directory.mkdir(parents=True)
             damage_payloads, artifacts = [], []
             self.exporter.save(
                 timestamp,
@@ -3031,96 +3023,87 @@ class LiveProcessor:
             for payload in damage_payloads:
                 if payload.get("tracking"):
                     payload["tracking"]["scope"] = "live_process_session_across_run_rotation"
-            if report_detections:
-                pcap_path = self.exporter.directory / (detection_frame_stem(row) + ".pcap")
-                pcap_metadata = save_scan_pcap(
-                    pcap_path, sources,
-                    None if start is None else start - 1e-6,
-                    None if end is None else end + 1e-6,
-                )
-                pcap_files = [] if pcap_metadata is None else [pcap_metadata]
-                if pcap_metadata is not None:
-                    artifacts.append(pcap_path)
-                for payload in damage_payloads:
-                    payload["lidar"].update(
-                        pcap_files=pcap_files, status=status if pcap_files else "pcap_unavailable",
-                        pcap_copy_policy="selected_scan_raw_records_unchanged",
-                    )
-                pair = save_detection_frame(
-                    self.exporter.directory, image_path, image, row, key,
-                    report_detections, damage_payloads,
-                    matched_gps_position(self.exporter.gps_streams, timestamp), pcap_files,
-                )
-                artifacts.extend(pair)
-            files = {p.name: dict(bytes=p.stat().st_size, sha256=sha(p)) for p in artifacts}
-            # Most frames have nothing to upload; they skip fsync, which on the
-            # SSD the collector keeps busy costs more than the analysis, and
-            # flush() makes them durable before each checkpoint. A frame with
-            # artifacts may be uploaded, so the frames before it are flushed
-            # first: recovery never finds a gap before an uploaded frame.
-            durable = bool(artifacts)
-            if durable:
-                self.flush()
-                for path in artifacts:
-                    with path.open("rb") as stream:
-                        os.fsync(stream.fileno())
-                fsync_dir(self.exporter.directory)
-            manifest = dict(frame_index=index, files=files, frame_log={}) if files else None
-            summary = dict(
-                schema_version=3,
-                source_run=key,
-                frame_index=index,
-                source_frame_id=row.get("source_frame_id"),
-                camera_timestamp=timestamp,
-                camera_timestamp_ns=row.get("timestamp_ns"),
-                target_lidar_timestamp=target,
-                offset_sec=OFFSET_SEC,
-                scan_start=start,
-                scan_end=end,
-                scan_delta_ms=None if delta is None else delta * 1000,
-                status=status,
-                error=error,
-                model_count=len(detections),
-                accepted_count=len(accepted),
-                reported_count=len(report_detections),
-                total_model_count=len(detections),
-                total_reported_count=len(report_detections),
-                damage_report_policy="first_confirmation_only",
-                objects=audit,
-                damage_details=damage_payloads,
-                tracks=tracked,
-                live_sequence=self.sequence,
-                live_session_id=self.session_id,
-                motion_compensation=motion,
-                upload_enabled=self.upload,
-                upload_manifest=manifest,
-                upload_blocked_reason=triplet_error(files) if files else "",
-                processing_seconds=time.monotonic() - started,
+            pcap_path = self.exporter.directory / (detection_frame_stem(row) + ".pcap")
+            pcap_metadata = save_scan_pcap(
+                pcap_path, sources,
+                None if start is None else start - 1e-6,
+                None if end is None else end + 1e-6,
             )
-            atomic_json(stage / "result.json", clean(summary), durable=durable)
-            if durable:
-                fsync_dir(stage)
-            stage.replace(folder)
-            if durable:
-                fsync_dir(folder.parent)
-            else:
-                self.unsynced = True
-            if self.upload and manifest:
-                queue_upload(self.output, key, folder)
+            pcap_files = [] if pcap_metadata is None else [pcap_metadata]
+            if pcap_metadata is not None:
+                artifacts.append(pcap_path)
+            for payload in damage_payloads:
+                payload["lidar"].update(
+                    pcap_files=pcap_files, status=status if pcap_files else "pcap_unavailable",
+                    pcap_copy_policy="selected_scan_raw_records_unchanged",
+                )
+            pair = save_detection_frame(
+                self.exporter.directory, image_path, image, row, key,
+                report_detections, damage_payloads,
+                matched_gps_position(self.exporter.gps_streams, timestamp), pcap_files,
+            )
+            artifacts.extend(pair)
+            files = {p.name: dict(bytes=p.stat().st_size, sha256=sha(p)) for p in artifacts}
+            reason = triplet_error(files)
+            if reason:  # e.g. no LiDAR scan for the PCAP: the server would refuse it
+                raise ValueError(reason)
+        except Exception as exc:
+            # The frame stays in the CSV; one frame the server cannot get must not stop
+            # the analysis (a restart would skip every frame recorded meanwhile).
+            print(f"[UPLOAD] not sent, only in the CSV: run={key} frame={index}: {exc}", flush=True)
+            shutil.rmtree(folder, ignore_errors=True)
             return summary
-        except BaseException:
-            if stage.exists():
-                shutil.rmtree(stage)
-            raise
+        self.uploader.send(key, index, folder, dict(frame_index=index, files=files, frame_log={}))
+        return summary
 
 
-def queue_upload(output, key, folder):
-    """Idempotent outbox creation; committed result.json is the recovery source."""
-    output, folder = (Path(output), Path(folder))
-    relative = folder.relative_to(output)
-    task = output / "runs" / "outbox" / key / (folder.name + ".json")
-    if not (folder / "upload_receipt.json").exists() and (not task.exists()):
-        atomic_json(task, dict(frame_folder=relative.as_posix(), source_run=key))
+class DetectionLog:
+    """DETECTIONS_CSV: time (KST), image (path under the recording root) and damage types
+    of each frame with newly confirmed damage."""
+
+    def __init__(self, path, root):
+        self.path, self.root = (Path(path), Path(root))
+        self.stream = None
+        self.open()
+
+    def open(self):
+        if self.stream:
+            self.stream.close()
+        if self.path.exists():
+            with self.path.open("r+b") as stream:
+                size = stream.seek(0, os.SEEK_END)
+                stream.seek(max(0, size - 65536))
+                tail = stream.read()
+                if tail and not tail.endswith(b"\n"):  # a row a power cut left unfinished
+                    stream.truncate(size - len(tail) + tail.rfind(b"\n") + 1)
+                    os.fdatasync(stream.fileno())
+        new = not self.path.exists() or self.path.stat().st_size == 0
+        self.stream = self.path.open("a", newline="", encoding="utf-8")
+        self.writer = csv.writer(self.stream)
+        if new:
+            self.writer.writerow(("time", "image", "objects"))
+            self.sync()
+            fsync_dir(self.path.parent)
+
+    def sync(self):
+        # Detections are rare and the CSV is the only record kept, so each row goes to
+        # the disk at once: a power cut right after a detection must not lose it.
+        self.stream.flush()
+        os.fdatasync(self.stream.fileno())
+
+    def add(self, timestamp, image_path, detections):
+        if not self.path.exists():  # deleted while running: start a new file
+            self.open()
+        image = Path(image_path)
+        if image.is_relative_to(self.root):
+            image = image.relative_to(self.root)
+        kinds = sorted({"pothole" if int(d.class_id) == 1 else "crack" for d in detections})
+        self.writer.writerow((camera_time_kst(timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                              image.as_posix(), "+".join(kinds)))
+        self.sync()
+
+    def close(self):
+        self.stream.close()
 
 
 UPLOAD_SETTINGS = (
@@ -3162,124 +3145,108 @@ def upload_options():
 
 
 class UploadWorker:
-    """Durable retry queue: HTTP API when PORTHOLE_API_URL is set, else the
-    embedded byte/hash-verified SSH transport."""
+    """Send reported frames from UPLOAD_STAGING, oldest first, and delete each one after.
 
-    def __init__(self, output, timeout=30):
-        self.output, self.timeout = (Path(output), timeout)
+    HTTP API when PORTHOLE_API_URL is set, else the embedded byte/hash-verified SSH
+    transport. Nothing is kept for later: when a send fails (no network, server down)
+    the frames waiting are dropped and, for OFFLINE_RETRY_SEC, new detections are only
+    listed in the CSV. A frame the server rejects is dropped as well.
+    """
+
+    def __init__(self, timeout=30):
+        self.timeout = timeout
+        self.jobs = queue.Queue()
+        self.offline_until = 0.0
         self.stop_event = threading.Event()
         self.error = ""
         self.thread = threading.Thread(target=self.run, name="live-artifact-upload", daemon=True)
+        try:
+            self.options = upload_options()
+        except ValueError as exc:
+            self.enabled, self.error = (False, str(exc))
+            print(f"[UPLOAD] off, detections are only listed in the CSV: {exc}", flush=True)
+            return
+        self.enabled = True
         self.thread.start()
+
+    def accepting(self):
+        """Whether a newly reported frame should be prepared for sending."""
+        return (self.enabled and time.monotonic() >= self.offline_until
+                and self.jobs.qsize() < UPLOAD_QUEUE_LIMIT)
+
+    def send(self, key, index, folder, manifest):
+        self.jobs.put((key, index, Path(folder), manifest))
+
+    def pending(self):
+        return self.jobs.qsize()
+
+    def drop_waiting(self):
+        while True:
+            try:
+                folder = self.jobs.get_nowait()[2]
+            except queue.Empty:
+                return
+            shutil.rmtree(folder, ignore_errors=True)
 
     def run(self):
         uploader, active_key = (None, None)
+        options = self.options
         try:
-            try:
-                options = upload_options()
-            except ValueError as exc:
-                # Not configured: keep analysing and keep the outbox until .env
-                # is filled in and main_live.py restarts.
-                self.error = str(exc)
-                self.stop_event.wait()
-                return
             target = options.api_url if options.mode == "api" else f"{options.user}@{options.host}"
             print(f"[UPLOAD] {options.mode} -> {target}", flush=True)
             while not self.stop_event.is_set():
-                jobs = sorted((self.output / "runs" / "outbox").glob("**/*.json"))
-                if not jobs:
-                    self.stop_event.wait(1)
+                try:
+                    key, index, folder, manifest = self.jobs.get(timeout=1)
+                except queue.Empty:
                     continue
-                blocked_reason = ""
-                for job in jobs:
-                    if self.stop_event.is_set():
-                        break
-                    try:
-                        task = json.loads(job.read_text())
-                        folder = (self.output / task["frame_folder"]).resolve()
-                        folder.relative_to(self.output.resolve())
-                        if (folder / "upload_receipt.json").exists():
-                            job.unlink()
-                            continue
-                        row = json.loads((folder / "result.json").read_text())
-                        reason = triplet_error(row["upload_manifest"].get("files"))
-                        if reason:
-                            blocked_reason = reason
-                            self.error = reason
-                            atomic_json(self.output / "runs" / "upload_status.json", dict(
-                                updated_at=time.time(), error=reason, pending=len(jobs),
-                                frame_folder=task["frame_folder"], retry=True,
-                                state="waiting_for_complete_triplet"))
-                            continue  # Keep this job, but do not block complete later frames.
-                        key = task["source_run"]
-                        if key != active_key:
-                            if uploader:
-                                uploader.close()
-                            uploader = (
-                                HttpUploader(options, timeout=self.timeout)
-                                if options.mode == "api"
-                                else PersistentUploader(
-                                    options,
-                                    Path(self.output.name) / key / "certifcate",
-                                    timeout=self.timeout,
-                                )
-                            )
-                            active_key = key
-                        receipt = uploader.upload(folder / "certifcate", row["upload_manifest"])
-                        atomic_json(folder / "upload_receipt.json", receipt)
-                        job.unlink()
-                        self.error = ""
-                        print(
-                            f"[UPLOAD] verified run={key} frame={row['frame_index']} files={receipt['files']}",
-                            flush=True,
-                        )
-                    except PermanentUploadError as exc:
-                        # Retrying cannot help and would block later frames; park it.
-                        failed = self.output / "runs" / "outbox_failed" / job.relative_to(
-                            self.output / "runs" / "outbox"
-                        )
-                        failed.parent.mkdir(parents=True, exist_ok=True)
-                        job.replace(failed)
-                        atomic_json(failed.with_suffix(".error.json"),
-                                    dict(failed_at=time.time(), error=str(exc)))
-                        print(f"[UPLOAD] rejected by server, moved to {failed}: {exc}", flush=True)
-                    except Exception as exc:
-                        self.error = str(exc)
-                        atomic_json(
-                            self.output / "runs" / "upload_status.json",
-                            dict(
-                                updated_at=time.time(),
-                                error=self.error,
-                                pending=len(jobs),
-                                retry=True,
-                            ),
-                        )
-                        print(f"[UPLOAD] retry pending: {exc}", flush=True)
+                if time.monotonic() < self.offline_until:  # queued just as a send failed
+                    shutil.rmtree(folder, ignore_errors=True)
+                    continue
+                try:
+                    if key != active_key:
                         if uploader:
                             uploader.close()
-                        uploader, active_key = (None, None)
-                        self.stop_event.wait(5)
-                        break
-                if blocked_reason:
-                    self.error = blocked_reason
-                    self.stop_event.wait(5)
+                        uploader = (
+                            HttpUploader(options, timeout=self.timeout)
+                            if options.mode == "api"
+                            else PersistentUploader(
+                                options, Path(REMOTE_FOLDER) / key / "certifcate", timeout=self.timeout
+                            )
+                        )
+                        active_key = key
+                    receipt = uploader.upload(folder / "certifcate", manifest)
+                    self.error = ""
+                    print(f"[UPLOAD] verified run={key} frame={index} files={receipt['files']}", flush=True)
+                except PermanentUploadError as exc:
+                    print(f"[UPLOAD] rejected by server, dropped run={key} frame={index}: {exc}", flush=True)
+                except Exception as exc:
+                    self.error = str(exc)
+                    self.offline_until = time.monotonic() + OFFLINE_RETRY_SEC
+                    dropped = 1 + self.jobs.qsize()
+                    self.drop_waiting()
+                    print(f"[UPLOAD] cannot send ({exc}); dropped {dropped} frame(s), "
+                          f"CSV only for {OFFLINE_RETRY_SEC} s", flush=True)
+                    if uploader:
+                        uploader.close()
+                    uploader, active_key = (None, None)
+                finally:
+                    shutil.rmtree(folder, ignore_errors=True)
         except Exception as exc:
-            self.error = str(exc)
-            print(f"[UPLOAD] worker stopped: {exc}", flush=True)
+            self.enabled, self.error = (False, str(exc))
+            print(f"[UPLOAD] worker stopped, detections are only listed in the CSV: {exc}", flush=True)
         finally:
+            self.drop_waiting()
             if uploader:
                 uploader.close()
 
     def close(self, drain_seconds=10):
         deadline = time.monotonic() + drain_seconds
-        while (
-            any((self.output / "runs" / "outbox").glob("**/*.json"))
-            and time.monotonic() < deadline
-            and (not self.error)
-        ):
+        while self.jobs.qsize() and self.thread.is_alive() and time.monotonic() < deadline:
             time.sleep(0.1)
         self.stop_event.set()
-        self.thread.join(timeout=self.timeout + 5)
+        if self.thread.is_alive():
+            self.thread.join(timeout=self.timeout + 5)
+        self.drop_waiting()
 
 
 class JsonlTail:
@@ -3385,37 +3352,6 @@ def count_manifest(path, entry):
             entry["last_recorded_timestamp"] = float(row.get("capture_timestamp", row["timestamp"]))
 
 
-def recover_committed(output, key, run, count, upload):
-    """Recover commits that survived a crash before the checkpoint write.
-
-    Frames without artifacts are committed without fsync, so a power cut can
-    leave the newest of them with a missing or partial result.json. Counting
-    stops there, and that frame and the ones after it are removed to be
-    analysed again; none of them was uploaded (see LiveProcessor.commit).
-    """
-    while count < len(run.frames.rows):
-        row = run.frames.rows[count]
-        folder = output / "runs" / key / "frames" / f"{int(row['frame_index']):08d}"
-        path = folder / "result.json"
-        if not folder.exists():
-            break
-        try:
-            saved = json.loads(path.read_text())
-        except (FileNotFoundError, ValueError):
-            for later in run.frames.rows[count:]:
-                leftover = output / "runs" / key / "frames" / f"{int(later['frame_index']):08d}"
-                if not leftover.exists():
-                    break
-                shutil.rmtree(leftover)
-            break
-        if saved["frame_index"] != int(row["frame_index"]) or saved["source_run"] != key:
-            raise ValueError(f"Committed frame does not match source: {path}")
-        if upload and saved.get("upload_enabled") and saved.get("upload_manifest"):
-            queue_upload(output, key, folder)
-        count += 1
-    return count
-
-
 def source_signature(run):
     if not run.frames.rows:
         return None
@@ -3449,8 +3385,11 @@ def discover(root):
     """PTP recordings under root/YYYYMMDD/<run>; others (e.g. new_data) are skipped."""
     result = set()
     for path in root.glob("*/*/frames/frames.jsonl"):
-        with path.open("rb") as stream:
-            first = stream.readline()
+        try:
+            with path.open("rb") as stream:
+                first = stream.readline()
+        except FileNotFoundError:  # deleted while listing
+            continue
         if first.endswith(b"\n") and first.strip():
             if json.loads(first).get("timestamp_source") != "camera_ptp_rtcp_utc":
                 continue
@@ -3458,42 +3397,27 @@ def discover(root):
     return sorted(result, key=lambda p: str(p))
 
 
-def analysis_signature(root):
-    return dict(
-        root=str(root),
-        code_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        model_hashes={MODEL_PATH.name: sha(MODEL_PATH) if MODEL_PATH.is_file() else None},
-    )
+def run_service(root=ROOT, upload=True, max_frames=0):
+    """Analyse the frames written from the start on until stopped (max_frames: tests).
 
-
-class OutputSettingsChanged(ValueError):
-    """The output checkpoint was written by other code, settings or input."""
-
-
-def prepare_run_metadata(output, signature):
-    """This output's checkpoint, or None for a new output."""
-    state_path = Path(output) / "runs" / "state.json"
-    if not state_path.exists():
-        return None
-    state = json.loads(state_path.read_text())
-    if state.get("schema_version") != 7 or state.get("configuration") != signature:
-        raise OutputSettingsChanged("Live output was written by other code or settings")
-    return state
-
-
-def run_service(root=ROOT, output=OUTPUT, upload=True, max_frames=0):
-    """Analyse every new recording under root until stopped (max_frames: tests)."""
+    Frames already in frames.jsonl at the start, e.g. the ones a power cut left
+    unanalysed, are skipped, and nothing carries over to the next start. The boundary
+    is each manifest's size at the start, so it does not depend on any clock.
+    """
     import fcntl
-    from contextlib import ExitStack
+    from contextlib import ExitStack, closing
 
-    root, output = (Path(root).resolve(), Path(output).resolve())
+    root = Path(root).resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Recording root is unavailable: {root}")
-    if str(output).startswith("/mnt/ssd/") and (not os.path.ismount("/mnt/ssd")):
+    if str(DETECTIONS_CSV).startswith("/mnt/ssd/") and (not os.path.ismount("/mnt/ssd")):
         raise RuntimeError("SSD is not mounted")
-    output.mkdir(parents=True, exist_ok=True)
-    state_path = output / "runs" / "state.json"
-    signature = analysis_signature(root)
+    start_bytes = {}  # run -> size of its frames.jsonl at the start
+    for manifest in root.glob("*/*/frames/frames.jsonl"):
+        try:
+            start_bytes[str(manifest.parent.parent.relative_to(root))] = manifest.stat().st_size
+        except FileNotFoundError:
+            pass
     stopping = False
 
     def stop(*_):
@@ -3501,59 +3425,19 @@ def run_service(root=ROOT, output=OUTPUT, upload=True, max_frames=0):
         stopping = True
 
     with ExitStack() as resources:
-        lock = resources.enter_context((output / "worker.lock").open("a"))
+        lock = resources.enter_context(open("/tmp/porthole_main_live.lock", "a"))
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         for sig in (signal.SIGINT, signal.SIGTERM):
             previous = signal.signal(sig, stop)
             resources.callback(signal.signal, sig, previous)
-        previous_output = previous_uploader = None
-        try:
-            state = prepare_run_metadata(output, signature)
-        except OutputSettingsChanged:
-            # main_live.py, its input root or model changed since this output was
-            # written. Keep those results in a dated folder (the old lock stays
-            # held) and start a fresh output.
-            stamp = time.strftime("%Y%m%d_%H%M%S")
-            previous_output = output.with_name(f"{output.name}_{stamp}")
-            suffix = 1
-            while previous_output.exists():
-                previous_output = output.with_name(f"{output.name}_{stamp}_{suffix}")
-                suffix += 1
-            output.rename(previous_output)
-            output.mkdir()
-            lock = resources.enter_context((output / "worker.lock").open("a"))
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            print(
-                f"[LIVE] analysis code/settings changed; previous output moved to {previous_output}",
-                flush=True,
-            )
-            state = None
-            # Uploads still queued there keep going from the moved folder.
-            if upload and any((previous_output / "runs" / "outbox").glob("**/*.json")):
-                previous_uploader = UploadWorker(previous_output)
-        if state is None:
-            paths = discover(root)
-            latest = (
-                max(paths, key=lambda p: (p / "frames/frames.jsonl").stat().st_mtime)
-                if paths
-                else None
-            )
-            state = dict(
-                schema_version=7,
-                configuration=signature,
-                watch_since=time.time(),
-                initial_run=str(latest) if latest else None,
-                ignored_runs=[str(p.relative_to(root)) for p in paths if p != latest],
-                runs={},
-            )
-            atomic_json(state_path, state)
+        shutil.rmtree(UPLOAD_STAGING, ignore_errors=True)  # frames an earlier start left unsent
+        log = resources.enter_context(closing(DetectionLog(DETECTIONS_CSV, root)))
         # The recorder always comes first: lowest CPU share and idle-class disk I/O.
         os.nice(10)
         if shutil.which("ionice"):
             subprocess.run(["ionice", "-c", "3", "-p", str(os.getpid())], check=False)
         processor = uploader = None
-        failure = ""
-        runs = {}
+        runs, entries = ({}, {})
         boundary_run = None
         processed = 0
         started = time.monotonic()
@@ -3561,7 +3445,8 @@ def run_service(root=ROOT, output=OUTPUT, upload=True, max_frames=0):
         previous_pending = None
         source_finished_at = None
         print(
-            f"[LIVE] root={root} output={output} upload={upload}; disk-backed FIFO, no skipped frames",
+            f"[LIVE] root={root} upload={upload}; frames written from now on; "
+            f"detections: {DETECTIONS_CSV}",
             flush=True,
         )
         try:
@@ -3569,20 +3454,23 @@ def run_service(root=ROOT, output=OUTPUT, upload=True, max_frames=0):
                 paths = discover(root)
                 for path in paths:
                     key = str(path.relative_to(root))
-                    if key not in state["runs"]:
-                        if key in state["ignored_runs"]:
+                    if key not in entries:
+                        # Taken up once frames are written after the start.
+                        try:
+                            size = (path / "frames/frames.jsonl").stat().st_size
+                        except FileNotFoundError:
                             continue
-                        state["runs"][key] = dict(
-                            processed_rows=0,
+                        if size <= start_bytes.get(key, 0):
+                            continue
+                        entries[key] = dict(
+                            processed_rows=None,  # set when the run is first read, below
                             recorded_rows=0,
                             complete=False,
                             first_frame_sha256=None,
                         )
-                    if not state["runs"][key]["complete"]:
-                        count_manifest(path / "frames/frames.jsonl", state["runs"][key])
-                active_keys = [
-                    key for key in sorted(state["runs"]) if not state["runs"][key]["complete"]
-                ]
+                    if not entries[key]["complete"]:
+                        count_manifest(path / "frames/frames.jsonl", entries[key])
+                active_keys = [key for key in sorted(entries) if not entries[key]["complete"]]
                 for key in list(runs):
                     if key not in active_keys[:2]:
                         del runs[key]
@@ -3590,16 +3478,19 @@ def run_service(root=ROOT, output=OUTPUT, upload=True, max_frames=0):
                     runs.setdefault(key, Run(root / key))
                 for key, run in runs.items():
                     run.refresh()
-                    entry = state["runs"][key]
+                    entry = entries[key]
                     count_manifest(run.frames.path, entry)
                     first_hash = source_signature(run)
                     if entry["first_frame_sha256"] not in (None, first_hash):
                         raise ValueError(f"Source recording was replaced: {run.path}")
                     entry["first_frame_sha256"] = first_hash
-                    count = recover_committed(output, key, run, entry["processed_rows"], upload)
-                    if count > len(run.frames.rows):
-                        raise ValueError(f"Source manifest shrank since checkpoint: {key}")
-                    entry["processed_rows"] = count
+                    if entry["processed_rows"] is None:
+                        # Rows already written at the start are skipped, not analysed.
+                        with run.frames.path.open("rb") as stream:
+                            head = stream.read(start_bytes.get(key, 0))
+                        entry["processed_rows"] = sum(
+                            1 for line in head.split(b"\n")[:-1] if line.strip()
+                        )
                 extra = []
                 if runs:
                     first_path = runs[min(runs)].path
@@ -3626,7 +3517,7 @@ def run_service(root=ROOT, output=OUTPUT, upload=True, max_frames=0):
                 )
                 did_work = False
                 for key in sorted(runs):
-                    run, entry = (runs[key], state["runs"][key])
+                    run, entry = (runs[key], entries[key])
                     count = entry["processed_rows"]
                     if count == len(run.frames.rows):
                         entry["complete"] = run.closed
@@ -3634,24 +3525,18 @@ def run_service(root=ROOT, output=OUTPUT, upload=True, max_frames=0):
                     ready = ready_frames(run, count, pcaps, allow_tail and run.closed)
                     if not ready:
                         break
-                    if shutil.disk_usage(output).free < MIN_FREE_GB * 1024**3:
-                        print(
-                            "[LIVE] paused: insufficient free space for analysis output", flush=True
-                        )
-                        break
                     wait_for_collector(lambda: stopping)
                     if processor is None:
-                        processor = LiveProcessor(output, upload)
+                        uploader = UploadWorker() if upload else None
+                        processor = LiveProcessor(log, uploader)
                     processor.prune_pcaps(pcaps)
-                    if upload and uploader is None:
-                        uploader = UploadWorker(output)
                     processor.refresh_run(run.path)
                     if max_frames:
                         ready = ready[: max_frames - processed]
                     stream = processor.infer(run.path, ready)
-                    committed = processor.analyse(run.path, key, stream, pcaps, lambda: stopping)
+                    reported = processor.analyse(run.path, key, stream, pcaps, lambda: stopping)
                     try:
-                        for _ in committed:
+                        for _ in reported:
                             entry["processed_rows"] += 1
                             processed += 1
                             did_work = True
@@ -3659,49 +3544,27 @@ def run_service(root=ROOT, output=OUTPUT, upload=True, max_frames=0):
                                 stopping = True
                                 break
                     finally:
-                        committed.close()
+                        reported.close()
                         stream.close()
-                        # One checkpoint per batch, not per frame: frames committed
-                        # after it are found again by recover_committed, never redone.
-                        # The frames it counts reach the disk first.
-                        processor.flush()
-                        atomic_json(state_path, state)
                     break
                 pending = sum(
-                    (
-                        entry["recorded_rows"] - entry["processed_rows"]
-                        for entry in state["runs"].values()
-                    )
+                    entry["recorded_rows"] - entry["processed_rows"]
+                    for entry in entries.values()
+                    if entry["processed_rows"] is not None
                 )
                 oldest = next(
                     (
-                        frame_time(run.frames.rows[state["runs"][key]["processed_rows"]])
+                        frame_time(run.frames.rows[entries[key]["processed_rows"]])
                         for key, run in sorted(runs.items())
-                        if state["runs"][key]["processed_rows"] < len(run.frames.rows)
+                        if entries[key]["processed_rows"] < len(run.frames.rows)
                     ),
                     None,
                 )
                 oldest_age = 0 if oldest is None else max(0, time.time() - oldest)
                 now = time.monotonic()
                 if now - last_status >= 5 or stopping:
-                    status = dict(
-                        updated_at=time.time(),
-                        state="stopping" if stopping else "running",
-                        processed_this_session=processed,
-                        pending_frames=pending,
-                        oldest_pending_age_seconds=oldest_age,
-                        full_runs_in_memory=len(runs),
-                        average_fps=processed / max(0.001, now - started),
-                        upload_pending=sum(
-                            (1 for _ in (output / "runs" / "outbox").glob("**/*.json"))
-                        ),
-                        upload_error="" if uploader is None else uploader.error,
-                        runs=state["runs"],
-                    )
-                    atomic_json(output / "runs" / "status.json", status)
-                    atomic_json(state_path, state)
                     print(
-                        f"[ANALYSIS {time.strftime('%H:%M:%S')}] processed={processed} pending={pending} avgFPS={status['average_fps']:.2f} oldestAge={oldest_age:.1f}s uploadQ={status['upload_pending']}",
+                        f"[ANALYSIS {time.strftime('%H:%M:%S')}] processed={processed} pending={pending} avgFPS={processed / max(0.001, now - started):.2f} oldestAge={oldest_age:.1f}s uploadQ={0 if uploader is None else uploader.pending()}",
                         flush=True,
                     )
                     if previous_pending is not None and pending > previous_pending + 150:
@@ -3710,52 +3573,18 @@ def run_service(root=ROOT, output=OUTPUT, upload=True, max_frames=0):
                             flush=True,
                         )
                     previous_pending, last_status = (pending, now)
-                if upload and uploader is None and any((output / "runs" / "outbox").glob("**/*.json")):
-                    uploader = UploadWorker(output)
-                if uploader is not None and (not uploader.thread.is_alive()):
-                    raise RuntimeError(
-                        f"Upload worker stopped; pending files retained: {uploader.error}"
-                    )
                 if not did_work:
                     time.sleep(POLL_SECONDS)
         except InterruptedError:
             if not stopping:
                 raise
-        except Exception as exc:
-            failure = str(exc)
-            raise
         finally:
-            if not (processor and processor.unsynced):  # never count frames a failed flush left
-                atomic_json(state_path, state)
             if processor:
                 processor.close()
             if uploader:
                 uploader.close()
-            if previous_uploader:
-                previous_uploader.close()
-            atomic_json(
-                output / "runs" / "status.json",
-                dict(
-                    updated_at=time.time(),
-                    state="failed" if failure else "stopped",
-                    error=failure,
-                    processed_this_session=processed,
-                    average_fps=processed / max(0.001, time.monotonic() - started),
-                    pending_frames=sum(
-                        (
-                            entry["recorded_rows"] - entry["processed_rows"]
-                            for entry in state["runs"].values()
-                        )
-                    ),
-                    upload_pending=sum((1 for _ in (output / "runs" / "outbox").glob("**/*.json"))),
-                    upload_error="" if uploader is None else uploader.error,
-                    runs=state["runs"],
-                ),
-            )
-            print(
-                f"[LIVE] stopped; processed={processed}; committed checkpoint and pending uploads retained",
-                flush=True,
-            )
+            shutil.rmtree(UPLOAD_STAGING, ignore_errors=True)
+            print(f"[LIVE] stopped; processed={processed}", flush=True)
 
 
 if __name__ == "__main__":
