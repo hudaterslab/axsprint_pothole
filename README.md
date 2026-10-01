@@ -267,6 +267,7 @@ python3 auto_update.py          # 코드와 모델 업데이트
 ```
 
 꺼져 있던 시간의 예약 작업을 나중에 몰아서 실행하지는 않습니다.
+실행 결과(코드·모델을 받았는지, 실패 이유)는 단말기의 `live_detection/update.log`에 시각과 함께 남습니다.
 단말기에서 코드를 직접 고치면 그 단말기는 업데이트를 멈춥니다. 고친 내용은 GitLab에 올려 주세요.
 Tailscale 복구에는 `systemctl start tailscaled`와 `tailscale up --timeout=30s`의 sudo 권한(NOPASSWD)이
 필요합니다.
