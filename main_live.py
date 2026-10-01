@@ -593,7 +593,7 @@ class PersistentUploader:
             "ServerAliveCountMax=2",
             f"{self.options.user}@{self.options.host}",
             "python3 -u -c "
-            + shlex.quote(server_transport_source())
+            + shlex.quote(SERVER_TRANSPORT_SOURCE)
             + " --serve "
             + shlex.quote(target),
         ]
@@ -3590,6 +3590,12 @@ def run_service(root=ROOT, upload=True, max_frames=0):
                 uploader.close()
             shutil.rmtree(UPLOAD_STAGING, ignore_errors=True)
             print(f"[LIVE] stopped; processed={processed}", flush=True)
+
+
+# The SSH receiver is built once, from this file as it was when the process started:
+# auto_update.py may replace main_live.py while the analysis runs, and inspect would then
+# read the new file at the old line numbers.
+SERVER_TRANSPORT_SOURCE = server_transport_source()
 
 
 if __name__ == "__main__":
