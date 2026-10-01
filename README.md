@@ -233,13 +233,23 @@ SSD의 수집 데이터는 `runs` 바로가기 대상 경로에 그대로 있습
 
 ## 코드와 모델 업데이트
 
-`auto_update.py` 하나가 GitLab의 `live_detection` 브랜치를 GitHub
-`hudaterslab/axsprint_pothole`의 같은 브랜치로 미러링하고, 단말기 코드와
-Hugging Face `HudatersU/road_maintanance`의 `best_seg.dxnn`을 확인합니다.
+배포는 사내 GitLab `hudaters_lab1/pothole`의 `live_detection` 브랜치에 올리면 됩니다.
+
+```
+사내 GitLab live_detection  →(GitLab 저장소 미러링, push)→  GitHub hudaterslab/axsprint_pothole
+납품 단말기  ←(auto_update.py, 받기만)←  GitHub + Hugging Face
+```
+
+- GitLab → GitHub: GitLab의 설정 > 저장소 > 저장소 미러링에 GitHub 주소를 push 방향으로 등록하고
+  "보호된 브랜치만 미러링"을 켭니다. 보호된 브랜치는 `live_detection` 하나만 두어야 다른 브랜치가
+  공개 GitHub로 나가지 않습니다. GitHub 토큰은 GitLab 미러링 설정에만 넣습니다.
+- 단말기: `auto_update.py`가 공개 GitHub에서 코드를 받고, Hugging Face
+  `HudatersU/road_maintanance`의 `best_seg.dxnn`을 확인하고, Tailscale 접속을 확인·복구합니다.
+  단말기에는 GitLab 주소나 업로드용 인증 정보가 없습니다.
 
 ```bash
 python3 auto_update.py --check  # 파일을 바꾸지 않고 상태 확인
-python3 auto_update.py          # 미러링 후 코드와 모델 업데이트
+python3 auto_update.py          # 코드와 모델 업데이트
 ```
 
 코드는 origin이 위 GitHub 저장소이고 현재 브랜치가 `live_detection`인 Git 작업 폴더에서만
@@ -247,17 +257,19 @@ python3 auto_update.py          # 미러링 후 코드와 모델 업데이트
 모델은 크기와 SHA-256을 검증한 후 교체합니다. 코드나 모델을 바꿔도 실행 중인 수집·분석
 프로세스를 자동으로 재시작하지 않으며, 다음 실행부터 적용됩니다.
 
-운영 단말기는 `hudaters` 사용자의 crontab에 한국 시간(Asia/Seoul) 00시·12시·18시로
-등록되어 있습니다. 별도 실행 도우미 없이 `auto_update.py`를 직접 실행합니다.
+운영 단말기는 `hudaters` 사용자의 crontab에 부팅 2분 뒤와 한국 시간(Asia/Seoul) 00시·12시·18시로
+등록되어 있습니다. 차량 단말기는 예약 시각에 꺼져 있는 경우가 많아 켤 때마다 한 번 확인합니다.
+별도 실행 도우미 없이 `auto_update.py`를 직접 실행합니다.
 
 ```cron
+@reboot sleep 120 && /usr/bin/python3 /home/hudaters/Desktop/live_detection/auto_update.py >> /home/hudaters/Desktop/live_detection/update.log 2>&1
 0 0,12,18 * * * /usr/bin/python3 /home/hudaters/Desktop/live_detection/auto_update.py >> /home/hudaters/Desktop/live_detection/update.log 2>&1
 ```
 
-미러링 인증 정보는 저장소 밖의 사용자 전용 파일에 보관합니다. 다른 브랜치나 태그는 보내지
-않으며, GitHub에 별도 수정이 생겨 이력이 갈라지면 미러링은 덮어쓰지 않고 중단합니다.
-GitLab에 연결할 수 없어도 GitHub에 이미 올라온 코드와 Hugging Face 모델 확인은 계속합니다.
-예약 시각에 단말기가 켜져 있어야 실행되며, 꺼져 있던 시간의 작업을 나중에 몰아서 실행하지는 않습니다.
+꺼져 있던 시간의 예약 작업을 나중에 몰아서 실행하지는 않습니다.
+단말기에서 코드를 직접 고치면 그 단말기는 업데이트를 멈춥니다. 고친 내용은 GitLab에 올려 주세요.
+Tailscale 복구에는 `systemctl start tailscaled`와 `tailscale up --timeout=30s`의 sudo 권한(NOPASSWD)이
+필요합니다.
 
-새 단말기를 복제한 것만으로 이 예약 작업이나 미러링 인증 정보가 설치되지는 않습니다.
+새 단말기를 복제한 것만으로 이 예약 작업과 sudo 권한이 설치되지는 않습니다.
 수동 확인과 업데이트에는 위의 `auto_update.py` 명령을 사용하세요.

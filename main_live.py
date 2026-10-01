@@ -58,7 +58,7 @@ import urllib.request
 import uuid
 import zlib
 
-POTHOLE_DEPTH_M = 0.01  # a pothole must be at least this deep below the road around it
+POTHOLE_DEPTH_M = 0.005  # a pothole must be at least this deep below the road around it
 
 PROJECT = Path(__file__).resolve().parent
 
