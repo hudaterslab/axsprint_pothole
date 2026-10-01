@@ -1,10 +1,13 @@
-"""live_detection 단말기 업데이트. --check는 파일/설정을 변경하지 않습니다.
+"""GitLab 미러링과 live_detection 단말기 업데이트.
+
+--check는 파일/설정을 변경하지 않습니다.
 
 모델 교체 후 실행 중인 main_live.py가 새 모델을 사용하려면 재실행이 필요합니다.
 이 스크립트는 수집/분석 프로세스를 자동으로 재시작하지 않습니다.
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -25,6 +28,9 @@ HF_MODELS = ["best_seg.dxnn"]
 TAILSCALE_IP = "100.66.125.121"
 GITHUB_URL = "https://github.com/hudaterslab/axsprint_pothole.git"
 GITHUB_BRANCH = "live_detection"
+GITLAB_URL = "http://192.168.1.173/hudaters_lab1/pothole.git"
+MIRROR_CACHE_DIR = Path.home() / ".local/share/axsprint-mirror"
+GITHUB_TOKEN_FILE = Path.home() / ".config/axsprint-mirror/github_token"
 
 
 def log(message):
@@ -41,12 +47,90 @@ def run_command(command, *, timeout=30, env=None):
     return result.stdout.strip()
 
 
+def mirror_git(*args, token=None):
+    """GitHub 전송에만 인증 정보를 전달하며 Git 설정이나 로그에는 남기지 않습니다."""
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith("GIT_") and key != "GITHUB_TOKEN"}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    encoded = ""
+    if token:
+        encoded = base64.b64encode(f"shpark-hudaters:{token}".encode()).decode()
+        env.update({
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": "",
+            "GIT_CONFIG_KEY_1": "http.https://github.com/.extraheader",
+            "GIT_CONFIG_VALUE_1": f"AUTHORIZATION: basic {encoded}",
+        })
+    result = subprocess.run(["git", *args], capture_output=True, text=True,
+                            timeout=120, env=env)
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+        if token:
+            detail = detail.replace(token, "[REDACTED]").replace(encoded, "[REDACTED]")
+        raise RuntimeError(detail)
+    return result.stdout.strip()
+
+
+def mirror_remote_sha(url):
+    ref = f"refs/heads/{GITHUB_BRANCH}"
+    rows = mirror_git("ls-remote", "--exit-code", url, ref).splitlines()
+    values = [row.split()[0] for row in rows if row.split()[-1] == ref]
+    if len(values) != 1 or not re.fullmatch(r"[0-9a-f]{40,64}", values[0]):
+        raise RuntimeError(f"{GITHUB_BRANCH} 브랜치 조회 실패")
+    return values[0]
+
+
+def mirror_gitlab(check_only=False):
+    """live_detection만 미러링합니다. GitHub의 별도 수정은 덮어쓰지 않습니다."""
+    source = mirror_remote_sha(GITLAB_URL)
+    target = mirror_remote_sha(GITHUB_URL)
+    if source == target:
+        log(f"미러링: {GITHUB_BRANCH} 최신 상태")
+        return
+    if check_only:
+        log(f"미러링: GitLab/GitHub 커밋 차이 확인 ({target[:12]} → {source[:12]}). "
+            "확인 모드이므로 다운로드/전송하지 않습니다.")
+        return
+    if GITHUB_TOKEN_FILE.stat().st_mode & 0o077:
+        raise RuntimeError("토큰 파일 권한은 600이어야 합니다.")
+    token = GITHUB_TOKEN_FILE.read_text().strip()
+    if not token:
+        raise RuntimeError("GitHub 인증 토큰이 비어 있습니다.")
+    MIRROR_CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    repo = MIRROR_CACHE_DIR / "repository.git"
+    if not repo.exists():
+        mirror_git("init", "--bare", str(repo))
+    if mirror_git("-C", str(repo), "rev-parse", "--is-bare-repository") != "true":
+        raise RuntimeError("미러링 캐시가 bare 저장소가 아닙니다.")
+    source_ref = f"refs/heads/{GITHUB_BRANCH}"
+    target_ref = f"refs/remotes/github/{GITHUB_BRANCH}"
+    mirror_git("-C", str(repo), "fetch", "--no-tags", GITLAB_URL,
+               f"+{source_ref}:{source_ref}")
+    mirror_git("-C", str(repo), "fetch", "--no-tags", GITHUB_URL,
+               f"+{source_ref}:{target_ref}")
+    source = mirror_git("-C", str(repo), "rev-parse", source_ref)
+    target = mirror_git("-C", str(repo), "rev-parse", target_ref)
+    if source == target:
+        log(f"미러링: {GITHUB_BRANCH} 최신 상태")
+        return
+    mirror_git("-C", str(repo), "merge-base", "--is-ancestor", target, source)
+    # 위 검사 이후 원격이 바뀌는 경우에도 덮어쓰지 않도록 lease를 사용합니다.
+    mirror_git("-C", str(repo), "push", f"--force-with-lease={source_ref}:{target}",
+               GITHUB_URL, f"{source}:{source_ref}", token=token)
+    if mirror_remote_sha(GITHUB_URL) != source:
+        raise RuntimeError("GitHub 전송 후 커밋 확인 실패")
+    log(f"미러링 완료: {GITHUB_BRANCH} {target[:12]} → {source[:12]}")
+
+
 def update_github(check_only=False):
     """지정한 브랜치만 fast-forward로 갱신하며 단말기 수정은 덮어쓰지 않습니다."""
     def git(*args, timeout=30):
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        if check_only:
+            env["GIT_OPTIONAL_LOCKS"] = "0"
         return run_command(
             ["git", "-C", str(WORK_DIR), *args], timeout=timeout,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            env=env,
         )
 
     if not (WORK_DIR / ".git").exists():
@@ -191,7 +275,7 @@ def check_tailscale(check_only=False):
 def run_updates(check_only):
     success = True
     # 각 작업의 실패를 분리하여 네트워크 오류가 다른 점검을 막지 않습니다.
-    for task in (check_tailscale, update_github, update_huggingface):
+    for task in (check_tailscale, mirror_gitlab, update_github, update_huggingface):
         try:
             task(check_only=check_only)
         except Exception as exc:
@@ -209,6 +293,7 @@ def main():
         return 1
     if args.check:
         return run_updates(True)
+    os.umask(0o077)
     # Linux 단말기에서 중복 실행으로 모델 교체가 겹치지 않게 합니다.
     import fcntl
 
