@@ -3,8 +3,8 @@
 Run: python3 -u main_live.py
 Input: /mnt/ssd/porthole_runs/YYYYMMDD/run/{frames,lidar,gps,meta}
 Only frames recorded after the start are analysed, in order; older ones are skipped.
-Detected images are listed in DETECTIONS_CSV, and their JPG/JSON/PCAP go to the server
-when it is reachable; nothing else is kept on the terminal.
+Detected images are listed in a CSV in each date folder (DETECTIONS_CSV), and their
+JPG/JSON/PCAP go to the server when it is reachable; nothing else is kept on the terminal.
 No other project Python file is imported or executed.
 Model/calibration files and installed NumPy/OpenCV/DEEPX runtime are data/runtime
 dependencies. PTP synchronizes clocks; GPS speed, when available, compensates
@@ -64,9 +64,10 @@ PROJECT = Path(__file__).resolve().parent
 
 ROOT = Path("/mnt/ssd/porthole_runs")  # collector recordings
 
-# The only file the analysis keeps on the terminal: time, image and damage types of each
-# frame with newly confirmed damage, whether or not the server could be reached.
-DETECTIONS_CSV = Path("/mnt/ssd/porthole_detections.csv")
+# The only file the analysis keeps on the terminal, one per date folder of the recordings
+# (ROOT/YYYYMMDD/): time, image and damage types of each frame with newly confirmed
+# damage, whether or not the server could be reached.
+DETECTIONS_CSV = "porthole_detections.csv"
 
 # A frame's JPG/JSON/PCAP wait here, in RAM (/tmp is tmpfs), only until they are sent.
 UPLOAD_STAGING = Path("/tmp/porthole_upload")
@@ -2991,7 +2992,7 @@ class LiveProcessor:
                        reported_count=len(report_detections))
         if not report_detections:
             return summary
-        self.log.add(timestamp, image_path, report_detections)
+        self.log.add(key, timestamp, image_path, report_detections)
         if self.uploader is None or not self.uploader.accepting():
             return summary
         folder = UPLOAD_STAGING / key / f"{index:08d}"
@@ -3058,17 +3059,17 @@ class LiveProcessor:
 
 
 class DetectionLog:
-    """DETECTIONS_CSV: time (KST), image (path under the recording root) and damage types
-    of each frame with newly confirmed damage."""
+    """<date folder>/DETECTIONS_CSV: time (KST), image (path in the date folder) and damage
+    types of each frame with newly confirmed damage. The date folder is the run's, so a run
+    that goes past midnight stays with its own date."""
 
-    def __init__(self, path, root):
-        self.path, self.root = (Path(path), Path(root))
-        self.stream = None
-        self.open()
+    def __init__(self, root):
+        self.root = Path(root)
+        self.path = self.stream = None
 
-    def open(self):
-        if self.stream:
-            self.stream.close()
+    def open(self, path):
+        self.close()
+        self.path = path
         if self.path.exists():
             with self.path.open("r+b") as stream:
                 size = stream.seek(0, os.SEEK_END)
@@ -3091,19 +3092,23 @@ class DetectionLog:
         self.stream.flush()
         os.fdatasync(self.stream.fileno())
 
-    def add(self, timestamp, image_path, detections):
-        if not self.path.exists():  # deleted while running: start a new file
-            self.open()
+    def add(self, key, timestamp, image_path, detections):
+        folder = self.root / Path(key).parts[0]
+        path = folder / DETECTIONS_CSV
+        if path != self.path or not path.exists():  # a new date, or deleted while running
+            self.open(path)
         image = Path(image_path)
-        if image.is_relative_to(self.root):
-            image = image.relative_to(self.root)
+        if image.is_relative_to(folder):
+            image = image.relative_to(folder)
         kinds = sorted({"pothole" if int(d.class_id) == 1 else "crack" for d in detections})
         self.writer.writerow((camera_time_kst(timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
                               image.as_posix(), "+".join(kinds)))
         self.sync()
 
     def close(self):
-        self.stream.close()
+        if self.stream:
+            self.stream.close()
+            self.stream = None
 
 
 UPLOAD_SETTINGS = (
@@ -3410,7 +3415,7 @@ def run_service(root=ROOT, upload=True, max_frames=0):
     root = Path(root).resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Recording root is unavailable: {root}")
-    if str(DETECTIONS_CSV).startswith("/mnt/ssd/") and (not os.path.ismount("/mnt/ssd")):
+    if str(root).startswith("/mnt/ssd/") and (not os.path.ismount("/mnt/ssd")):
         raise RuntimeError("SSD is not mounted")
     start_bytes = {}  # run -> size of its frames.jsonl at the start
     for manifest in root.glob("*/*/frames/frames.jsonl"):
@@ -3431,7 +3436,7 @@ def run_service(root=ROOT, upload=True, max_frames=0):
             previous = signal.signal(sig, stop)
             resources.callback(signal.signal, sig, previous)
         shutil.rmtree(UPLOAD_STAGING, ignore_errors=True)  # frames an earlier start left unsent
-        log = resources.enter_context(closing(DetectionLog(DETECTIONS_CSV, root)))
+        log = resources.enter_context(closing(DetectionLog(root)))
         # The recorder always comes first: lowest CPU share and idle-class disk I/O.
         os.nice(10)
         if shutil.which("ionice"):
@@ -3446,7 +3451,7 @@ def run_service(root=ROOT, upload=True, max_frames=0):
         source_finished_at = None
         print(
             f"[LIVE] root={root} upload={upload}; frames written from now on; "
-            f"detections: {DETECTIONS_CSV}",
+            f"detections: {root}/<date>/{DETECTIONS_CSV}",
             flush=True,
         )
         try:

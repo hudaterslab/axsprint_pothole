@@ -123,7 +123,7 @@ Ubuntu 22.04 Lubuntu(LXQt), 사용자 `hudaters`, 라이다 포트 `enp1s0`(`/de
 라이다, 카메라, 라벨이 `porthole`인 ext4 USB SSD를 연결한 뒤 실행하세요.
 
 ```bash
-git clone -b live_detection https://github.com/hudaterslab/pothole.git ~/Desktop/live_detection
+git clone -b live_detection https://github.com/hudaterslab/axsprint_pothole.git ~/Desktop/live_detection
 cd ~/Desktop/live_detection
 sudo ./install.sh --dry-run   # 바뀔 내용만 확인
 sudo ./install.sh
@@ -189,11 +189,13 @@ GPS 속도가 없으면(실내 등) 보정 없이 깊이를 측정합니다. 정
 
 `main_live.py`는 시작한 시점 이후에 녹화된 프레임만 분석합니다. 단말기가 갑자기 꺼져서 분석하지 못한
 프레임이 남아 있어도, 다시 켜면 그 프레임은 건너뛰고 새로 들어오는 프레임부터 분석합니다.
-단말기에는 분석 결과를 저장하지 않고, 검출된 이미지 목록 `/mnt/ssd/porthole_detections.csv`만 남깁니다.
+단말기에는 분석 결과를 저장하지 않고, 녹화 날짜 폴더마다 검출된 이미지 목록
+`/mnt/ssd/porthole_runs/<날짜>/porthole_detections.csv`만 남깁니다(검출이 없는 날은 만들지 않음).
 추적 객체를 처음 확인한 프레임마다 한 줄이며, 서버로 보냈는지와 상관없이 적습니다.
+날짜는 run 폴더를 따르므로, 자정을 넘긴 run의 검출도 그 run의 날짜 폴더에 적습니다.
 
 - `time`: 촬영 시각(KST)
-- `image`: `/mnt/ssd/porthole_runs` 아래 이미지 경로(예: `20260930/20260930_2240/frames/00001725.jpg`)
+- `image`: 날짜 폴더 안의 이미지 경로(예: `20260930_2240/frames/00001725.jpg`)
 - `objects`: `crack`, `pothole` 또는 `crack+pothole`
 
 ## 서버 전송
@@ -228,3 +230,24 @@ API 서버가 정해지면 위 요청 형식(항목 이름, 헤더, 응답 코�
 `/home/hudaters/ptp_pothole_archive/` 아래 정리 날짜 폴더로 옮겼습니다.
 실제 systemd 서비스 설정은 `/etc/systemd/system/`에 유지합니다.
 SSD의 수집 데이터는 `runs` 바로가기 대상 경로에 그대로 있습니다.
+
+## 코드와 모델 업데이트
+
+`auto_update.py`는 GitHub `hudaterslab/axsprint_pothole`의 `live_detection` 브랜치와
+Hugging Face `HudatersU/road_maintanance`의 `best_seg.dxnn`을 확인합니다.
+
+```bash
+python3 auto_update.py --check  # 파일을 바꾸지 않고 상태 확인
+python3 auto_update.py          # 코드와 모델 업데이트
+```
+
+코드는 origin이 위 GitHub 저장소이고 현재 브랜치가 `live_detection`인 Git 작업 폴더에서만
+갱신합니다. 커밋되지 않은 수정, 분기된 이력, 기존 파일과 충돌이 있으면 덮어쓰지 않고 중단합니다.
+모델은 크기와 SHA-256을 검증한 후 교체합니다. 코드나 모델을 바꿔도 실행 중인 수집·분석
+프로세스를 자동으로 재시작하지 않으며, 다음 실행부터 적용됩니다.
+
+예약 실행은 별도 등록이 필요합니다. 하루 00시·12시·18시 예시:
+
+```cron
+0 0,12,18 * * * /usr/bin/python3 /home/hudaters/Desktop/live_detection/auto_update.py >> /home/hudaters/Desktop/live_detection/update.log 2>&1
+```

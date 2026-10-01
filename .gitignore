@@ -7,3 +7,4 @@ __pycache__/
 *.dxnn
 # Per-unit settings (upload server, API keys); see .env.example.
 .env
+update.log
