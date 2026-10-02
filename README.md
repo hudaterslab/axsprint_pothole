@@ -6,7 +6,9 @@
 live_detection/
   main_live.py      실시간 포트홀 탐지 (카메라 탐지 + 라이다 깊이 측정)
   camera_calib_best_effort.json   카메라 렌즈 보정값과 카메라 위치·방향 (라이다 바로 아래 9 cm, main_live.py가 읽음)
-  XT32_Angle_Correction_File.csv      라이다 채널 각도 (main_live.py가 읽음)
+  XT32_Angle_Correction_File.csv      라이다 채널 각도 (main_live.py가 읽음). 이 단말기 라이다(SN XT4BCC56E14BCC23)의
+                                      공장 보정값으로, 센서에서 읽은 값입니다(PTC 명령 0x05). 라이다마다 값이 달라서
+                                      다른 단말기는 그 라이다에서 읽은 값으로 바꿔야 합니다.
   best_seg.dxnn     main_live.py 모델 (저장소에 넣지 않음, ./download_models.sh로 받음)
   download_models.sh   모델 다운로드 (Hugging Face HudatersU/road_maintanance, sha256 확인)
   .env.example      main_live.py 설정 예시 (.env로 복사해 채움, .env는 저장소 제외)

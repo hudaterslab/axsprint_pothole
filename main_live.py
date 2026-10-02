@@ -2072,7 +2072,7 @@ lidar__XT32_CHANNELS = 32
 
 lidar__XT32_TAIL_OFFSET = 1052
 
-lidar__XT32_LASER_FIRETIME_US = [1.512 * i + 0.368 for i in range(32)]
+lidar__XT32_LASER_FIRETIME_US = [1.512 * i + 6.0 for i in range(32)]  # Hesai XT firetime correction file: 6.0 .. 52.872 us
 
 lidar__XT_COORD_H_M = 0.0315
 

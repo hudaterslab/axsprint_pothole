@@ -31,7 +31,8 @@ lidar_pcap_seconds: 10.0
 lidar_pcap_queue_size: 8
 lidar_fov_filter_enabled: true
 # LiDAR azimuth of the camera optical axis (camera_calib_best_effort.json: 180 deg).
-# 75 deg each side keeps the whole image (108.6..243.9 deg) plus a few degrees.
+# 75 deg each side (105..255 deg) keeps every part of the image the LiDAR reaches on the road
+# (111.8..244.2 deg); only the image corners (104.3..251.1 deg) go further, beyond the LiDAR's reach.
 camera_forward_offset_deg: -180.0
 lidar_h_margin_deg: 75.0
 gps_device: auto

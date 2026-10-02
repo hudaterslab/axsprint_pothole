@@ -56,12 +56,12 @@ HEIGHT_RANGE_CM = 5.0  # color range ±cm, as replay_certifcate.py
 # by main_live.py): the camera sits 9 cm directly below the LiDAR with its axes aligned
 # (optical axis = LiDAR -Y). Update both together if the camera or LiDAR mount changes.
 CAMERA = dict(
-    fx=904.1,
-    fy=904.1,
-    cx=983.8,
-    cy=536.8,
-    k1=-0.0127,
-    k2=-0.02,
+    fx=909.7,
+    fy=909.7,
+    cx=984.3,
+    cy=535.2,
+    k1=-0.0308,
+    k2=-0.0088,
     R_sensor_to_cam=[
         [-1.0, 0.0, 0.0],
         [0.0, 0.0, -1.0],
@@ -92,7 +92,7 @@ XT32_BODY_OFFSET = 12
 XT32_BLOCK_LEN = 130
 XT32_BLOCKS = 8
 XT32_TAIL_OFFSET = 1052
-XT32_FIRETIME_US = [1.512 * i + 0.368 for i in range(32)]
+XT32_FIRETIME_US = [1.512 * i + 6.0 for i in range(32)]  # Hesai XT firetime correction file: 6.0 .. 52.872 us
 XT_COORD_H_M = 0.0315
 XT_COORD_B_M = 0.013
 RETURN_SELECTION = "last"
