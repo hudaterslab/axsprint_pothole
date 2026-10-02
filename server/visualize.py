@@ -164,8 +164,8 @@ def decode_xt32(pcap_path, calibration):
     points its road plane is fitted to (None when the scan misses the camera's optical
     axis): the firing nearest PLANE_CENTER_AZIMUTH_RAW and PLANE_SIDE_FIRINGS firings
     on each side, every channel (main_live.plane_points); each point's PCAP record
-    time (main_live's point_timestamps); and the points on or next to lane paint
-    (near_paint), which do not count as deep pothole points."""
+    time (main_live's point_timestamps); and the paint zone (paint_zone), whose points
+    count as deep pothole points only from PAINT_DEPTH_M."""
     records = list(xt32_payloads(pcap_path))
     if not records:
         raise ValueError("PCAP has no XT32 packets")
@@ -211,7 +211,7 @@ def decode_xt32(pcap_path, calibration):
     point_firing = np.broadcast_to(firing[:, :, None], keep.shape)[keep]
     channel = np.broadcast_to(np.arange(1, XT32_CHANNELS + 1)[None, None, :], keep.shape)[keep]
     firing_azimuth = raw_az100[block_ok]
-    painted = near_paint(channel, firing_azimuth, point_firing, lasers[..., 2][keep])
+    painted = paint_zone(channel, firing_azimuth, point_firing, lasers[..., 2][keep])
     if not len(firing_azimuth):
         return xyz, None, times, painted
     error = np.abs((firing_azimuth - PLANE_CENTER_AZIMUTH_RAW + 18000) % 36000 - 18000)
@@ -221,13 +221,14 @@ def decode_xt32(pcap_path, calibration):
     return xyz, np.abs(point_firing - center) <= PLANE_SIDE_FIRINGS, times, painted
 
 
-def near_paint(channel, firing_azimuth, firing, reflectivity):
-    """main_live.py's near_paint(): points on lane paint or within PAINT_EDGE_FIRINGS
-    firings of it on the same channel, found by the firings' azimuth."""
+def paint_zone(channel, firing_azimuth, firing, reflectivity):
+    """main_live.py's paint_zone(): points on lane paint (reflectivity >= PAINT_REFLECTIVITY)
+    or within PAINT_EDGE_FIRINGS firings of it on the same channel, found by the firings'
+    azimuth."""
     azimuth = np.asarray(firing_azimuth, np.int64)
     steps = np.diff(azimuth) % 36000
     step = float(np.median(steps[steps > 0])) if np.any(steps > 0) else 36.0
-    return azimuth_near(channel, azimuth[firing], reflectivity > PAINT_REFLECTIVITY,
+    return azimuth_near(channel, azimuth[firing], reflectivity >= PAINT_REFLECTIVITY,
                         (PAINT_EDGE_FIRINGS + 0.5) * step)
 
 
@@ -285,11 +286,11 @@ MOTION_MAX_PACKET_AGE_SEC = 0.15
 OFFSET_SEC = 0.033
 # main_live.py's pothole check (measure_mask_local_depth): points of the pothole mask
 # POTHOLE_DEPTH_M or more below a robust plane through the road POTHOLE_RING_M (metres)
-# around it, not counting lane paint and the PAINT_EDGE_FIRINGS points next to it on
-# the same channel (the LiDAR reads the asphalt after bright paint about 1 cm deep).
-# The label shows how many there are (the terminal needs 3).
+# around it; in the paint zone (reflectivity PAINT_REFLECTIVITY or more, and the
+# PAINT_EDGE_FIRINGS points next to it on the same channel, which the LiDAR reads up to
+# ~1.5 cm deep) PAINT_DEPTH_M or more. The label shows how many (the terminal needs 3).
 POTHOLE_DEPTH_M, POTHOLE_RING_M = 0.010, (0.10, 0.30)
-PAINT_REFLECTIVITY, PAINT_EDGE_FIRINGS = 30, 2
+PAINT_REFLECTIVITY, PAINT_EDGE_FIRINGS, PAINT_DEPTH_M = 15, 5, 0.020
 
 
 def road_plane(xyz, selected):
@@ -543,8 +544,8 @@ def render(json_path, output_path):
             if kind == "pothole":
                 inside = visible[mask[uv[:, 1], uv[:, 0]]]
                 depths = local_depths(road, pixels, visible, inside, exclusion) if len(inside) else None
-                deep_points[ann["id"]] = (None if depths is None
-                                          else int(np.sum((depths >= POTHOLE_DEPTH_M) & ~painted[inside])))
+                deep_points[ann["id"]] = (None if depths is None else int(np.sum(
+                    depths >= np.where(painted[inside], PAINT_DEPTH_M, POTHOLE_DEPTH_M))))
     except (OSError, ValueError) as exc:
         lidar_missing = str(exc)
 
@@ -557,7 +558,7 @@ def render(json_path, output_path):
         label = f"{kind.upper()} #{ann['id']}"
         if kind == "pothole" and ann["id"] in deep_points:
             count = deep_points[ann["id"]]
-            label += " | depth n/a" if count is None else f" | points >= 1 cm deep: {count}"
+            label += " | depth n/a" if count is None else f" | deep points (1 cm, paint 2 cm): {count}"
         if hasattr(painter, "textbbox"):
             left, top, right, bottom = painter.textbbox((0, 0), label, font=font)
         else:  # Pillow 7.x

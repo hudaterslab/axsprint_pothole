@@ -129,12 +129,15 @@ PLANE_MAX_TILT_DEG = 15.0  # from RoadPlaneSettings.expected_normal
 POTHOLE_RING_M = (0.10, 0.30)
 POTHOLE_MIN_POINTS = 3
 POTHOLE_MAX_RISE_M = 0.005
-# Lane paint reflects strongly, and the LiDAR reads the asphalt right after it about 1 cm too
-# deep (2026-10-02: a crosswalk stripe passed on 8 such points). Paint returns (reflectivity
-# above PAINT_REFLECTIVITY) and the points within PAINT_EDGE_FIRINGS firings of them on the
-# same channel do not count as deep points.
-PAINT_REFLECTIVITY = 30
-PAINT_EDGE_FIRINGS = 2
+# Lane paint, worn paint too, reflects more than asphalt, and the LiDAR reads it up to about
+# 1.5 cm too deep, and the asphalt for a few firings after it as well (2026-10-02: crosswalks
+# 16821 and 17293, dashed line 17239). Points of the paint zone - returns with reflectivity
+# PAINT_REFLECTIVITY or more and the points within PAINT_EDGE_FIRINGS firings of them on the
+# same channel - count as deep only from PAINT_DEPTH_M; elsewhere from POTHOLE_DEPTH_M. The
+# real pothole of that drive (frame 7622) is about 2 cm deep with bright debris (reflectivity ~16).
+PAINT_REFLECTIVITY = 15
+PAINT_EDGE_FIRINGS = 5
+PAINT_DEPTH_M = 0.020
 
 
 def server_transport_source():
@@ -1945,8 +1948,9 @@ def fit_spatial_road_plane(xyz, selected=None, settings=RoadPlaneSettings()):
     return (normal, offset, quality)
 
 
-def near_paint(points):
-    """Points on lane paint or within PAINT_EDGE_FIRINGS firings of it on the same channel.
+def paint_zone(points):
+    """Points on lane paint (reflectivity >= PAINT_REFLECTIVITY) or within PAINT_EDGE_FIRINGS
+    firings of it on the same channel.
 
     Neighbours are found by the firings' azimuth, not their order, so a lost packet never
     makes firings that are far apart look adjacent.
@@ -1954,7 +1958,7 @@ def near_paint(points):
     azimuth = points.firing_azimuth_raw.astype(np.int64)
     steps = np.diff(azimuth) % 36000
     step = float(np.median(steps[steps > 0])) if np.any(steps > 0) else 36.0
-    return azimuth_near(points.channel, azimuth[points.firing], points.reflectivity > PAINT_REFLECTIVITY,
+    return azimuth_near(points.channel, azimuth[points.firing], points.reflectivity >= PAINT_REFLECTIVITY,
                         (PAINT_EDGE_FIRINGS + 0.5) * step)
 
 
@@ -1974,15 +1978,15 @@ def azimuth_near(channel, azimuth, marked, reach):
 
 
 def measure_mask_local_depth(road, pixels, visible_indices, indices, exclusion, threshold_m,
-                             ignored=None):
+                             paint=None):
     """Depth of a pothole's LiDAR points below the road around it, and whether it counts.
 
     The reference is every visible point outside all detection masks whose distance on
     the road to the nearest pothole point is within POTHOLE_RING_M. A robust plane through
     their 5 cm cell medians is the local road; each pothole point's depth is its distance
     below it. The pothole counts (info["accepted"]) when at least POTHOLE_MIN_POINTS of its
-    points, not counting the ignored ones (near_paint), are threshold_m or more below it
-    and the median of all its points is at most POTHOLE_MAX_RISE_M
+    points are deep - threshold_m or more below it, PAINT_DEPTH_M for points of the paint
+    zone (paint_zone mask over all points) - and the median of all its points is at most POTHOLE_MAX_RISE_M
     above it (a raised object is no pothole). reference_noise_m (robust spread of the
     reference road) is kept as evidence of how well it was measured.
     """
@@ -2023,17 +2027,18 @@ def measure_mask_local_depth(road, pixels, visible_indices, indices, exclusion, 
     measured[:, 2] = (measured[:, 2] - ((measured[:, :2] - origin) @ coef[:2] + coef[2])) / norm
     residual = (reps[:, 2] - A @ coef) / norm
     depth = -measured[:, 2]
-    deep = depth >= threshold_m
-    painted = np.zeros(len(indices), bool) if ignored is None else ignored[indices]
+    in_paint = np.zeros(len(indices), bool) if paint is None else paint[indices]
+    deep = depth >= np.where(in_paint, PAINT_DEPTH_M, threshold_m)
     info.update(
         local_coefficients=coef.tolist(),
         local_origin_xy_m=origin.tolist(),
         reference_noise_m=max(0.002, 1.4826 * float(np.median(abs(residual - np.median(residual))))),
-        points_at_threshold=int(np.sum(deep & ~painted)),
-        deep_points_near_paint=int(np.sum(deep & painted)),
+        points_at_threshold=int(np.sum(deep)),
+        paint_points=int(np.sum(in_paint)),
+        paint_points_below_paint_depth=int(np.sum(in_paint & (depth >= threshold_m) & ~deep)),
         max_depth_m=float(depth.max()),
         median_depth_m=float(np.median(depth)),
-        accepted=bool(np.sum(deep & ~painted) >= POTHOLE_MIN_POINTS
+        accepted=bool(np.sum(deep) >= POTHOLE_MIN_POINTS
                       and np.median(depth) >= -POTHOLE_MAX_RISE_M),
     )
     return (measured, info)
@@ -2609,7 +2614,7 @@ def validate_objects(detections, result, camera, threshold_m=POTHOLE_DEPTH_M):
     masks = [np.asarray(d.mask, bool) for d in detections if d.mask is not None]
     exclusion = np.logical_or.reduce(masks) if masks else None
     accepted, objects, audit = ([], [], [])
-    painted = None  # near_paint() of the scan, made once for the frame's first pothole
+    paint = None  # paint_zone() of the scan, made once for the frame's first pothole
     for i, d in enumerate(detections):
         indices = np.empty(0, int)
         if result is not None and d.mask is not None:
@@ -2647,8 +2652,8 @@ def validate_objects(detections, result, camera, threshold_m=POTHOLE_DEPTH_M):
         local = {}
         global_maximum = maximum
         if int(d.class_id) == 1 and len(indices):
-            if painted is None:
-                painted = near_paint(result["points"])
+            if paint is None:
+                paint = paint_zone(result["points"])
             measured, local = measure_mask_local_depth(
                 result["road_xyz_m"],
                 pixels,
@@ -2656,7 +2661,7 @@ def validate_objects(detections, result, camera, threshold_m=POTHOLE_DEPTH_M):
                 indices,
                 exclusion,
                 threshold_m,
-                painted,
+                paint,
             )
             road = np.empty((0, 3)) if measured is None else measured
             maximum = None if measured is None else local["max_depth_m"]
