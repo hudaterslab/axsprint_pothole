@@ -56,11 +56,11 @@ HEIGHT_RANGE_CM = 5.0  # color range ±cm, as replay_certifcate.py
 # by main_live.py): the camera sits 9 cm directly below the LiDAR with its axes aligned
 # (optical axis = LiDAR -Y). Update both together if the camera or LiDAR mount changes.
 CAMERA = dict(
-    fx=980.388,
-    fy=980.388,
-    cx=989.0,
-    cy=536.0,
-    k1=-0.07,
+    fx=904.1,
+    fy=904.1,
+    cx=983.8,
+    cy=536.8,
+    k1=-0.0127,
     k2=-0.02,
     R_sensor_to_cam=[
         [-1.0, 0.0, 0.0],
