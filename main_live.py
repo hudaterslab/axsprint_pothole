@@ -1759,7 +1759,14 @@ def save_detection_frame(directory, source_image, image, row, key,
 
 
 def detection_frame_stem(row):
-    return f"frame_{int(row['timestamp_ns'])}_{int(row['frame_index']):08d}"
+    """frame_<KST date>_<time>_<ms> of the camera time, e.g. frame_20261002_101345_123.
+
+    The same moment as the CSV time; frames are 33 ms apart, so the milliseconds keep the
+    names of one run unique. The frame number is in the JSON record_id.
+    """
+    ns = int(row["timestamp_ns"])
+    moment = datetime.fromtimestamp(ns // 1_000_000_000, timezone.utc).astimezone(KST)
+    return f"frame_{moment:%Y%m%d_%H%M%S}_{ns // 1_000_000 % 1000:03d}"
 
 
 def save_scan_pcap(destination, sources, start, end):

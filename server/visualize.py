@@ -5,7 +5,8 @@ Draw main_live.py report frames the way codecode/replay_certifcate.py draws
 its replayed/lidar_images: the received JPG with the detection areas and the
 LiDAR points of the frame's PCAP, colored by height from the fitted road plane.
 
-main_live.py uploads one frame_<capture ns>_<frame 8 digits>.jpg/.json/.pcap
+main_live.py uploads one frame_<KST date>_<time>_<ms>.jpg/.json/.pcap (until
+2026-10-02: frame_<capture ns>_<frame 8 digits>)
 per reported frame to model_detections/porthole_live_analysis*/<date>/<run>/
 certifcate/. Images go to OUTPUT_ROOT/<upload folder>/<date>/<run>/ with the
 same name; frames already drawn are skipped, so running it again only draws
@@ -28,6 +29,7 @@ import math
 import os
 import struct
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 
@@ -322,6 +324,20 @@ def compensate(xyz, times, normal, target, speed):
     return xyz + dt[:, None] * velocity, None
 
 
+KST = timezone(timedelta(hours=9))
+
+
+def capture_time(stem):
+    """Camera time (Unix seconds) in main_live's file name: frame_<KST date>_<time>_<ms>, or
+    frame_<capture ns>_<frame> before 2026-10-02. The new names keep milliseconds (<= 1 cm
+    of compensation at 10 m/s)."""
+    parts = stem.split("_")
+    if len(parts) == 3:
+        return int(parts[1]) / 1e9
+    moment = datetime.strptime(parts[1] + parts[2], "%Y%m%d%H%M%S").replace(tzinfo=KST)
+    return moment.timestamp() + int(parts[3]) / 1000
+
+
 # =============================================================================
 # Drawing (replay_certifcate.py)
 # =============================================================================
@@ -417,7 +433,7 @@ def render(json_path, output_path):
         normal, offset = road_plane(xyz, selected)
         heights = xyz @ normal + offset  # compensation moves points along the road only
         speed = (doc.get("gps") or {}).get("speed_mps")
-        target = int(json_path.stem.split("_")[1]) / 1e9 - OFFSET_SEC  # frame_<capture ns>_<frame>
+        target = capture_time(json_path.stem) - OFFSET_SEC
         moved, reason = compensate(xyz, times, normal, target, speed)
         motion = (f"motion compensated at {speed:.1f} m/s" if moved is not None
                   else f"not motion compensated: {reason}")
