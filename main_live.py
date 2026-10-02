@@ -98,7 +98,7 @@ CAMERA_CALIBRATION = PROJECT / "camera_calib_best_effort.json"  # lens and camer
 
 LIDAR_CALIBRATION = PROJECT / "XT32_Angle_Correction_File.csv"
 
-CONFIDENCE_THRESHOLD = 0.25
+CONFIDENCE_THRESHOLD = 0.40  # model detections below this are ignored (0.25 until 2026-10-02)
 
 SCAN_SEARCH_HALF_WINDOW_SEC = 0.1
 

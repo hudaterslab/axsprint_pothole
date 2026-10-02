@@ -556,6 +556,8 @@ def render(json_path, output_path):
             painter.line(polygon + [polygon[0]], fill=color, width=line_width)
         painter.rectangle((x0, y0, x1, y1), outline=color, width=line_width)
         label = f"{kind.upper()} #{ann['id']}"
+        if ann.get("confidence") is not None:
+            label += f" conf {float(ann['confidence']):.2f}"
         if kind == "pothole" and ann["id"] in deep_points:
             count = deep_points[ann["id"]]
             label += " | depth n/a" if count is None else f" | deep points (1 cm, paint 2 cm): {count}"
