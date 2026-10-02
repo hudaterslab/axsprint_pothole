@@ -58,7 +58,7 @@ import urllib.request
 import uuid
 import zlib
 
-POTHOLE_DEPTH_M = 0.005  # a pothole must be at least this deep below the road around it
+POTHOLE_DEPTH_M = 0.010  # depth of the POTHOLE_MIN_POINTS deep points (see POTHOLE_RING_M)
 
 PROJECT = Path(__file__).resolve().parent
 
@@ -121,9 +121,14 @@ PLANE_MIN_SUPPORT = 0.6
 
 PLANE_MAX_TILT_DEG = 15.0  # from RoadPlaneSettings.expected_normal
 
-# Pothole depth: the road POTHOLE_RING_M (metres) around the pothole is the reference road,
-# and the pothole counts when its deepest LiDAR point is POTHOLE_DEPTH_M or more below it.
+# Pothole depth: the road POTHOLE_RING_M (metres) around the pothole is the reference road.
+# The pothole counts when at least POTHOLE_MIN_POINTS of its LiDAR points are POTHOLE_DEPTH_M
+# or more below it and the median of its points is at most POTHOLE_MAX_RISE_M above it.
+# One deepest point is not enough: with LiDAR noise of about 3 mm, one of ~100 points on flat
+# lane paint lands 5-9 mm low (2026-10-02 drive: 49 of 86 reported potholes passed that way).
 POTHOLE_RING_M = (0.10, 0.30)
+POTHOLE_MIN_POINTS = 3
+POTHOLE_MAX_RISE_M = 0.005
 
 
 def server_transport_source():
@@ -1359,7 +1364,7 @@ class ObjectTracker:
                 cls == 1
                 and depth is not None
                 and math.isfinite(float(depth))
-                and (reason in ("depth_pass", "depth_below_threshold"))
+                and (reason in ("depth_pass", "depth_below_threshold", "raised_above_road"))
             )
             if bool(observation.get("accepted")):
                 if cls == 1 and (
@@ -1851,7 +1856,11 @@ def save_scan_pcap(destination, sources, start, end):
 
 @dataclass(frozen=True)
 class RoadPlaneSettings:
-    expected_normal: tuple = (-0.016, 0.666, 0.746)
+    # Road normal in LiDAR coordinates as mounted on the car: the mean of 793 moving scans
+    # of the 2026-10-02 drive (all within 5.4 deg, median 0.5 deg). The old value
+    # (-0.016, 0.666, 0.746) was 11.4 deg off, leaving PLANE_MAX_TILT_DEG little room on
+    # slopes. Measure it again if the sensor mount angle changes.
+    expected_normal: tuple = (-0.012, 0.8, 0.6)
     cell_size_m: float = 0.35
 
 
@@ -1936,9 +1945,10 @@ def measure_mask_local_depth(road, pixels, visible_indices, indices, exclusion, 
     The reference is every visible point outside all detection masks whose distance on
     the road to the nearest pothole point is within POTHOLE_RING_M. A robust plane through
     their 5 cm cell medians is the local road; each pothole point's depth is its distance
-    below it. The pothole counts (info["accepted"]) when its deepest point is threshold_m
-    or more below it; small potholes may hold only a few LiDAR points. reference_noise_m
-    (robust spread of the reference road) is kept as evidence of how well it was measured.
+    below it. The pothole counts (info["accepted"]) when at least POTHOLE_MIN_POINTS of its
+    points are threshold_m or more below it and their median is at most POTHOLE_MAX_RISE_M
+    above it (a raised object is no pothole). reference_noise_m (robust spread of the
+    reference road) is kept as evidence of how well it was measured.
     """
     near, far = POTHOLE_RING_M
     uv = pixels[visible_indices].astype(int)
@@ -1983,7 +1993,9 @@ def measure_mask_local_depth(road, pixels, visible_indices, indices, exclusion, 
         reference_noise_m=max(0.002, 1.4826 * float(np.median(abs(residual - np.median(residual))))),
         points_at_threshold=int(np.sum(depth >= threshold_m)),
         max_depth_m=float(depth.max()),
-        accepted=bool(depth.max() >= threshold_m),
+        median_depth_m=float(np.median(depth)),
+        accepted=bool(np.sum(depth >= threshold_m) >= POTHOLE_MIN_POINTS
+                      and np.median(depth) >= -POTHOLE_MAX_RISE_M),
     )
     return (measured, info)
 
@@ -2607,10 +2619,12 @@ def validate_objects(detections, result, camera, threshold_m=POTHOLE_DEPTH_M):
             reason = (
                 "local_reference_unavailable"
                 if measured is None
-                else "depth_pass" if keep else "depth_below_threshold"
+                else "depth_pass" if keep
+                else "raised_above_road" if local["median_depth_m"] < -POTHOLE_MAX_RISE_M
+                else "depth_below_threshold"
             )
         evidence = dict(
-            method="model_only" if d.class_id == 0 else "model_mask_local_max_depth",
+            method="model_only" if d.class_id == 0 else "model_mask_local_depth_points",
             accepted=keep,
             reason=reason,
             max_depth_m=maximum,

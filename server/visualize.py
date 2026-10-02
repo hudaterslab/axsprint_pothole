@@ -240,7 +240,7 @@ def project(xyz):
 # flatten() checks and RecordingAlignment.compensate()
 # =============================================================================
 
-EXPECTED_NORMAL = (-0.016, 0.666, 0.746)
+EXPECTED_NORMAL = (-0.012, 0.8, 0.6)  # main_live's RoadPlaneSettings: road normal measured on the car
 # Plane points as main_live.py: the firing nearest the camera's optical axis and this
 # many firings on each side (201 firings, all 32 channels), like lcz_to_pcap.py.
 PLANE_SIDE_FIRINGS, CELL_SIZE_M = 100, 0.35
@@ -254,6 +254,10 @@ MOTION_MAX_PACKET_AGE_SEC = 0.15
 # main_live.py's OFFSET_SEC: the camera stamps a frame this long after taking it, so the
 # points are moved to the file name's capture time minus this.
 OFFSET_SEC = 0.033
+# main_live.py's pothole check (measure_mask_local_depth): points of the pothole mask
+# POTHOLE_DEPTH_M or more below a robust plane through the road POTHOLE_RING_M (metres)
+# around it. The label shows how many there are (the terminal needs 3).
+POTHOLE_DEPTH_M, POTHOLE_RING_M = 0.010, (0.10, 0.30)
 
 
 def road_plane(xyz, selected):
@@ -322,6 +326,52 @@ def compensate(xyz, times, normal, target, speed):
     if not np.isfinite(dt).all() or np.max(np.abs(dt), initial=0) > MOTION_MAX_PACKET_AGE_SEC:
         return None, "LiDAR packets more than 150 ms from the image"
     return xyz + dt[:, None] * velocity, None
+
+
+def road_frame(normal, offset):
+    """main_live.py's road-aligned axes (rows: road X, road Y, normal) and plane origin."""
+    n = np.asarray(normal, float) / np.linalg.norm(normal)
+    road_x = np.array([1.0, 0.0, 0.0]) - n[0] * n
+    if np.linalg.norm(road_x) < 1e-09:
+        road_x = np.array([0.0, 1.0, 0.0]) - n[1] * n
+    road_x /= np.linalg.norm(road_x)
+    road_y = np.cross(n, road_x)
+    road_y /= np.linalg.norm(road_y)
+    return np.vstack([road_x, road_y, n]), -float(offset) * n
+
+
+def local_depths(road, pixels, visible, inside, exclusion):
+    """Depths (m) of the pothole points `inside` below the road around them, as main_live.py's
+    measure_mask_local_depth(); None when that road cannot be fitted."""
+    near, far = POTHOLE_RING_M
+    uv = pixels[visible].astype(int)
+    outside = visible[~exclusion[uv[:, 1], uv[:, 0]]]
+    hole = road[inside, :2]
+    around = np.all((road[outside, :2] >= hole.min(axis=0) - far)
+                    & (road[outside, :2] <= hole.max(axis=0) + far), axis=1)
+    candidates = outside[around]
+    gap = np.full(len(candidates), np.inf)
+    for start in range(0, len(hole), 256):
+        step = road[candidates, None, :2] - hole[None, start:start + 256]
+        gap = np.minimum(gap, np.sqrt((step ** 2).sum(axis=2)).min(axis=1))
+    ref = candidates[(gap >= near) & (gap <= far)]
+    if len(ref) < 3:
+        return None
+    origin = np.median(hole, axis=0)
+    cells = np.floor((road[ref, :2] - origin) / 0.05).astype(int)
+    inv = np.unique(cells, axis=0, return_inverse=True)[1].reshape(-1)
+    reps = np.array([np.median(road[ref[inv == i]], axis=0) for i in range(inv.max() + 1)])
+    A = np.column_stack((reps[:, :2] - origin, np.ones(len(reps))))
+    if np.linalg.matrix_rank(A) < 3:
+        return None
+    coef = np.linalg.lstsq(A, reps[:, 2], rcond=None)[0]
+    for _ in range(8):
+        residual = reps[:, 2] - A @ coef
+        scale = max(0.002, 1.4826 * np.median(abs(residual - np.median(residual))))
+        weights = np.sqrt(np.minimum(1.0, 1.5 * scale / np.maximum(abs(residual), 1e-12)))
+        coef = np.linalg.lstsq(A * weights[:, None], reps[:, 2] * weights, rcond=None)[0]
+    measured = road[inside]
+    return -(measured[:, 2] - ((measured[:, :2] - origin) @ coef[:2] + coef[2])) / np.sqrt(1 + coef[:2] @ coef[:2])
 
 
 KST = timezone(timedelta(hours=9))
@@ -427,7 +477,7 @@ def render(json_path, output_path):
         canvas = Image.alpha_composite(canvas, layer)
     painter = ImageDraw.Draw(canvas)
 
-    lidar_missing, motion = None, ""
+    lidar_missing, motion, deep_points = None, "", {}
     try:
         xyz, selected, times = decode_xt32(json_path.with_suffix(".pcap"), _CALIBRATION)
         normal, offset = road_plane(xyz, selected)
@@ -444,6 +494,24 @@ def render(json_path, output_path):
             raise ValueError("matched scan has no points in the camera image")
         for (u, v), height_m in zip(pixels[valid].tolist(), heights[valid].tolist()):
             painter.ellipse((u - 1, v - 1, u + 1, v + 1), fill=(*height_rgb(height_m), 255))
+        # Deep points of each pothole, measured as main_live.py measured them.
+        rotation, origin = road_frame(normal, offset)
+        road = ((xyz if moved is None else moved) - origin) @ rotation.T
+        road[:, 2] = heights
+        visible = np.flatnonzero(valid)
+        uv = pixels[visible].astype(int)
+        masks = []
+        for _, _, polygons, _ in objects:
+            mask = Image.new("1", (width, height), 0)
+            for polygon in polygons:
+                ImageDraw.Draw(mask).polygon(polygon, fill=1)
+            masks.append(np.array(mask, dtype=bool))
+        exclusion = np.logical_or.reduce(masks)
+        for (kind, ann, _, _), mask in zip(objects, masks):
+            if kind == "pothole":
+                inside = visible[mask[uv[:, 1], uv[:, 0]]]
+                depths = local_depths(road, pixels, visible, inside, exclusion) if len(inside) else None
+                deep_points[ann["id"]] = None if depths is None else int(np.sum(depths >= POTHOLE_DEPTH_M))
     except (OSError, ValueError) as exc:
         lidar_missing = str(exc)
 
@@ -454,9 +522,9 @@ def render(json_path, output_path):
             painter.line(polygon + [polygon[0]], fill=color, width=line_width)
         painter.rectangle((x0, y0, x1, y1), outline=color, width=line_width)
         label = f"{kind.upper()} #{ann['id']}"
-        depth = ann["measurements"]["depth"]["median_cm"]
-        if kind == "pothole" and depth is not None:
-            label += f" | median depth {depth:.2f} cm"
+        if kind == "pothole" and ann["id"] in deep_points:
+            count = deep_points[ann["id"]]
+            label += " | depth n/a" if count is None else f" | points >= 1 cm deep: {count}"
         if hasattr(painter, "textbbox"):
             left, top, right, bottom = painter.textbbox((0, 0), label, font=font)
         else:  # Pillow 7.x
