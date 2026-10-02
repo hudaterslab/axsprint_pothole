@@ -4,9 +4,10 @@
 Set FOLDER, START_FRAME and END_FRAME below, then run:  python3 checklidarcamera.py
 Each frame is saved as OUTPUT_DIR/<run>/<frame 8 digits>.jpg.
 
-The LiDAR scan matched to each frame, its decoding, the road plane and the camera
-projection are main_live.py's own (camera_calib_best_effort.json), so the picture is
-what the analysis sees. Points are coloured by height above the fitted road plane:
+The LiDAR scan matched to each frame, its decoding, the road plane, the motion
+compensation (GPS speed; none indoors) and the camera projection are main_live.py's own
+(camera_calib_best_effort.json, OFFSET_SEC), so the picture is what the analysis sees.
+Points are coloured by height above the fitted road plane:
 blue at -HEIGHT_RANGE_CM or lower, green at 0, red at +HEIGHT_RANGE_CM or higher.
 
 The road plane is fitted to the LiDAR firing nearest the camera's optical axis (0) and
@@ -95,25 +96,33 @@ def draw_plane_range(image, points, pixels, visible, firings):
                     color, 2, cv2.LINE_AA)
 
 
-def overlay(image, row, pcaps, camera, angles, cache):
+def overlay(image, row, pcaps, camera, angles, alignment, cache):
     """Draw the frame's LiDAR scan onto image; returns a one-line summary."""
-    candidates = ml.scan_candidates(pcaps, ml.frame_time(row) - ml.OFFSET_SEC, cache)
+    target = ml.frame_time(row) - ml.OFFSET_SEC
+    candidates = ml.scan_candidates(pcaps, target, cache)
     if not candidates:
         return "no LiDAR scan yet (its 10 s file may still be recording)"
     _, sources, start, end, delta = min(candidates, key=lambda c: c[0])
     if abs(delta) > ml.MAX_SCAN_CENTER_DELTA_SEC:
         return f"nearest LiDAR scan is {delta * 1000:+.0f} ms away; main_live skips it"
     points = ml.decode_scan(sources, angles, start - 1e-06, end + 1e-06)
+    xyz = points.xyz
     try:
-        heights = ml.flatten(points, camera.axis_azimuth_raw)["road_xyz_m"][:, 2]
+        result = ml.flatten(points, camera.axis_azimuth_raw)
+        heights = result["road_xyz_m"][:, 2]
         values = np.clip(heights * 100 / HEIGHT_RANGE_CM, -1, 1) * 127.5 + 127.5
         colors = cv2.applyColorMap(values.astype(np.uint8).reshape(-1, 1), cv2.COLORMAP_TURBO)[:, 0]
         plane = ""
         draw_legend(image)
+        try:  # moved to the moment the image was taken, as main_live does while driving
+            xyz = alignment.compensate(result, camera, target)["sensor_xyz_m"]
+            plane = f", moved for {alignment.speed_at(target):.1f} m/s"
+        except ValueError as exc:
+            plane = f", not moved ({exc})"
     except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
         colors = np.full((len(points), 3), 255, np.uint8)
         plane = f", road plane unavailable ({exc})"
-    pixels, visible = camera.project(points.xyz)
+    pixels, visible = camera.project(xyz)
     h, w = image.shape[:2]
     visible &= (pixels[:, 0] >= 0) & (pixels[:, 0] < w) & (pixels[:, 1] >= 0) & (pixels[:, 1] < h)
     for (u, v), color in zip(pixels[visible].astype(int), colors[visible]):
@@ -136,6 +145,7 @@ def main():
     pcaps = [dict(r, path=str(run / "lidar" / r["path"])) for r in jsonl(run / "lidar" / "pcaps.jsonl")]
     camera = ml.LiDAR2Camera(ml.CAMERA_CALIBRATION)
     angles = ml.lidar__load_calibration(ml.LIDAR_CALIBRATION)
+    alignment = ml.RecordingAlignment(ml.GpsTail(run).read() or {})
     output = Path(OUTPUT_DIR) / run.name
     output.mkdir(parents=True, exist_ok=True)
     cache = {}
@@ -145,7 +155,7 @@ def main():
         if image is None:
             print(f"{index:08d}: image missing ({row['path']})")
             continue
-        summary = overlay(image, row, pcaps, camera, angles, cache)
+        summary = overlay(image, row, pcaps, camera, angles, alignment, cache)
         clock = time.strftime("%H:%M:%S", time.localtime(ml.frame_time(row)))
         caption = f"{run.name}  frame {index}  {clock}  {summary}"
         cv2.rectangle(image, (0, 0), (image.shape[1], 50), (0, 0, 0), -1)

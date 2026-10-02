@@ -82,7 +82,11 @@ BATCH_SIZE = 16  # frames per inference batch
 
 POLL_SECONDS = 0.5
 
-OFFSET_SEC = 0.0
+# The camera stamps each frame about one frame period (33 ms at 30 fps) after taking it,
+# so LiDAR scans are matched and motion-compensated to camera time minus this. Measured
+# on the 2026-10-02 drive by lining up road paint in LiDAR reflectivity and the image:
+# 33 ms at 3-10 m/s, the same at every speed (a timing offset, not a calibration error).
+OFFSET_SEC = 0.033
 
 ALIGNMENT_PROFILE_ID = "ptp_live_recorded_utc_v1"
 

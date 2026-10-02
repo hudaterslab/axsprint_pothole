@@ -15,7 +15,8 @@ Drawing follows replay_certifcate.py (render_frame, draw_height_legend,
 height_rgb). XT32 decoding, the camera model, the road plane with its checks and
 the motion compensation are those of main_live.py, so the points land where the
 analysis saw them: when the JSON carries gps.speed_mps, the points are moved to
-the image time as main_live.py moved them. When the road plane fails
+the moment the image was taken (capture time minus OFFSET_SEC) as main_live.py
+moved them. When the road plane fails
 main_live.py's checks, the frame is drawn without LiDAR and the reason is printed.
 """
 
@@ -36,9 +37,10 @@ import numpy as np
 # USER SETTINGS
 # =============================================================================
 
-# The data folder on the server; elsewhere (e.g. a Windows PC through the network
-# share) set the PORTHOLE_ROOT environment variable to it.
-PORTHOLE_ROOT = Path(os.environ.get("PORTHOLE_ROOT", "/media/hudaters/raid/porthole"))
+# The data folder: on the server this script is <data folder>/code_server/visualize.py,
+# so it is the folder above the script's; elsewhere (e.g. a Windows PC through the
+# network share) set the PORTHOLE_ROOT environment variable to it.
+PORTHOLE_ROOT = Path(os.environ.get("PORTHOLE_ROOT") or Path(__file__).resolve().parent.parent)
 UPLOAD_ROOT = PORTHOLE_ROOT / "model_detections"  # main_live's PORTHOLE_UPLOAD_DIR
 UPLOAD_PREFIX = "porthole_live_analysis"  # main_live upload folders, including _test and moved-aside ones
 OUTPUT_ROOT = PORTHOLE_ROOT / "model_detections_lidar_images"
@@ -247,6 +249,9 @@ PLANE_CENTER_AZIMUTH_RAW = round(math.degrees(math.atan2(
 # plane, and tilt from EXPECTED_NORMAL.
 PLANE_MIN_CELLS, PLANE_SUPPORT_M, PLANE_MIN_SUPPORT, PLANE_MAX_TILT_DEG = 10, 0.04, 0.6, 15.0
 MOTION_MAX_PACKET_AGE_SEC = 0.15
+# main_live.py's OFFSET_SEC: the camera stamps a frame this long after taking it, so the
+# points are moved to the file name's capture time minus this.
+OFFSET_SEC = 0.033
 
 
 def road_plane(xyz, selected):
@@ -412,7 +417,7 @@ def render(json_path, output_path):
         normal, offset = road_plane(xyz, selected)
         heights = xyz @ normal + offset  # compensation moves points along the road only
         speed = (doc.get("gps") or {}).get("speed_mps")
-        target = int(json_path.stem.split("_")[1]) / 1e9  # frame_<capture ns>_<frame>
+        target = int(json_path.stem.split("_")[1]) / 1e9 - OFFSET_SEC  # frame_<capture ns>_<frame>
         moved, reason = compensate(xyz, times, normal, target, speed)
         motion = (f"motion compensated at {speed:.1f} m/s" if moved is not None
                   else f"not motion compensated: {reason}")

@@ -107,6 +107,9 @@ NetworkManager의 `ptp-pothole-lidar` 설정은 `enp1s0`/`48:21:0B:72:DC:48`,
 LiDAR 패킷 내부 tail은 원본 PTP/TAI이며 기록된 UTC offset(현재 37초)을 한 번 빼야 합니다.
 이미 UTC인 PCAP header에는 다시 빼지 않습니다. 기존 offset 추정값을 추가 적용하지 마세요.
 PTP는 시계를 맞추며, 카메라 노출 시작과 LiDAR 회전 위상 자체를 일치시키지는 않습니다.
+또 카메라는 사진을 찍고 약 한 프레임(33 ms) 뒤의 시각을 `timestamp_ns`로 붙입니다. 시계 차이가 아니라
+카메라 안의 처리 시간이라 PTP로는 없어지지 않으며, `main_live.py`의 `OFFSET_SEC`(0.033초)로 맞춥니다.
+LiDAR PCAP 시각은 센서가 패킷에 적은 PTP 시각 그대로입니다.
 시작 직후에는 PTP 잠금과 카메라 RTCP 시각 정보가 확인될 때까지 잠시 저장을 기다립니다.
 시작 시 동기화 검사는 5초 연속 통과해야 합니다. 준비 시간의 기준은
 운영체제 부팅 시간이 아닌 `collect_data.py` 프로세스 시작 시각입니다.
@@ -184,6 +187,9 @@ sudo reboot
 DEEPX 런타임은 이 스크립트가 설치하지 않습니다. NPU 카드와 DEEPX 런타임(dx-runtime)을 먼저 설치하세요.
 `main_live.py`는 옵션 없이 실행합니다. GPS 속도가 있으면 주행 중 라이다 점의 어긋남을 보정하고,
 GPS 속도가 없으면(실내 등) 보정 없이 깊이를 측정합니다. 정지·저속에서는 보정 없이도 오차가 작습니다.
+라이다는 사진의 `timestamp_ns`에서 `OFFSET_SEC`(0.033초)를 뺀, 실제로 찍은 순간에 맞춥니다.
+2026-10-02 주행에서 도로 도색이 라이다 반사도와 사진에서 겹치는 시각을 찾아 잰 값으로, 속도(3~10 m/s)와
+상관없이 같았습니다. 보정 전에는 9 m/s에서 라이다 점이 사진보다 약 30 cm 뒤쪽(사진 위쪽)에 찍혔습니다.
 라이다 스캔 해석은 numpy 배열 계산으로 한 번에 처리하고, PCAP은 파일별 색인으로 필요한 패킷만 읽습니다.
 추적은 프레임 순서대로 합니다.
 
@@ -247,14 +253,18 @@ python3 senddata.py
 ## 서버 시각화 (server/visualize.py)
 
 서버에 올라온 검출 프레임을 사진 위에 검출 영역과 라이다 점(도로 평면 기준 높이 색)으로 그립니다.
-단말기가 아니라 업로드 서버에서 실행하는 도구이며, 서버의 데이터 폴더(기본
-`/media/hudaters/raid/porthole`, 다른 곳에서는 환경변수 `PORTHOLE_ROOT`) 아래
+단말기가 아니라 업로드 서버에서 실행하는 도구이며, 서버의 데이터 폴더(서버에서는
+`<데이터 폴더>/code_server/visualize.py`로 두므로 그 한 단계 위 폴더, 다른 곳에서는 환경변수 `PORTHOLE_ROOT`) 아래
 `model_detections/porthole_live_analysis*`를 읽어 `model_detections_lidar_images`에 그립니다.
 이미 그린 프레임은 건너뜁니다. 서버에서 NumPy와 Pillow가 있는 파이썬으로 `python3 visualize.py`를 실행합니다.
+보정 계산이나 `OFFSET_SEC`를 바꾼 뒤 이미 그린 이미지를 새로 그리려면, 예전 이미지 폴더를 다른 이름으로
+옮겨 두고 다시 실행하거나 `OVERWRITE = True`로 한 번 실행합니다.
 
 라이다 해석, 카메라 보정값, 도로 평면과 그 검사, 주행 중 보정은 `main_live.py`와 같습니다.
-JSON의 `gps.speed_mps`로 단말기와 같은 주행 보정을 하고, 평면 검사에 걸리면 라이다 없이 그립니다.
-`main_live.py`의 평면·보정 계산이나 `camera_calib_best_effort.json`을 바꾸면 이 파일도 같이 고친 뒤
+JSON의 `gps.speed_mps`와 단말기와 같은 카메라 시각 보정(`OFFSET_SEC`)으로 라이다 점을 똑같이 옮기고,
+평면 검사에 걸리면 라이다 없이 그립니다. 그래서 `OFFSET_SEC`를 넣기 전(2026-10-02 이전)에 분석된 프레임도
+지금 그리면 실제 촬영 순간에 맞춰 그려집니다.
+`main_live.py`의 평면·보정 계산, `OFFSET_SEC`, `camera_calib_best_effort.json`을 바꾸면 이 파일도 같이 고친 뒤
 서버의 `code_server/visualize.py`에 복사해 주세요.
 
 ## 시험 자료 및 변경 전 파일
