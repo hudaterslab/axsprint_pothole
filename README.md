@@ -244,6 +244,19 @@ python3 senddata.py
 - NPU를 쓰므로 분석 프로그램(`main_live.py`)이 켜져 있으면 실행되지 않습니다. 수집기는 켜져 있어도 됩니다.
 - 녹화 폴더를 지운 날의 검출은 보낼 수 없습니다.
 
+## 서버 시각화 (server/visualize.py)
+
+서버에 올라온 검출 프레임을 사진 위에 검출 영역과 라이다 점(도로 평면 기준 높이 색)으로 그립니다.
+단말기가 아니라 업로드 서버에서 실행하는 도구이며, 서버의 데이터 폴더(기본
+`/media/hudaters/raid/porthole`, 다른 곳에서는 환경변수 `PORTHOLE_ROOT`) 아래
+`model_detections/porthole_live_analysis*`를 읽어 `model_detections_lidar_images`에 그립니다.
+이미 그린 프레임은 건너뜁니다. 서버에서 NumPy와 Pillow가 있는 파이썬으로 `python3 visualize.py`를 실행합니다.
+
+라이다 해석, 카메라 보정값, 도로 평면과 그 검사, 주행 중 보정은 `main_live.py`와 같습니다.
+JSON의 `gps.speed_mps`로 단말기와 같은 주행 보정을 하고, 평면 검사에 걸리면 라이다 없이 그립니다.
+`main_live.py`의 평면·보정 계산이나 `camera_calib_best_effort.json`을 바꾸면 이 파일도 같이 고친 뒤
+서버의 `code_server/visualize.py`에 복사해 주세요.
+
 ## 시험 자료 및 변경 전 파일
 
 시험용 수집기·검증 스크립트·검증 결과·이전 백업·미사용 보조 파일은
