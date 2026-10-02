@@ -1701,7 +1701,8 @@ def save_detection_frame(directory, source_image, image, row, key,
     """Frame JSON in the terminal-server data spec (단말기-서버 데이터 명세서, 2026-09-28).
 
     Only record_id, categories, images, annotations, gps and lidar.pcap_files are
-    sent; missing measurements are null, not 0.
+    sent; missing measurements are null, not 0. gps.speed_mps (added to the spec on
+    2026-10-02) is the GPS speed motion compensation used, so a viewer can repeat it.
     """
     if not damage_detections:
         return []
@@ -1744,7 +1745,8 @@ def save_detection_frame(directory, source_image, image, row, key,
         images=[dict(id=1, width=width, height=height, file_name=image_path.name,
                      date_captured=captured.strftime("%Y-%m-%dT%H:%M:%SZ"))],
         annotations=annotations,
-        gps=dict(latitude_deg=gps.get("latitude_deg"), longitude_deg=gps.get("longitude_deg")),
+        gps=dict(latitude_deg=gps.get("latitude_deg"), longitude_deg=gps.get("longitude_deg"),
+                 speed_mps=gps.get("speed_mps")),
         lidar=dict(pcap_files=[dict(name=f["name"]) for f in pcap_files]),
     )
     # Indented, so the file reads well when opened on the server.
@@ -2673,11 +2675,17 @@ class RecordingAlignment:
                 speed_records.append(row)
         self.speeds = np.asarray(sorted(speed_records), dtype=float).reshape(-1, 2)
 
-    def compensate(self, raw, camera, target):
+    def speed_at(self, target):
+        """GPS speed (m/s) at target, or None without valid speeds on both sides within 1.5 s."""
         k = int(np.searchsorted(self.speeds[:, 0], target))
         if k == 0 or k == len(self.speeds) or self.speeds[k, 0] - self.speeds[k - 1, 0] > 1.5:
+            return None
+        return float(np.interp(target, self.speeds[:, 0], self.speeds[:, 1]))
+
+    def compensate(self, raw, camera, target):
+        speed = self.speed_at(target)
+        if speed is None:
             raise ValueError("Motion compensation requires bracketing valid GPS speeds")
-        speed = float(np.interp(target, self.speeds[:, 0], self.speeds[:, 1]))
         normal = raw["plane_normal"]
         direction = camera.R[2].copy()
         direction -= (direction @ normal) * normal
@@ -3038,10 +3046,12 @@ class LiveProcessor:
                     pcap_files=pcap_files, status=status if pcap_files else "pcap_unavailable",
                     pcap_copy_policy="selected_scan_raw_records_unchanged",
                 )
+            gps = matched_gps_position(self.exporter.gps_streams, timestamp)
+            speed = self.alignment.speed_at(target)  # the speed motion compensation used
+            gps["speed_mps"] = None if speed is None else round(speed, 3)
             pair = save_detection_frame(
                 self.exporter.directory, image_path, image, row, key,
-                report_detections, damage_payloads,
-                matched_gps_position(self.exporter.gps_streams, timestamp), pcap_files,
+                report_detections, damage_payloads, gps, pcap_files,
             )
             artifacts.extend(pair)
             files = {p.name: dict(bytes=p.stat().st_size, sha256=sha(p)) for p in artifacts}

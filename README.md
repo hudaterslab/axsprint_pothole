@@ -209,6 +209,8 @@ CSV에 남은 검출은 사무실에서 `senddata.py`로 보냅니다(아래).
 JSON은 「크랙 포트홀 서버 전송 명세서」(2026-09-28) 형식입니다. `record_id`(`단말기/run 폴더/프레임 번호`),
 `categories`, `images`, `annotations`(bbox·segmentation·크기·깊이), `gps`, `lidar.pcap_files`만 담고,
 측정값이 없으면 0 대신 null입니다. 크랙은 깊이를 재지 않으므로 `depth.median_cm`이 null입니다.
+`gps.speed_mps`(2026-10-02 추가)는 그 순간 차 속도(m/s)로, 단말기가 주행 중 라이다 점을 사진에 맞출 때
+쓴 값입니다. 서버의 시각화도 같은 값으로 똑같이 보정할 수 있습니다. GPS 속도가 없으면 null입니다.
 JSON은 열어 보기 쉽게 줄바꿈과 2칸 들여쓰기로 저장합니다.
 단말기 이름은 `.env`의 `PORTHOLE_TERMINAL_ID`이며, 비어 있으면 호스트 이름을 씁니다.
 단말기마다 다른 이름을 써야 서버가 다른 단말기의 결과를 중복으로 버리지 않습니다(첫 단말기는 `hudaters`).
