@@ -544,8 +544,9 @@ def render(json_path, output_path):
             if kind == "pothole":
                 inside = visible[mask[uv[:, 1], uv[:, 0]]]
                 depths = local_depths(road, pixels, visible, inside, exclusion) if len(inside) else None
-                deep_points[ann["id"]] = (None if depths is None else int(np.sum(
-                    depths >= np.where(painted[inside], PAINT_DEPTH_M, POTHOLE_DEPTH_M))))
+                deep_points[ann["id"]] = (None if depths is None else (int(np.sum(
+                    depths >= np.where(painted[inside], PAINT_DEPTH_M, POTHOLE_DEPTH_M))),
+                    100 * float(depths.max())))
     except (OSError, ValueError) as exc:
         lidar_missing = str(exc)
 
@@ -555,22 +556,28 @@ def render(json_path, output_path):
         for polygon in polygons:
             painter.line(polygon + [polygon[0]], fill=color, width=line_width)
         painter.rectangle((x0, y0, x1, y1), outline=color, width=line_width)
-        label = f"{kind.upper()} #{ann['id']}"
+        lines = [f"{kind.upper()} #{ann['id']}"]
         if ann.get("confidence") is not None:
-            label += f" conf {float(ann['confidence']):.2f}"
+            lines[0] += f" conf {float(ann['confidence']):.2f}"
         if kind == "pothole" and ann["id"] in deep_points:
-            count = deep_points[ann["id"]]
-            label += " | depth n/a" if count is None else f" | deep points (1 cm, paint 2 cm): {count}"
-        if hasattr(painter, "textbbox"):
-            left, top, right, bottom = painter.textbbox((0, 0), label, font=font)
-        else:  # Pillow 7.x
-            left, top = 0, 0
-            right, bottom = painter.textsize(label, font=font)
-        label_width, label_height = right - left + 12, bottom - top + 10
+            depth = deep_points[ann["id"]]
+            lines.append("depth n/a" if depth is None else
+                         f"deep points (1 cm, paint 2 cm): {depth[0]} | deepest {depth[1]:.1f} cm")
+        boxes = []
+        for line in lines:
+            if hasattr(painter, "textbbox"):
+                boxes.append(painter.textbbox((0, 0), line, font=font))
+            else:  # Pillow 7.x
+                boxes.append((0, 0, *painter.textsize(line, font=font)))
+        line_height = max(b[3] - b[1] for b in boxes) + 6
+        label_width = max(b[2] - b[0] for b in boxes) + 12
+        label_height = line_height * len(lines) + 4
         x = max(0, min(x0, width - label_width))
         y = max(0, min(y0 - label_height, height - label_height))
         painter.rectangle((x, y, x + label_width, y + label_height), fill=color)
-        painter.text((x + 6 - left, y + 5 - top), label, font=font, fill=(255, 255, 255, 255))
+        for i, (line, (left, top, _, _)) in enumerate(zip(lines, boxes)):
+            painter.text((x + 6 - left, y + 5 + i * line_height - top), line, font=font,
+                         fill=(255, 255, 255, 255))
     if lidar_missing is None:
         draw_height_legend(canvas, HEIGHT_RANGE_CM, motion)
 
