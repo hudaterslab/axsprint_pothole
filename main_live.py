@@ -129,12 +129,14 @@ PLANE_MAX_TILT_DEG = 15.0  # from RoadPlaneSettings.expected_normal
 POTHOLE_RING_M = (0.10, 0.30)
 POTHOLE_MIN_POINTS = 3
 POTHOLE_MAX_RISE_M = 0.005
-# Lane paint, worn paint too, reflects more than asphalt, and the LiDAR reads it up to about
-# 1.5 cm too deep, and the asphalt for a few firings after it as well (2026-10-02: crosswalks
-# 16821 and 17293, dashed line 17239). Points of the paint zone - returns with reflectivity
-# PAINT_REFLECTIVITY or more and the points within PAINT_EDGE_FIRINGS firings of them on the
-# same channel - count as deep only from PAINT_DEPTH_M; elsewhere from POTHOLE_DEPTH_M. The
-# real pothole of that drive (frame 7622) is about 2 cm deep with bright debris (reflectivity ~16).
+# Points of the paint zone - returns with reflectivity PAINT_REFLECTIVITY or more and the
+# points within PAINT_EDGE_FIRINGS firings of them on the same channel - count as deep only
+# from PAINT_DEPTH_M; elsewhere from POTHOLE_DEPTH_M. Paint itself is level with the asphalt
+# beside it (LiDAR viewer; 2026-10-02 drive: median 0.5 mm higher over 41,574 crossings). The
+# deep readings on paint that day came from the ring plane's error, the image-LiDAR offset of
+# the old lens values (fixed 2026-10-03) and shallow 40-60 cm dips of the road under worn
+# crosswalk stripes (frames 17293, 12277); the paint zone stays as a safeguard. The real
+# pothole of that drive (frame 7622) is about 2 cm deep with bright debris (reflectivity ~16).
 PAINT_REFLECTIVITY = 15
 PAINT_EDGE_FIRINGS = 5
 PAINT_DEPTH_M = 0.020

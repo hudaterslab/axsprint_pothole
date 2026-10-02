@@ -287,8 +287,8 @@ OFFSET_SEC = 0.033
 # main_live.py's pothole check (measure_mask_local_depth): points of the pothole mask
 # POTHOLE_DEPTH_M or more below a robust plane through the road POTHOLE_RING_M (metres)
 # around it; in the paint zone (reflectivity PAINT_REFLECTIVITY or more, and the
-# PAINT_EDGE_FIRINGS points next to it on the same channel, which the LiDAR reads up to
-# ~1.5 cm deep) PAINT_DEPTH_M or more. The label shows how many (the terminal needs 3).
+# PAINT_EDGE_FIRINGS points next to it on the same channel; see main_live.py) PAINT_DEPTH_M
+# or more. The label shows how many (the terminal needs 3).
 POTHOLE_DEPTH_M, POTHOLE_RING_M = 0.010, (0.10, 0.30)
 PAINT_REFLECTIVITY, PAINT_EDGE_FIRINGS, PAINT_DEPTH_M = 15, 5, 0.020
 
