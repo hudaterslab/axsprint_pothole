@@ -28,6 +28,17 @@ TIMEBASE_MARK = Path("/run/ptp_pothole_timebase")
 LOG_STARTS = 30  # var/logs keeps the logs of this many service starts (phc2sys: ~7 MB a day per port)
 
 
+def disable_clock_steps():
+    """No automatic system clock step by chrony from now on (chronyc's second form of makestep:
+    threshold, number of future clock updates). (accepted, chronyc's answer)."""
+    try:
+        result = subprocess.run(["/usr/bin/chronyc", "makestep", "1", "0"],
+                                capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    return result.returncode == 0, (result.stdout + result.stderr).strip()
+
+
 def prune_logs(logdir, keep=LOG_STARTS):
     """Make room for one more set of logs: each start writes <YYYYmmdd_HHMMSS>_<label> files,
     and only the newest keep - 1 earlier sets stay."""
@@ -142,10 +153,10 @@ logging_level 6
                 # PHCs after its start, so a step now (a first NTP update arriving late) would
                 # leave both sensors seconds behind the host for hours, and the camera's RTCP
                 # times would be refused for being that far from the host clock.
-                result = subprocess.run(["/usr/bin/chronyc", "makestep", "1", "0"],
-                                        capture_output=True, text=True, timeout=5)
-                print("PTP host clock: no clock steps from now on: "
-                      + (result.stdout + result.stderr).strip(), flush=True)
+                steps_off, message = disable_clock_steps()
+                print(("PTP host clock: no clock steps from now on: " if steps_off else
+                       "PTP host clock: could not turn chrony's clock steps off (retried every 60 s): ")
+                      + message, flush=True)
             TIMEBASE_MARK.write_text(f"{time.time_ns()}\n")
         for interface, phc in [("enp1s0", "ptp0"), ("enp2s0", "ptp1")]:
             expected = Path("/sys/class/net") / interface / "device/ptp" / phc
@@ -255,6 +266,7 @@ logging_level 6
         # Do not send START_PTP again while the just-started camera servo is
         # acquiring the master. A duplicate start can reset its acquisition.
         next_sensor_check = time.monotonic() + 60
+        next_steps_check, steps_off = time.monotonic() + 5, None
         while not stop:
             if any(c.poll() is not None for c in children):
                 raise RuntimeError("A clock process exited; inspect logs")
@@ -264,6 +276,15 @@ logging_level 6
                     flush=True,
                 )
                 next_sensor_check = time.monotonic() + 60
+            # Every 5 s: a restarted chronyd reads makestep from its config again, and its first
+            # clock update comes several seconds after its start.
+            if time.monotonic() >= next_steps_check and Path("/usr/bin/chronyc").exists():
+                ok, message = disable_clock_steps()
+                if ok != steps_off:
+                    print(("PTP host clock: chrony clock steps off: " if ok else
+                           "PTP host clock: could not turn chrony's clock steps off: ") + message, flush=True)
+                steps_off = ok
+                next_steps_check = time.monotonic() + 5
             time.sleep(0.5)
     finally:
         for c in reversed(children):

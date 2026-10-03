@@ -3163,7 +3163,9 @@ class LiveProcessor:
         objects, audit = (lidar["objects"], lidar["audit"])
         self.sequence += 1
         if self.last_frame_time is not None and not 0 < timestamp - self.last_frame_time <= TRACK_GAP_SEC:
+            next_id = self.tracker.next_id
             self.tracker = ObjectTracker()
+            self.tracker.next_id = next_id  # track numbers go on: one session never reuses one
         self.last_frame_time = timestamp
         tracked = self.tracker.update(
             self.sequence,
@@ -3695,7 +3697,7 @@ class RawUploader:
     def close(self):
         self.stop_event.set()
         if self.thread.is_alive():
-            self.thread.join(timeout=7)
+            self.thread.join(timeout=6)
 
 
 class JsonlTail:
@@ -3736,6 +3738,7 @@ class Run:
         self.pcaps = JsonlTail(self.pcap_dir / "pcaps.jsonl")
         self.closed = False
         self.validated_rows = 0
+        self.bad_pcaps = set()
 
     def refresh(self, with_frames=True):
         rows = self.frames.read() if with_frames else []
@@ -3750,25 +3753,37 @@ class Run:
             self.pcaps.read()
 
     def pcap_records(self):
+        """The listed PCAPs; one that is gone or not the listed size is left out (said once), so
+        the frames it covers go without LiDAR instead of the analysis stopping on every start."""
         for row in self.pcaps.rows:
             path = Path(row["path"])
             if not path.is_absolute():
                 path = self.pcap_dir / path
-            if not path.is_file():
-                raise FileNotFoundError(f"Committed PCAP missing: {path}")
-            if "disk_bytes" in row and path.stat().st_size != int(row["disk_bytes"]):
-                raise RuntimeError(f"Committed PCAP size mismatch: {path}")
+            try:
+                if not path.is_file():
+                    raise FileNotFoundError("missing")
+                if "disk_bytes" in row and path.stat().st_size != int(row["disk_bytes"]):
+                    raise ValueError(f"{path.stat().st_size} bytes, listed {row['disk_bytes']}")
+            except (OSError, ValueError) as exc:
+                if path not in self.bad_pcaps:
+                    self.bad_pcaps.add(path)
+                    print(f"[ANALYSIS] listed PCAP left out ({exc}): {path}", flush=True)
+                continue
             yield dict(row, path=str(path))
 
 
 def ready_frames(run, count, pcaps, allow_tail):
     watermark = max((float(p["last_timestamp"]) for p in pcaps), default=float("-inf"))
-    now = time.time()
+    now, now_monotonic = time.time(), time.monotonic()
     selected = []
     for row in run.frames.rows[count:]:
         timestamp = frame_time(row)
+        # How long ago the collector got the frame, on the shared monotonic clock (no clock step
+        # moves it); the capture time against the host clock only for rows without it.
+        arrived = row.get("arrival_monotonic")
+        age = now_monotonic - float(arrived) if arrived is not None else now - timestamp
         if (not allow_tail and timestamp - OFFSET_SEC + SCAN_SEARCH_HALF_WINDOW_SEC > watermark
-                and now - timestamp < LIDAR_WAIT_MAX_SEC):
+                and age < LIDAR_WAIT_MAX_SEC):
             break
         selected.append(row)
         if len(selected) >= BATCH_SIZE:

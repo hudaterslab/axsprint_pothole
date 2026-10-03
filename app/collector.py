@@ -1104,6 +1104,7 @@ class LidarRawRecorder:
         self.pcap_writer = None
         self.pending_recorder = None
         self.pending_boundary = None
+        self.writer_boundary = float("-inf")  # start of the current writer's folder
         self.pcap_peer = LinkHeaderBuilder(dst_port=int(port))
         self.peer_known = False
         self.sequence_tracker = xt32_packet.SequenceTracker()
@@ -1155,6 +1156,7 @@ class LidarRawRecorder:
         if self.pending_recorder is None or timestamp < self.pending_boundary:
             return False
         recorder = self.pending_recorder
+        self.writer_boundary = self.pending_boundary
         self.pending_recorder = None
         self.pending_boundary = None
         self.recorder = recorder
@@ -1262,6 +1264,11 @@ class LidarRawRecorder:
     def _write_packet(self, timestamp: float, payload: bytes):
         with self.storage_lock:
             self._apply_pending_rotation_locked(timestamp)
+            if timestamp < self.writer_boundary:
+                # Older than the folder being written: only after a forced switch, when this
+                # thread was held up past the boundary. It belongs to a folder already closed.
+                GUARD.reject("lidar_late_for_closed_folder")
+                return
             self.pcap_writer.write_packet(timestamp, payload)
         with self.lock:
             self.saved_packet_count += 1

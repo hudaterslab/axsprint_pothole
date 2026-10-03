@@ -145,12 +145,17 @@ DEFAULT_DST_PORT = 2368
 
 
 def _fsync_directory(path: Path) -> None:
-    """Persist a rename; a failure is a storage failure like any write error."""
-    descriptor = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
+    """Persist a rename; on failure, say so (the file itself is synced; a power cut could undo
+    only its rename, and the analysis skips a listed file that is missing)."""
+    descriptor = None
     try:
+        descriptor = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
         os.fsync(descriptor)
+    except OSError as exc:
+        print(f"[LiDAR WARN] directory sync failed for {path}: {exc}", flush=True)
     finally:
-        os.close(descriptor)
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def pcap_global_header() -> bytes:
@@ -298,6 +303,8 @@ class PcapLidarWriter:
         self.queue_block_count = 0
         self.queue_block_seconds = 0.0
         self.writer_errors = []
+        self.sync_errors = []  # files whose data could not be synced: kept as .tmp, never listed
+        self._file_failed = False
 
         self.thread = threading.Thread(target=self._worker, name="lidar-pcap-writer", daemon=True)
         self.thread.start()
@@ -339,7 +346,7 @@ class PcapLidarWriter:
         self.file_packet_count += 1
         self.file_payload_bytes += len(payload)
         if len(self.buffer) >= self.flush_bytes:
-            self._submit({"kind": "data", "blob": bytes(self.buffer)})
+            self._submit({"kind": "data", "blob": bytes(self.buffer), "sequence": self.sequence})
             self.buffer = bytearray()
 
     def _submit(self, job):
@@ -387,6 +394,8 @@ class PcapLidarWriter:
                 try:
                     if job is None:
                         return
+                    if self.writer_errors:  # after a write error nothing more is sealed or listed
+                        continue
                     handle, temp_path = self._apply(job, handle, temp_path)
                 except Exception as exc:
                     with self.lock:
@@ -416,20 +425,32 @@ class PcapLidarWriter:
         packet drops.  Syncing incrementally keeps each pause small and leaves
         almost nothing for the final one.
 
-        An error is not swallowed: the kernel reports a lost write-back only once,
-        so the file would otherwise be sealed and listed as if it were on disk.
-        It fails the writer, like a write error, and the file is never listed.
+        A failed sync marks the file: the kernel reports a lost write-back only
+        once, so a later sync of the same file could succeed and list data that is
+        not on disk. The file is kept as .tmp and never listed; recording goes on
+        with the next file (a failing drive shows as one such error per file).
+        A write error (flush) still fails the writer, as before.
         """
         handle.flush()
-        if full:
-            os.fsync(handle.fileno())
-        else:
-            os.fdatasync(handle.fileno())
+        try:
+            if full:
+                os.fsync(handle.fileno())
+            else:
+                os.fdatasync(handle.fileno())
+        except (OSError, ValueError) as exc:
+            if not self._file_failed:
+                print(f"[LiDAR WARN] PCAP sync failed, {Path(handle.name).name} will not be listed: {exc}",
+                      flush=True)
+                with self.lock:
+                    self.sync_errors.append(f"{Path(handle.name).name}: {exc}")
+                    del self.sync_errors[:-20]
+            self._file_failed = True
 
     def _apply(self, job, handle, temp_path):
         if handle is None:
             handle, temp_path, _ = self._open_file(job.get("sequence", self.sequence))
             self._unsynced = 0
+            self._file_failed = False
         if job["blob"]:
             handle.write(job["blob"])
             self._unsynced += len(job["blob"])
@@ -442,6 +463,8 @@ class PcapLidarWriter:
         self._sync(handle, full=True)
         self._unsynced = 0
         handle.close()
+        if self._file_failed:
+            return None, None
         filename = f"{job['sequence']:08d}{self.suffix}"
         final_path = self.directory / filename
         os.replace(temp_path, final_path)
@@ -501,4 +524,5 @@ class PcapLidarWriter:
                 "pcap_queue_block_count": self.queue_block_count,
                 "pcap_queue_block_seconds": self.queue_block_seconds,
                 "pcap_writer_errors": list(self.writer_errors),
+                "pcap_sync_errors": list(self.sync_errors),
             }
