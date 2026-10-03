@@ -89,6 +89,8 @@ PTP 기준 시계는 계속 동작합니다. 분석 터미널도 부팅할 때�
 이 도우미와 systemd·sudoers·LXQt 자동 시작 등록은 운영체제의 표준 위치에 유지합니다.
 원본은 `deploy/`에 있으며 `install.sh`가 설치합니다.
 도우미는 PTP 서비스를 시작 요청한 다음 이 폴더의 `collect_data.py`를 실행합니다.
+수집기는 단말기에서 가장 높은 우선순위(CPU `nice -10`, 디스크 best-effort 0)로 돌고, 분석기는 가장 낮게
+(CPU `nice 19`, 디스크 idle) 돕니다. 도우미를 바꾸면 `sudo ./install.sh`로 다시 설치해야 적용됩니다.
 `porthole-collector.service`는 중복 수집 방지를 위해 비활성화했습니다.
 기준 시계 상태는 `systemctl status ptp-pothole-master.service`로 확인합니다.
 
@@ -99,7 +101,7 @@ PCAP와 목록 파일은 `lidar/00000000.pcap`, `lidar/pcaps.jsonl`처럼 `lidar
 라이다는 경계를 넘은 첫 패킷에서 다음 폴더로 넘어가고, 그때 패킷이 없으면(라이다 끊김, PTP 대기) 경계 5초 뒤에
 넘어가며 이전 폴더의 마지막 파일을 마감합니다. 수집기가 켜질 때 외장 SSD가 아직 인식되지 않았으면 90초까지 기다립니다.
 PTP 검사는 시작할 때만 저장을 막습니다(두 센서가 이 단말기 시계를 0.1 ms 안으로 5초 연속 따라야 저장 시작).
-저장이 시작된 뒤에는 계속 저장하고, 1초마다 하는 검사는 `meta/ptp_status.jsonl`의 `check`에 기록만 합니다
+저장이 시작된 뒤에는 계속 저장하고, 검사는 10초마다 해서 `meta/ptp_status.jsonl`의 `check`에 기록만 합니다
 (어긋나면 수집 창에 `[PTP] CHECK reason=... (recording continues)`). 시계는 PTP가 스스로 맞추고, 10-03에는
 센서 시계가 수 ns 안으로 맞는데도 상태 응답 하나가 덜 와서 저장이 1초씩 두 번 멈췄기 때문입니다.
 시각이 크게 틀린 데이터는 그대로 걸러집니다(카메라: 단말기 시계와 2초 넘게 차이, 라이다: 단말기 PTP 시계와 비교).

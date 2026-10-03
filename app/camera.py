@@ -311,6 +311,7 @@ class CameraCapture:
         self.watchdog_sec = watchdog_sec
         self.connection_timeout_sec = connection_timeout_sec
         self.lock = threading.Lock()
+        self.frame_ready = threading.Condition(self.lock)  # read() waits on it for the next frame
         self.frames = deque()
         self.buffer_size = max(1, buffer_size)
 
@@ -349,8 +350,12 @@ class CameraCapture:
             reference = self.frame_timestamp or self.started_at
         return time.time() - reference <= self.watchdog_sec
 
-    def read(self):
+    def read(self, timeout=0.0):
+        """(True, frame) for the oldest frame waiting, else (False, None) after waiting up to
+        timeout seconds for one: the collector's loop waits here instead of polling."""
         with self.lock:
+            if not self.frames and timeout > 0:
+                self.frame_ready.wait(timeout)
             if not self.frames:
                 return False, None
             image, info = self.frames.popleft()
@@ -443,6 +448,7 @@ class CameraCapture:
                         self.frames.popleft()
                         self.overwritten_count += 1
                     self.frames.append((image, info))
+                    self.frame_ready.notify()
                     self.last_emitted_capture = utc
                     self.buffer_high_watermark = max(self.buffer_high_watermark, len(self.frames))
         except Exception as exc:

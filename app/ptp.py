@@ -333,6 +333,9 @@ def attach_filter(sock, program=PTP_FRAME_FILTER):
     )
 
 
+SENSOR_LOG_SEC = 10  # after the startup check, how often the sensors' PTP state is read and logged
+
+
 class PtpGuard:
     def __init__(self):
         self.lock = threading.Lock()
@@ -362,7 +365,7 @@ class PtpGuard:
                     "lidar_packet_payload": "unchanged native PTP/TAI; subtract advertised currentUtcOffset exactly once",
                     "gps_timestamp": "host receive UTC; GPS fix fields retain receiver data",
                     "ptp_required": True,
-                    "ptp_admission": "startup check only; afterwards the per-second check is logged "
+                    "ptp_admission": "startup check only; afterwards the check (every 10 s) is logged "
                                      "(ptp_status.jsonl 'check') and does not stop recording",
                     "grandmaster_identity": MASTER,
                     "max_ptp_offset_ns": 100000,
@@ -370,7 +373,6 @@ class PtpGuard:
                     "startup_stable_seconds": 5,
                     "grandmaster_clock": "both PHCs follow a common host reference with rate limits; their skew is checked with hardware cross timestamps",
                     "lidar_epoch_validation": "compared with PHC0 time, independently of host NTP corrections",
-                    "lidar_clock_bin": "<QQQII per accepted incoming packet: sensor UTC ns, receive UTC ns, native PTP ns, sequence uint32, UTC offset seconds uint32; before FoV filter",
                     "camera_lidar_offset_sec": 0,
                     "exposure_phase_alignment": "See motion validation report; PTP does not trigger exposures or motor phase.",
                 },
@@ -402,7 +404,7 @@ class PtpGuard:
     def qualification(self):
         """Whether data may be saved, (ok, reason). Until the startup check has passed (both
         sensors on this master within 100 us, status fresh, 5 s in a row), only when it passes;
-        from then on always. PTP keeps the clocks by itself, and the per-second check
+        from then on always. PTP keeps the clocks by itself, and the check
         (current_qualification) is only logged: a status reply that came back incomplete stopped
         recording for a second twice on 2026-10-03 while both clocks were within a few ns.
         Grossly wrong sensor times are still refused where data comes in (camera RTCP against
@@ -510,16 +512,24 @@ class PtpGuard:
             print("[PTP WARN] " + message, flush=True)
 
     def monitor(self):
-        reported = None
+        reported, next_sensor_read = None, 0.0
         while not self.stop_event.is_set():
             try:
-                sensors = read_all()
+                # Every second: the LiDAR packet times are checked against this clock.
                 master = self.read_master_clock()
                 with self.lock:
-                    self.sensors = sensors
                     self.master_clock = master
+                if time.monotonic() < next_sensor_read:
+                    self.stop_event.wait(1)
+                    continue
+                # The sensors (two pmc runs): every second until the startup check has passed,
+                # then every SENSOR_LOG_SEC, as from then on their state is only logged.
+                sensors = read_all()
+                with self.lock:
+                    self.sensors = sensors
+                next_sensor_read = time.monotonic() + (SENSOR_LOG_SEC if self.startup_ready else 0)
                 state = self.qualification()  # whether data is saved
-                check = self.current_qualification()  # this second's check; after startup only logged
+                check = self.current_qualification()  # the check; after startup only logged
                 if not state[0]:
                     text = "WAITING reason=" + state[1]
                 elif check[0]:

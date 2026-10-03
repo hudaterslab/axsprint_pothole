@@ -1092,11 +1092,6 @@ def close_interrupted_runs(save_dir: Path):
             print(f"[RECOVER WARN] {run_dir}: {exc}", flush=True)
 
 
-# meta/lidar_clock.bin row: sensor UTC ns, receive UTC ns, native PTP ns,
-# sequence, UTC offset seconds.
-LIDAR_CLOCK_RECORD = struct.Struct("<QQQII")
-
-
 class LidarRawRecorder:
     """LiDAR UDP raw packet만 파일에 덤프한다. 파싱/좌표변환은 하지 않는다."""
 
@@ -1137,9 +1132,6 @@ class LidarRawRecorder:
         self.received_packet_count = 0
         self.last_receive_timestamp = 0.0
         self.last_ptp_ns = None
-        self.clock_recorder = None
-        self.clock_path = None
-        self.clock_file = None
 
     def _new_writer(self, recorder: "RunRecorder") -> PcapLidarWriter:
         return PcapLidarWriter(
@@ -1232,9 +1224,6 @@ class LidarRawRecorder:
             except Exception as exc:
                 self.storage_errors.append(repr(exc))
                 print(f"[LiDAR] pcap writer close failed: {exc}")
-        if self.clock_file:
-            self.clock_file.close()
-            self.clock_file = None
 
     def stats(self):
         with self.lock:
@@ -1300,8 +1289,7 @@ class LidarRawRecorder:
             return
         try:
             native, sequence = xt32_clock(data)
-            announce = GUARD.status()[1]
-            utc = native_to_utc(native, announce)
+            utc = native_to_utc(native, GUARD.announce)  # the latest Announce (replaced whole, never changed)
         except ValueError:
             GUARD.reject("lidar_invalid_clock")
             return
@@ -1315,22 +1303,6 @@ class LidarRawRecorder:
             GUARD.reject("lidar_nonmonotonic")
             return
         self.last_ptp_ns = utc
-        recorder = GUARD.recorder(utc)
-        if recorder is not self.clock_recorder:
-            # A run's meta_dir never changes, so neither does its clock file.
-            self.clock_recorder = recorder
-            path = recorder.meta_dir / "lidar_clock.bin" if recorder else None
-            if path != self.clock_path:
-                if self.clock_file:
-                    self.clock_file.close()
-                self.clock_path = path
-                self.clock_file = path.open("ab", buffering=1 << 20) if path else None
-        if self.clock_file:
-            self.clock_file.write(
-                LIDAR_CLOCK_RECORD.pack(
-                    utc, arrival, native, sequence, announce["current_utc_offset"]
-                )
-            )
         timestamp = utc / NS
         with self.lock:
             self.sequence_tracker.update(sequence)
@@ -2552,10 +2524,11 @@ def _run_collector(stop: threading.Event):
                 time.sleep(0.01)
                 continue
 
-            ok, frame = cap.read()
+            # Waits for the next frame (one comes every 33 ms) instead of polling every 5 ms;
+            # the checks above still run at least every 50 ms.
+            ok, frame = cap.read(timeout=0.05)
             if not ok:
                 if cap.isOpened():
-                    time.sleep(0.005)
                     continue
                 schedule_camera_reconnect("frame read failed or watchdog expired")
                 continue
