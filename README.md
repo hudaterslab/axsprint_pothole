@@ -149,7 +149,8 @@ sudo reboot
 
 `install.sh`가 하는 일은 다음과 같습니다.
 
-- 패키지: linuxptp·chrony·GStreamer/VAAPI 등 apt 패키지와 numpy·opencv-python(pip)
+- 패키지: linuxptp·chrony·GStreamer/VAAPI 등 apt 패키지와 numpy·opencv-python·simplejpeg(pip).
+  simplejpeg는 분석기가 사진을 읽을 때 씁니다(OpenCV와 같은 픽셀, CPU 약 3분의 1 절약). 없으면 OpenCV로 읽습니다.
 - 사용자 그룹: `dialout`(GPS), `video`·`render`(하드웨어 디코딩)
 - PTP: `/dev/ptp0`·`/dev/ptp1` 읽기 권한(udev), 보정 속도를 제한한 chrony,
   `systemd-timesyncd` 중지, `ptp-pothole-master.service` 설치·시작

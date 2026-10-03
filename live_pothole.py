@@ -62,6 +62,11 @@ import urllib.request
 import uuid
 import zlib
 
+try:  # libjpeg-turbo like OpenCV: the same pixels for about a third less CPU (pip install simplejpeg)
+    import simplejpeg
+except ImportError:  # not installed: OpenCV reads the pictures
+    simplejpeg = None
+
 PROJECT = Path(__file__).resolve().parent
 
 ROOT = Path("/mnt/ssd/porthole_runs")  # collector recordings
@@ -933,12 +938,21 @@ def letterbox_rgb_uint8(image_bgr: np.ndarray, out: np.ndarray) -> tuple[np.ndar
     scale = min(size / width, size / height)
     resized_width = max(1, min(size, int(round(width * scale))))
     resized_height = max(1, min(size, int(round(height * scale))))
-    resized = cv2.resize(image_bgr, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
+    if image_bgr.ndim == 3 and (width, height) == (3 * resized_width, 3 * resized_height):
+        # The camera's 1920x1080: cv2.INTER_LINEAR at exactly a third takes source pixel
+        # 3 * i + 1 with weight 1 (its fixed-point weights are 2048 and 0), so taking those
+        # pixels gives the same bytes at a third of the CPU time.
+        resized = np.ascontiguousarray(image_bgr[1::3, 1::3])
+    else:
+        resized = cv2.resize(image_bgr, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
     pad_x = (size - resized_width) // 2
     pad_y = (size - resized_height) // 2
     input_nhwc = out
     input_nhwc.fill(114)
-    input_nhwc[0, pad_y : pad_y + resized_height, pad_x : pad_x + resized_width] = resized[:, :, ::-1]
+    # cvtColor swaps the channels as resized[:, :, ::-1] would, without numpy's slow strided copy.
+    input_nhwc[0, pad_y : pad_y + resized_height, pad_x : pad_x + resized_width] = cv2.cvtColor(
+        resized, cv2.COLOR_BGR2RGB
+    )
     context = LetterboxContext(
         original_width=width,
         original_height=height,
@@ -999,11 +1013,11 @@ def decode_detections(
         raise ValueError(f"unexpected detection output shape: {prediction.shape}")
     class_scores = prediction[4 : 4 + len(class_names)]
     class_ids = np.argmax(class_scores, axis=0)
-    confidences = class_scores[class_ids, np.arange(class_scores.shape[1])]
-    selected = np.flatnonzero(
-        (confidences >= confidence_threshold)
-        & np.isin(class_ids, np.fromiter(selected_class_ids, dtype=np.int64))
-    )
+    confidences = class_scores.max(axis=0)  # the score at class_ids
+    keep = confidences >= confidence_threshold
+    if not set(range(len(class_names))) <= set(selected_class_ids):  # this model: every class
+        keep &= np.isin(class_ids, np.fromiter(selected_class_ids, dtype=np.int64))
+    selected = np.flatnonzero(keep)
     detections: list[Detection] = []
     for index in selected:
         center_x, center_y, width, height = prediction[:4, index]
@@ -1065,12 +1079,10 @@ def attach_masks(
             (context.original_width, context.original_height),
             interpolation=cv2.INTER_LINEAR,
         )
-        mask = restored >= threshold
         x1, y1, x2, y2 = np.rint(detection.box_xyxy).astype(int)
-        cropped = np.zeros_like(mask)
-        cropped[max(0, y1) : y2 + 1, max(0, x1) : x2 + 1] = mask[
-            max(0, y1) : y2 + 1, max(0, x1) : x2 + 1
-        ]
+        box = (slice(max(0, y1), y2 + 1), slice(max(0, x1), x2 + 1))
+        cropped = np.zeros(restored.shape, bool)
+        cropped[box] = restored[box] >= threshold  # the mask is kept inside the box only
         detection.mask = cropped
 
 
@@ -1275,6 +1287,11 @@ class ObjectTracker:
         self.last_frame = None
 
     def _motion(self, image, needed):
+        if not needed:
+            # No track and no detection: no motion now, and none on the next frame either
+            # (it would need this frame's features), so this frame is not even shrunk.
+            self.previous = self.previous_points = None
+            return None
         height, width = image.shape[:2]
         scale = self.settings["image_width"] / width
         small = cv2.resize(
@@ -2161,8 +2178,18 @@ class PotholeScan:
         h, w = shape
         self.visible = visible & (self.pixels[:, 0] >= 0) & (self.pixels[:, 0] < w) & (self.pixels[:, 1] >= 0) & (self.pixels[:, 1] < h)
         self.uv = np.where(self.visible[:, None], self.pixels, 0).astype(int)
-        self.union = np.logical_or.reduce(self.masks) if self.masks else np.zeros(shape, bool)
-        self.road_ok = self.visible & ~self.union[self.uv[:, 1], self.uv[:, 0]]
+        self.shape, self._union = shape, None
+        covered = np.zeros(len(self.uv), bool)  # in any model area, looked up at the points only
+        for mask in self.masks:
+            covered |= mask[self.uv[:, 1], self.uv[:, 0]]
+        self.road_ok = self.visible & ~covered
+
+    @property
+    def union(self):
+        """Every model area of the frame as one image mask (pothole_check.py)."""
+        if self._union is None:
+            self._union = np.logical_or.reduce(self.masks) if self.masks else np.zeros(self.shape, bool)
+        return self._union
 
     def inside(self, mask):
         return self.visible & mask[self.uv[:, 1], self.uv[:, 0]]
@@ -2850,7 +2877,7 @@ class RecordingAlignment:
                 row = (float(record["timestamp"]), float(record["speed_mps"]))
             except (KeyError, TypeError, ValueError):
                 continue
-            if np.isfinite(row).all() and row[1] >= 0:
+            if math.isfinite(row[0]) and math.isfinite(row[1]) and row[1] >= 0:
                 speed_records.append(row)
         self.speeds = np.asarray(sorted(speed_records), dtype=float).reshape(-1, 2)
 
@@ -3082,7 +3109,14 @@ class LiveProcessor:
         def read_image(row):
             path = Path(row["path"])
             path = path if path.is_absolute() else run / path
-            image = cv2.imread(str(path))
+            image = None
+            if simplejpeg is not None:
+                try:
+                    image = simplejpeg.decode_jpeg(path.read_bytes(), colorspace="BGR")
+                except (OSError, ValueError, RuntimeError):
+                    image = None  # OpenCV decides, as before, what a damaged or missing file gives
+            if image is None:
+                image = cv2.imread(str(path))
             if image is None:  # a broken JPEG: analysed as a blank picture, not a crash and restart
                 print(f"[ANALYSIS] unreadable image, analysed as blank: {path}", flush=True)
                 image = np.zeros((1080, 1920, 3), np.uint8)
@@ -3847,19 +3881,35 @@ def wait_for_collector(stopping):
     raise InterruptedError("Live analysis stopping")
 
 
+_DISCOVERED = {}  # frames.jsonl -> (inode, PTP recording or not, run folder), once its first row is complete
+
+
 def discover(root):
-    """PTP recordings under root/YYYYMMDD/<run>; others (e.g. new_data) are skipped."""
+    """PTP recordings under root/YYYYMMDD/<run>; others (e.g. new_data) are skipped.
+
+    The loop asks twice a second and the SSD keeps every run, so a manifest's first row, which
+    decides and never changes, is read only once per file (a replaced file is read again)."""
     result = set()
     for path in root.glob("*/*/frames/frames.jsonl"):
         try:
-            with path.open("rb") as stream:
-                first = stream.readline()
+            inode = path.stat().st_ino
         except FileNotFoundError:  # deleted while listing
             continue
-        if first.endswith(b"\n") and first.strip():
-            if json.loads(first).get("timestamp_source") != "camera_ptp_rtcp_utc":
+        known = _DISCOVERED.get(path)
+        if known is None or known[0] != inode:
+            try:
+                with path.open("rb") as stream:
+                    first = stream.readline()
+            except FileNotFoundError:  # deleted while listing
                 continue
-        result.add(path.parent.parent.resolve())
+            run = path.parent.parent.resolve()
+            if first.endswith(b"\n") and first.strip():
+                known = (inode, json.loads(first).get("timestamp_source") == "camera_ptp_rtcp_utc", run)
+                _DISCOVERED[path] = known
+            else:
+                known = (inode, True, run)  # no first row yet: taken, and read again next time
+        if known[1]:
+            result.add(known[2])
     return sorted(result, key=lambda p: str(p))
 
 

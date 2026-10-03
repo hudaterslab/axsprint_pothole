@@ -44,8 +44,9 @@ APT_PACKAGES=(
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-vaapi
   intel-media-va-driver libgl1 qterminal
 )
-# The versions the first unit collects with.
-PIP_PACKAGES=(numpy==2.2.6 opencv-python==4.13.0.92)
+# The versions the first unit collects with. simplejpeg: the analysis reads its JPEGs with it
+# (same pixels as OpenCV, about a third less CPU); without it, OpenCV reads them.
+PIP_PACKAGES=(numpy==2.2.6 opencv-python==4.13.0.92 simplejpeg==1.9.0)
 
 NM_FIELDS=connection.interface-name,802-3-ethernet.mac-address,ipv4.method,ipv4.addresses,ipv4.routes,ipv4.never-default,ipv6.method,connection.autoconnect,connection.autoconnect-priority
 

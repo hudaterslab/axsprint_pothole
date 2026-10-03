@@ -109,7 +109,7 @@ preflight() {
 # DEEPX NPU runtime and Python packages that live_pothole.py imports.
 check_runtime() {
   local module
-  for module in numpy cv2; do
+  for module in numpy cv2 simplejpeg; do
     if as_user python3 -c "import $module" >/dev/null 2>&1; then
       say "runtime: python $module ok"
     else
