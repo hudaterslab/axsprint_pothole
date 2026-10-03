@@ -1,6 +1,7 @@
 """Two hardware LAN ports serving one PTP grandmaster with bounded UTC discipline.
 
-No system clock writes. Both PHCs use the same CLOCK_REALTIME reference.
+The system clock is not written here; chrony only finishes its NTP correction once, before
+the timebase starts, and only slews afterwards. Both PHCs use the same CLOCK_REALTIME reference.
 Requires linuxptp 3.1.1+, root, and exclusive ownership of these PTP interfaces.
 """
 
@@ -20,6 +21,21 @@ from ptp import enable_sensors, camera_command
 # TAI - UTC in seconds, advertised in every Announce; changes only with a leap second.
 UTC_OFFSET = 37
 
+# Set once the PTP timebase is set up in this boot (/run is emptied at every boot), so that a
+# restart of this service neither waits for NTP again nor steps the host clock under the sensors.
+TIMEBASE_MARK = Path("/run/ptp_pothole_timebase")
+
+LOG_STARTS = 30  # var/logs keeps the logs of this many service starts (phc2sys: ~7 MB a day per port)
+
+
+def prune_logs(logdir, keep=LOG_STARTS):
+    """Make room for one more set of logs: each start writes <YYYYmmdd_HHMMSS>_<label> files,
+    and only the newest keep - 1 earlier sets stay."""
+    starts = sorted({path.name[:15] for path in logdir.iterdir() if path.name[8:9] == "_"})
+    for old in starts[: max(0, len(starts) - (keep - 1))]:
+        for path in logdir.glob(old + "_*"):
+            path.unlink(missing_ok=True)
+
 
 def main():
     base = Path(__file__).resolve().parent
@@ -36,6 +52,7 @@ def main():
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     logdir = state / "logs"
     logdir.mkdir(exist_ok=True)
+    prune_logs(logdir)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     children = []
     logs = []
@@ -77,52 +94,69 @@ uds_address /var/run/ptp_pothole
 logging_level 6
 """)
     try:
-        # Use the same bounded host-clock wait as the foreground collector.
-        # Advertising PTP before the first NTP correction makes both sensor
-        # servos follow that correction and can interrupt admission at boot.
-        clock_deadline = time.monotonic() + 60
-        waiting_logged = False
-        while not stop:
-            try:
-                check = subprocess.run(
-                    ["/usr/bin/timedatectl", "show", "-p", "NTP", "-p", "NTPSynchronized"],
-                    capture_output=True,
-                    text=True,
-                    timeout=3,
-                )
-                clock = dict(
-                    line.split("=", 1) for line in check.stdout.splitlines() if "=" in line
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                clock = {}
-            if clock.get("NTPSynchronized") == "yes":
-                print("PTP host clock: NTP synchronized", flush=True)
-                break
-            if clock.get("NTP") == "no":
-                print("PTP host clock: NTP disabled; using RTC", flush=True)
-                break
-            if time.monotonic() >= clock_deadline:
-                print("PTP host clock: NTP wait timed out after 60s; using RTC", flush=True)
-                break
-            if not waiting_logged:
-                print(
-                    "PTP host clock: waiting for initial NTP synchronization (up to 60s)",
-                    flush=True,
-                )
-                waiting_logged = True
-            time.sleep(0.5)
-        if stop:
-            return
-        if clock.get("NTPSynchronized") == "yes" and Path("/usr/bin/chronyc").exists():
-            # Startup only: finish the pending NTP correction before creating
-            # the PTP timebase. Runtime corrections remain bounded by chrony.
-            subprocess.run(["/usr/bin/chronyc", "makestep"], check=True, timeout=5)
+        if TIMEBASE_MARK.exists():
+            print("PTP host clock: timebase set up earlier in this boot", flush=True)
+        else:
+            # Use the same bounded host-clock wait as the foreground collector.
+            # Advertising PTP before the first NTP correction makes both sensor
+            # servos follow that correction and can interrupt admission at boot.
+            clock_deadline = time.monotonic() + 60
+            waiting_logged = False
+            while not stop:
+                try:
+                    check = subprocess.run(
+                        ["/usr/bin/timedatectl", "show", "-p", "NTP", "-p", "NTPSynchronized"],
+                        capture_output=True,
+                        text=True,
+                        timeout=3,
+                    )
+                    clock = dict(
+                        line.split("=", 1) for line in check.stdout.splitlines() if "=" in line
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    clock = {}
+                if clock.get("NTPSynchronized") == "yes":
+                    print("PTP host clock: NTP synchronized", flush=True)
+                    break
+                if clock.get("NTP") == "no":
+                    print("PTP host clock: NTP disabled; using RTC", flush=True)
+                    break
+                if time.monotonic() >= clock_deadline:
+                    print("PTP host clock: NTP wait timed out after 60s; using RTC", flush=True)
+                    break
+                if not waiting_logged:
+                    print(
+                        "PTP host clock: waiting for initial NTP synchronization (up to 60s)",
+                        flush=True,
+                    )
+                    waiting_logged = True
+                time.sleep(0.5)
+            if stop:
+                return
+            if Path("/usr/bin/chronyc").exists():
+                if clock.get("NTPSynchronized") == "yes":
+                    # Startup only: finish the pending NTP correction before creating
+                    # the PTP timebase. Runtime corrections remain bounded by chrony.
+                    subprocess.run(["/usr/bin/chronyc", "makestep"], check=True, timeout=5)
+                # From here on chrony may only slew the host clock. phc2sys never steps the
+                # PHCs after its start, so a step now (a first NTP update arriving late) would
+                # leave both sensors seconds behind the host for hours, and the camera's RTCP
+                # times would be refused for being that far from the host clock.
+                result = subprocess.run(["/usr/bin/chronyc", "makestep", "1", "0"],
+                                        capture_output=True, text=True, timeout=5)
+                print("PTP host clock: no clock steps from now on: "
+                      + (result.stdout + result.stderr).strip(), flush=True)
+            TIMEBASE_MARK.write_text(f"{time.time_ns()}\n")
         for interface, phc in [("enp1s0", "ptp0"), ("enp2s0", "ptp1")]:
             expected = Path("/sys/class/net") / interface / "device/ptp" / phc
             if not expected.exists():
                 raise RuntimeError(interface + " has an unexpected PHC")
-        # Stop the camera's old servo while the host hardware clocks initialize.
-        camera_command("stop-ptp")
+        # Stop the camera's old servo while the host hardware clocks initialize. A camera that
+        # cannot be reached (off, still booting) must not keep the LiDAR from getting PTP.
+        try:
+            camera_command("stop-ptp")
+        except OSError as exc:
+            print(f"PTP camera stop-ptp not sent: {exc}", flush=True)
         # Both ports use the same reference and controller. This source/sink
         # combination uses the NIC's precise hardware/host cross timestamps;
         # direct PHC-to-PHC MMIO reads are too asymmetric on this device.
@@ -196,9 +230,11 @@ logging_level 6
             try:
                 camera_command("start-ptp")
                 break
-            except OSError:
+            except OSError as exc:
                 if time.monotonic() >= camera_deadline:
-                    raise
+                    # Keep serving the LiDAR; enable_sensors() starts the camera's PTP later.
+                    print(f"PTP camera start-ptp not sent: {exc}", flush=True)
+                    break
                 time.sleep(0.5)
         (state / "ptp_runtime.json").write_text(
             json.dumps(

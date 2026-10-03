@@ -432,7 +432,8 @@ class CameraCapture:
                     camera_ssrc=meta["ssrc"],
                     timestamp_source="camera_ptp_rtcp_utc",
                     capture_mode="gstreamer_vaapi_ptp",
-                    ptp_grandmaster=GUARD.status()[0]["camera"]["grandmaster_identity"],
+                    # A newer status than the one qualified above may be an error row.
+                    ptp_grandmaster=GUARD.status()[0].get("camera", {}).get("grandmaster_identity"),
                 )
                 with self.lock:
                     self.frame_id += 1

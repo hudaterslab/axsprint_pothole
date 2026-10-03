@@ -55,10 +55,14 @@ mounted_target_for() {
   return 0
 }
 
-mapfile -t CANDIDATES < <(find_candidates)
-if (( ${#CANDIDATES[@]} == 0 )); then
-  fail "no ext4 USB partition labelled '$STORAGE_LABEL'; refusing internal-disk fallback"
-fi
+# At login the USB drive can still be enumerating; look again for up to WAIT_SEC.
+for (( attempt=0; ; attempt++ )); do
+  mapfile -t CANDIDATES < <(find_candidates)
+  (( ${#CANDIDATES[@]} )) && break
+  (( attempt < WAIT_SEC )) \
+    || fail "no ext4 USB partition labelled '$STORAGE_LABEL' within ${WAIT_SEC}s; refusing internal-disk fallback"
+  sleep 1
+done
 if (( ${#CANDIDATES[@]} > 1 )); then
   printf '[storage] ERROR: multiple matching USB partitions; disconnect all but one:\n' >&2
   printf '  %s\n' "${CANDIDATES[@]}" >&2

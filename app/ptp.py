@@ -244,13 +244,22 @@ def enable_sensors():
     except Exception as exc:
         result["lidar_error"] = str(exc)
     try:
+        global _camera_not_slave
         state = read_sensor("camera")
-        if state.get("port_state") != "SLAVE":
+        _camera_not_slave = 0 if state.get("port_state") == "SLAVE" else _camera_not_slave + 1
+        # START_PTP resets the camera's acquisition, so one lost reply or a camera still
+        # locking on (UNCALIBRATED) is no reason to send it; two checks in a row are (its PTP
+        # may not be running at all, which also leaves the state unreadable).
+        if _camera_not_slave >= 2:
             result["camera_start"] = camera_command("start-ptp")
+            _camera_not_slave = 0
         result["camera_state"] = state.get("port_state", state.get("error"))
     except Exception as exc:
         result["camera_error"] = str(exc)
     return result
+
+
+_camera_not_slave = 0  # enable_sensors() checks in a row without a SLAVE camera
 
 
 def udp_payload(frame):
@@ -333,6 +342,7 @@ class PtpGuard:
         self.announce_at = 0
         self.runs = []
         self.errors = []
+        self.faults = []  # the last transient read/receive failures (see fault())
         self.rejected = Counter()
         self.master_clock = None
         self.phc_fds = []
@@ -478,10 +488,22 @@ class PtpGuard:
             measurement_method="PTP_SYS_OFFSET_PRECISE",
         )
 
+    def fault(self, message):
+        """A failed status read, receive or log write. It is not fatal: the status it would have
+        refreshed goes stale, so qualification fails and data waits until reads succeed again
+        (before, one such failure ended the collector for the rest of the drive). Printed when
+        it differs from the previous one; the last 20 are kept."""
+        with self.lock:
+            changed = not self.faults or self.faults[-1] != message
+            self.faults.append(message)
+            del self.faults[:-20]
+        if changed:
+            print("[PTP WARN] " + message, flush=True)
+
     def monitor(self):
-        try:
-            reported = None
-            while not self.stop_event.is_set():
+        reported = None
+        while not self.stop_event.is_set():
+            try:
                 sensors = read_all()
                 master = self.read_master_clock()
                 with self.lock:
@@ -503,36 +525,41 @@ class PtpGuard:
                         rejected=dict(self.rejected),
                     ),
                 )
-                self.stop_event.wait(1)
-        except Exception as exc:
-            self.errors.append(repr(exc))
-            self.stop_event.set()
+            except Exception as exc:
+                self.fault("PTP status read failed: " + repr(exc))
+            self.stop_event.wait(1)
 
     def listen(self):
-        try:
-            while not self.stop_event.is_set():
-                try:
-                    frame = self.socket.recv(65536)
-                except socket.timeout:
-                    continue
+        while not self.stop_event.is_set():
+            try:
+                frame = self.socket.recv(65536)
+            except socket.timeout:
+                continue
+            except OSError as exc:  # e.g. the port went down for a moment
+                self.fault("PTP Announce receive failed: " + repr(exc))
+                self.stop_event.wait(1)
+                continue
+            try:
                 parsed = udp_payload(frame)
                 if not parsed or parsed[1] not in (319, 320):
                     continue
                 announce = ptp_announce(parsed[2])
-                if (
-                    announce
-                    and announce["domain"] == 0
-                    and announce["grandmaster_identity"] == MASTER.replace(".", "")
-                ):
-                    with self.lock:
-                        self.announce = announce
-                        self.announce_at = time.monotonic_ns()
+            except (ValueError, IndexError, struct.error):  # a malformed frame
+                continue
+            if (
+                announce
+                and announce["domain"] == 0
+                and announce["grandmaster_identity"] == MASTER.replace(".", "")
+            ):
+                with self.lock:
+                    self.announce = announce
+                    self.announce_at = time.monotonic_ns()
+                try:
                     self.log(
                         "ptp_announce.jsonl", dict(host_utc_ns=time.time_ns(), announce=announce)
                     )
-        except Exception as exc:
-            self.errors.append(repr(exc))
-            self.stop_event.set()
+                except Exception as exc:
+                    self.fault("PTP Announce log failed: " + repr(exc))
 
     def close(self):
         self.stop_event.set()

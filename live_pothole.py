@@ -108,6 +108,15 @@ MAX_SCAN_CENTER_DELTA_SEC = 0.055
 
 SCAN_GAP_SEC = 0.005
 
+# A frame waits at most this long (after it was taken) for the LiDAR file covering it. PCAPs are
+# sealed every 10 s, so an older frame's scan is not coming (the LiDAR sent nothing): it is
+# analysed without LiDAR - cracks are still reported - instead of stalling all later frames.
+LIDAR_WAIT_MAX_SEC = 60
+
+# A gap between analysed pictures longer than this (camera or PTP outage) starts tracking afresh:
+# the car has moved on, and an old track must not swallow new damage at the same spot in the image.
+TRACK_GAP_SEC = 1.0
+
 # Road plane points: the LiDAR firing nearest the camera's optical axis and this many
 # firings on each side (201 firings, all 32 channels), as codecode/lcz_to_pcap.py crops
 # a scan.
@@ -778,7 +787,7 @@ class HttpUploader:
     the server can drop repeats, and PORTHOLE_API_TOKEN, if set, is sent as a
     Bearer token. 2xx and 409 (already received) count as delivered. Malformed
     requests (400, 413, 415, 422) are permanent; everything else, including
-    redirects, is retried.
+    redirects, counts as a failed send (UploadWorker then drops the frames waiting).
     """
 
     CONTENT_TYPES = dict(jpg="image/jpeg", json="application/json",
@@ -2846,11 +2855,17 @@ class RecordingAlignment:
         self.speeds = np.asarray(sorted(speed_records), dtype=float).reshape(-1, 2)
 
     def speed_at(self, target):
-        """GPS speed (m/s) at target, or None without valid speeds on both sides within 1.5 s."""
+        """GPS speed (m/s) at target: interpolated between valid speeds on both sides within
+        1.5 s of each other, else the nearer valid speed within 1.5 s of target (a run's first
+        and last second, whose other neighbour is in the next or previous run's GPS file), else
+        None."""
         k = int(np.searchsorted(self.speeds[:, 0], target))
-        if k == 0 or k == len(self.speeds) or self.speeds[k, 0] - self.speeds[k - 1, 0] > 1.5:
+        if 0 < k < len(self.speeds) and self.speeds[k, 0] - self.speeds[k - 1, 0] <= 1.5:
+            return float(np.interp(target, self.speeds[:, 0], self.speeds[:, 1]))
+        near = [i for i in (k - 1, k) if 0 <= i < len(self.speeds) and abs(self.speeds[i, 0] - target) <= 1.5]
+        if not near:
             return None
-        return float(np.interp(target, self.speeds[:, 0], self.speeds[:, 1]))
+        return float(self.speeds[min(near, key=lambda i: abs(self.speeds[i, 0] - target)), 1])
 
     def compensate(self, raw, camera, target):
         speed = self.speed_at(target)
@@ -2999,7 +3014,7 @@ def lidar_stage(detections, target, scan, camera, angles, alignment, cache):
                     motion = dict(applied=True, **result.get("motion_compensation", {}))
                 except ValueError as exc:
                     motion = dict(applied=False, reason=str(exc))
-            except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
+            except (OSError, ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
                 result = None
                 status, error = ("plane_or_scan_invalid", str(exc))
     accepted, objects, audit, judged = validate_objects(detections, result, camera, scanned,
@@ -3027,6 +3042,7 @@ class LiveProcessor:
         self.detector = DXNNDetector(MODEL_PATH, CONFIDENCE_THRESHOLD)
         self.tracker = ObjectTracker()
         self.sequence = 0
+        self.last_frame_time = None  # capture time of the last tracked picture (TRACK_GAP_SEC)
         self.session_id = uuid.uuid4().hex
         self.scan_bounds = {}
         self.scan_cache = OrderedDict()
@@ -3067,8 +3083,9 @@ class LiveProcessor:
             path = Path(row["path"])
             path = path if path.is_absolute() else run / path
             image = cv2.imread(str(path))
-            if image is None:
-                raise FileNotFoundError(path)
+            if image is None:  # a broken JPEG: analysed as a blank picture, not a crash and restart
+                print(f"[ANALYSIS] unreadable image, analysed as blank: {path}", flush=True)
+                image = np.zeros((1080, 1920, 3), np.uint8)
             return image
 
         # iter_detect loads records strictly in order; decode the next few ahead.
@@ -3096,7 +3113,11 @@ class LiveProcessor:
         target = timestamp - OFFSET_SEC
         scan = None
         if detections:
-            candidates = scan_candidates(pcaps, target, self.scan_bounds)
+            try:
+                candidates = scan_candidates(pcaps, target, self.scan_bounds)
+            except (OSError, ValueError) as exc:  # a PCAP gone or unreadable: no scan, no crash
+                print(f"[ANALYSIS] LiDAR files unreadable, frame {row.get('frame_index')}: {exc}", flush=True)
+                candidates = []
             if candidates:
                 _, sources, start, end, delta = min(candidates, key=lambda item: item[0])
                 scan = (sources, start, end, delta)
@@ -3141,6 +3162,9 @@ class LiveProcessor:
         accepted = [detections[i] for i in lidar["accepted"]]
         objects, audit = (lidar["objects"], lidar["audit"])
         self.sequence += 1
+        if self.last_frame_time is not None and not 0 < timestamp - self.last_frame_time <= TRACK_GAP_SEC:
+            self.tracker = ObjectTracker()
+        self.last_frame_time = timestamp
         tracked = self.tracker.update(
             self.sequence,
             image,
@@ -3433,13 +3457,15 @@ class UploadWorker:
             if uploader:
                 uploader.close()
 
-    def close(self, drain_seconds=10):
+    def close(self, drain_seconds=3):
+        """Give waiting frames a moment, then stop; the whole shutdown has to fit in the 15 s the
+        analysis terminal allows before it kills the process (the CSV rows are already on disk)."""
         deadline = time.monotonic() + drain_seconds
         while self.jobs.qsize() and self.thread.is_alive() and time.monotonic() < deadline:
             time.sleep(0.1)
         self.stop_event.set()
         if self.thread.is_alive():
-            self.thread.join(timeout=self.timeout + 5)
+            self.thread.join(timeout=5)
         self.drop_waiting()
 
 
@@ -3669,7 +3695,7 @@ class RawUploader:
     def close(self):
         self.stop_event.set()
         if self.thread.is_alive():
-            self.thread.join(timeout=15)
+            self.thread.join(timeout=7)
 
 
 class JsonlTail:
@@ -3737,10 +3763,12 @@ class Run:
 
 def ready_frames(run, count, pcaps, allow_tail):
     watermark = max((float(p["last_timestamp"]) for p in pcaps), default=float("-inf"))
+    now = time.time()
     selected = []
     for row in run.frames.rows[count:]:
         timestamp = frame_time(row)
-        if not allow_tail and timestamp - OFFSET_SEC + SCAN_SEARCH_HALF_WINDOW_SEC > watermark:
+        if (not allow_tail and timestamp - OFFSET_SEC + SCAN_SEARCH_HALF_WINDOW_SEC > watermark
+                and now - timestamp < LIDAR_WAIT_MAX_SEC):
             break
         selected.append(row)
         if len(selected) >= BATCH_SIZE:

@@ -145,16 +145,12 @@ DEFAULT_DST_PORT = 2368
 
 
 def _fsync_directory(path: Path) -> None:
-    """Persist a rename (best effort)."""
-    descriptor = None
+    """Persist a rename; a failure is a storage failure like any write error."""
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
     try:
-        descriptor = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
         os.fsync(descriptor)
-    except OSError:
-        pass
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
+        os.close(descriptor)
 
 
 def pcap_global_header() -> bytes:
@@ -419,15 +415,16 @@ class PcapLidarWriter:
         queue, which backs up into the receive loop and shows up as kernel
         packet drops.  Syncing incrementally keeps each pause small and leaves
         almost nothing for the final one.
+
+        An error is not swallowed: the kernel reports a lost write-back only once,
+        so the file would otherwise be sealed and listed as if it were on disk.
+        It fails the writer, like a write error, and the file is never listed.
         """
-        try:
-            handle.flush()
-            if full:
-                os.fsync(handle.fileno())
-            else:
-                os.fdatasync(handle.fileno())
-        except (OSError, ValueError):
-            pass
+        handle.flush()
+        if full:
+            os.fsync(handle.fileno())
+        else:
+            os.fdatasync(handle.fileno())
 
     def _apply(self, job, handle, temp_path):
         if handle is None:

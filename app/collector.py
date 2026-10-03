@@ -634,9 +634,13 @@ class GpsNmeaRecorder:
         )
         try:
             self._configure_serial(fd)
-        except Exception:
+        except Exception as exc:
             os.close(fd)
-            raise
+            if isinstance(exc, (OSError, ValueError)):
+                raise
+            # termios.error is no OSError; as one, the reader retries with back-off instead of
+            # ending for the rest of the drive (the device can vanish while it re-enumerates).
+            raise OSError(f"cannot configure {active_device}: {exc}") from exc
         self.fd = fd
         with self.lock:
             self.active_device = active_device
@@ -1171,6 +1175,15 @@ class LidarRawRecorder:
         threading.Thread(target=_close_previous, name="lidar-storage-close", daemon=True).start()
         return True
 
+    def force_pending_rotation(self):
+        """Switch to the armed folder now if no saved packet has done so (the LiDAR sends nothing,
+        or nothing PTP-qualified): otherwise the closed folder's last PCAP would stay an open
+        .tmp, unlisted, until LiDAR data resumes - maybe never."""
+        with self.storage_lock:
+            if self._apply_pending_rotation_locked(float("inf")):
+                print("[LiDAR] no packets at the folder boundary; switched folders, last file sealed",
+                      flush=True)
+
     def note_peer(self, addr):
         """Remember the sensor's address so synthesised pcap headers are real."""
         if self.peer_known or not addr:
@@ -1271,7 +1284,9 @@ class LidarRawRecorder:
             GUARD.reject("lidar_invalid_clock")
             return
         arrival = round(timestamp * NS)
-        if not -5_000_000 <= GUARD.master_time_ns() - native <= NS:
+        # Age at arrival (kernel stamp), not when this thread got to the packet: the socket keeps
+        # ~1.5 s of packets through a stall of this thread, and they are still valid afterwards.
+        if not -5_000_000 <= GUARD.master_time_ns() - (time.time_ns() - arrival) - native <= NS:
             GUARD.reject("lidar_invalid_epoch")
             return
         if self.last_ptp_ns is not None and utc <= self.last_ptp_ns:
@@ -2084,6 +2099,7 @@ def _run_collector(stop: threading.Event):
     pending_finish = None
     armed_recorder = None
     armed_boundary = None
+    lidar_force_at = None  # when LiDAR must have left the closed folder, packets or not
 
     def persisted_frame_count(target_recorder) -> int:
         """Return the exact number of frame records after queued writes drain."""
@@ -2333,7 +2349,7 @@ def _run_collector(stop: threading.Event):
         nonlocal recorder, run_sequence, next_run_rotation_at
         nonlocal health_last_frame_count, warmup_skipped
         nonlocal pending_camera_recorder, camera_boundary_time, pending_finish
-        nonlocal armed_recorder, armed_boundary
+        nonlocal armed_recorder, armed_boundary, lidar_force_at
 
         previous = recorder
         lidar_snapshot = lidar.stats()
@@ -2358,6 +2374,9 @@ def _run_collector(stop: threading.Event):
         # one contiguous slice of both streams.
         pending_camera_recorder = new_recorder
         camera_boundary_time = boundary_time
+        # LiDAR switches on the first saved packet past the boundary; without packets it is
+        # switched when the camera's handover is forced at the latest.
+        lidar_force_at = boundary_time + CAMERA_HANDOVER_GRACE_SEC
 
         # Emit the closing health sample while `recorder` still points at the
         # old folder and frame_index still holds its real count, so the line
@@ -2478,6 +2497,9 @@ def _run_collector(stop: threading.Event):
                 and loop_now >= camera_boundary_time + CAMERA_HANDOVER_GRACE_SEC
             ):
                 hand_over_camera(forced=True)
+            if lidar_force_at is not None and loop_now >= lidar_force_at:
+                lidar_force_at = None
+                lidar.force_pending_rotation()
             if loop_now >= next_run_rotation_at - ROTATION_ARM_LEAD_SEC:
                 arm_rotation(next_run_rotation_at)
             if loop_now >= next_run_rotation_at:

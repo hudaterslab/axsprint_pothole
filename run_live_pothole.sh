@@ -4,10 +4,11 @@
 #
 # After an NPU device reset the DEEPX runtime ends the process itself ("This application
 # must exit and restart to reload models"), and the analysis cannot start while the DEEPX
-# service is restarting. So an error exit is followed by a restart after 10 s, doubling up
-# to 60 s while it keeps failing. The analysis then covers the frames recorded from its
-# new start on; the ones recorded while it was down are skipped. Exit status 0 (finished)
-# or a stop signal from the analysis terminal ends the loop.
+# service is restarting. So any exit - with an error, or with status 0, which the runtime
+# may use too - is followed by a restart after 10 s, doubling up to 60 s while it keeps
+# failing. The analysis then covers the frames recorded from its new start on; the ones
+# recorded while it was down are skipped. Only a stop signal from the analysis terminal
+# ends the loop.
 set -u
 cd "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" || exit 1
 
@@ -30,9 +31,6 @@ while :; do
   wait "$child"
   status=$?
   child=""
-  if (( status == 0 )); then
-    exit 0
-  fi
   if (( SECONDS - started >= 600 )); then
     delay=10
   fi
