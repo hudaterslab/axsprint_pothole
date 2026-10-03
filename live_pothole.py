@@ -9,7 +9,7 @@ neighbouring points DEPTH_M or more below their road (pothole_check.py). Cracks 
 before. main_live.py itself is unchanged and still runs on its own.
 
 The analysis terminal starts it at login through run_main_live.sh; by hand:
-    python3 check_pothole.py
+    python3 live_pothole.py
 senddata.py imports it, so a resent drive is judged the same way.
 """
 

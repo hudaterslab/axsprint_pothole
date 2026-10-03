@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 import main_live as ml
-import check_pothole  # noqa: F401 - potholes judged as the terminal judges them (pothole_check.py)
+import live_pothole  # noqa: F401 - potholes judged as the terminal judges them (pothole_check.py)
 
 WARMUP_FRAMES = 15  # frames analysed before each listed frame, so tracking matches the road
 

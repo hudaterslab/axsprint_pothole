@@ -5,7 +5,7 @@
 ```text
 live_detection/
   main_live.py      실시간 포트홀 탐지 (카메라 탐지 + 라이다 깊이 측정)
-  check_pothole.py  자동 실행되는 실시간 탐지: main_live.py 그대로에 포트홀만 pothole_check.py 규칙으로 확인
+  live_pothole.py  자동 실행되는 실시간 탐지: main_live.py 그대로에 포트홀만 pothole_check.py 규칙으로 확인
   pothole_check.py  새 포트홀 라이다 규칙(라이다 줄마다 양옆 도로로 직선)과 그 주행 평가 도구
   camera_calib_best_effort.json   카메라 렌즈 보정값과 카메라 위치·방향 (라이다 바로 아래 9 cm, main_live.py가 읽음)
   XT32_Angle_Correction_File.csv      라이다 채널 각도 (main_live.py가 읽음). 이 단말기 라이다(SN XT4BCC56E14BCC23)의
@@ -169,7 +169,7 @@ SSH 수신 서버로 보내려면 `PORTHOLE_UPLOAD_HOST`, `_USER`, `_DIR`, `_KEY
 
 `install.sh`는 수집기만 자동 실행으로 등록합니다. 실시간 탐지도 부팅 시 자동으로
 돌리려면 `install.sh` 다음에 `install_detection.sh`를 따로 실행합니다(sudo 불필요).
-분석 터미널은 `run_main_live.sh`로 `check_pothole.py`를 실행합니다. `main_live.py`의 포트홀 규칙으로
+분석 터미널은 `run_main_live.sh`로 `live_pothole.py`를 실행합니다. `main_live.py`의 포트홀 규칙으로
 돌아가려면 `run_main_live.sh`의 `PROGRAM`을 `main_live.py`로 바꿉니다(`main_live.py`는 그대로 있습니다).
 
 ```bash
@@ -199,7 +199,7 @@ GPS 속도가 없으면(실내 등) 보정 없이 깊이를 측정합니다. 정
 상관없이 같았습니다. 보정 전에는 9 m/s에서 라이다 점이 사진보다 약 30 cm 뒤쪽(사진 위쪽)에 찍혔습니다.
 모델 검출은 신뢰도 0.4 이상만 씁니다(`CONFIDENCE_THRESHOLD`).
 크랙은 모델 결과만으로 보고합니다. 포트홀은 라이다로 한 번 더 확인합니다.
-자동 실행되는 `check_pothole.py`는 `pothole_check.py` 규칙을 씁니다: 포트홀 영역을 지나는 라이다 줄마다
+자동 실행되는 `live_pothole.py`는 `pothole_check.py` 규칙을 씁니다: 포트홀 영역을 지나는 라이다 줄마다
 같은 줄에서 영역 양옆 2~15 cm의 도로 점으로 직선(그 줄의 도로)을 긋고(5 mm 넘게 꺼진 점은 빼고 다시),
 도로 점이 모자라거나 흩어지거나 기준선이 흔들리는 줄은 빼고, 깊이 1.4 cm 이상인 점이 연속 3개 이상인 줄이
 2개 이상이면 포트홀입니다. 2026-10-02 주행에서 진짜 포트홀(7622~7624)은 확인되고, 도색은 모두 걸러졌습니다.

@@ -435,7 +435,7 @@ class Scan:
 
     @classmethod
     def from_points(cls, points, masks, camera, alignment, target, shape):
-        """The scan of a live frame, already decoded, with the frame's model masks (check_pothole.py)."""
+        """The scan of a live frame, already decoded, with the frame's model masks (live_pothole.py)."""
         scan = cls.__new__(cls)
         scan.frame, scan.camera, scan.alignment, scan.target = None, camera, alignment, target
         scan.masks, scan.detections, scan.ok, scan.scan_delta = masks, [], True, None

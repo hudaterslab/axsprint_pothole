@@ -198,7 +198,7 @@ EOF
   if [[ "$COMPONENT" == "collector" ]]; then
     required=("$SCRIPT_DIR/config.yaml" "$SCRIPT_DIR/collect_data.py" "/usr/local/sbin/ptp-pothole-collector-foreground")
   else
-    required=("$SCRIPT_DIR/main_live.py" "$SCRIPT_DIR/pothole_check.py" "$SCRIPT_DIR/check_pothole.py")
+    required=("$SCRIPT_DIR/main_live.py" "$SCRIPT_DIR/pothole_check.py" "$SCRIPT_DIR/live_pothole.py")
   fi
   for file in "${required[@]}"; do
     if [[ ! -f "$file" ]]; then
@@ -216,7 +216,7 @@ EOF
     rm -f -- "$ptp_pid_file"
     /usr/bin/sudo -n /usr/local/sbin/ptp-pothole-collector-foreground &
   else
-    # run_main_live.sh runs check_pothole.py and restarts it after an error exit (e.g. an NPU reset).
+    # run_main_live.sh runs live_pothole.py and restarts it after an error exit (e.g. an NPU reset).
     (cd "$SCRIPT_DIR" && exec /usr/bin/env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
       /usr/bin/nice -n 15 /usr/bin/ionice -c 3 "$SCRIPT_DIR/run_main_live.sh") &
   fi

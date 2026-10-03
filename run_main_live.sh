@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Keep the live analysis running for the analysis terminal (run_component_foreground.sh analysis).
-# It runs check_pothole.py: main_live.py with potholes confirmed by pothole_check.py's LiDAR rule
+# It runs live_pothole.py: main_live.py with potholes confirmed by pothole_check.py's LiDAR rule
 # (main_live.py is kept unchanged; put main_live.py in PROGRAM to go back to its own rule).
 #
 # After an NPU device reset the DEEPX runtime ends the process itself ("This application
@@ -12,7 +12,7 @@
 set -u
 cd "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" || exit 1
 
-PROGRAM=check_pothole.py
+PROGRAM=live_pothole.py
 
 child=""
 stop() {

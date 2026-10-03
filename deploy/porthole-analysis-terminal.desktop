@@ -2,7 +2,7 @@
 Type=Application
 Version=1.0
 Name=Porthole Live Detection Terminal
-Comment=Run check_pothole.py (main_live.py with the new pothole rule) in its own terminal; closing this terminal stops only live detection
+Comment=Run live_pothole.py (main_live.py with the new pothole rule) in its own terminal; closing this terminal stops only live detection
 Exec=/home/hudaters/Desktop/live_detection/launch_component_terminal.sh analysis
 OnlyShowIn=LXQt;
 Terminal=false
