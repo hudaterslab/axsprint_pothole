@@ -118,6 +118,12 @@ SCAN_GAP_SEC = 0.005
 # analysed without LiDAR - cracks are still reported - instead of stalling all later frames.
 LIDAR_WAIT_MAX_SEC = 60
 
+# Each frame is analysed this long after it arrived, as the frames come: a steady load. Without it
+# the 300 frames a sealed 10 s PCAP releases were analysed at once, at about twice real time, and
+# the CPU went from ~20% to ~50% and back every 10 s. 11 s covers the 10 s PCAP and its sealing,
+# so frames do not wait longer than before for LiDAR; a backlog is still worked off at full speed.
+PACE_DELAY_SEC = 11
+
 # A gap between analysed pictures longer than this (camera or PTP outage) starts tracking afresh:
 # the car has moved on, and an old track must not swallow new damage at the same spot in the image.
 TRACK_GAP_SEC = 1.0
@@ -3816,8 +3822,8 @@ def ready_frames(run, count, pcaps, allow_tail):
         # moves it); the capture time against the host clock only for rows without it.
         arrived = row.get("arrival_monotonic")
         age = now_monotonic - float(arrived) if arrived is not None else now - timestamp
-        if (not allow_tail and timestamp - OFFSET_SEC + SCAN_SEARCH_HALF_WINDOW_SEC > watermark
-                and age < LIDAR_WAIT_MAX_SEC):
+        if not allow_tail and (age < PACE_DELAY_SEC or (
+                timestamp - OFFSET_SEC + SCAN_SEARCH_HALF_WINDOW_SEC > watermark and age < LIDAR_WAIT_MAX_SEC)):
             break
         selected.append(row)
         if len(selected) >= BATCH_SIZE:
@@ -4031,7 +4037,7 @@ def run_service(root=ROOT, upload=True, max_frames=0):
                     source_finished_at is not None
                     and time.monotonic() - source_finished_at >= POLL_SECONDS
                 )
-                did_work = False
+                did_work = short_batch = False
                 for key in sorted(runs):
                     run, entry = (runs[key], entries[key])
                     count = entry["processed_rows"]
@@ -4051,6 +4057,7 @@ def run_service(root=ROOT, upload=True, max_frames=0):
                     processor.refresh_run(run.path)
                     if max_frames:
                         ready = ready[: max_frames - processed]
+                    short_batch = len(ready) < BATCH_SIZE  # caught up with PACE_DELAY_SEC
                     stream = processor.infer(run.path, ready)
                     reported = processor.analyse(run.path, key, stream, pcaps, lambda: stopping)
                     try:
@@ -4093,6 +4100,10 @@ def run_service(root=ROOT, upload=True, max_frames=0):
                     previous_pending, last_status = (pending, now)
                 if not did_work:
                     time.sleep(POLL_SECONDS)
+                elif short_batch:
+                    # Let the next frames come due, so that they go to the NPU in batches of about
+                    # 15, not one or two each pass of this loop (each pass also rereads the manifests).
+                    time.sleep(POLL_SECONDS / 2)
         except InterruptedError:
             if not stopping:
                 raise
