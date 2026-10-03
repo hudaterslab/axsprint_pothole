@@ -53,6 +53,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -3447,7 +3448,17 @@ RAW_DONE = PROJECT / "var" / "raw_uploaded.txt"  # runs sent completely, one "<d
 
 RAW_LOCK = Path("/tmp/porthole_raw_upload.lock")
 
-RAW_POLL_SEC = 60  # a run is finished every 10 minutes; a failed send is tried again then
+RAW_POLL_SEC = 60  # a run is finished every 10 minutes
+
+# A finished run is sent once its run_meta.jsonl is this old: the collector seals the folder's last
+# LiDAR file in a thread of its own, which can end after the run_finished record.
+RAW_SETTLE_SEC = 60
+
+RAW_RETRY_MAX_SEC = 3600  # a run that keeps failing is tried again after 1, 2, 4 ... minutes, at most this
+
+# rsync exit statuses of a server that cannot be reached (ssh, connection, timeout): no run is to
+# blame, so all are simply tried again at the next look.
+RAW_UNREACHABLE = frozenset((5, 10, 12, 30, 35, 255))
 
 
 def raw_upload_options():
@@ -3484,19 +3495,21 @@ def collector_busy(held):
 
 class RawUploader:
     """Send every finished recording to <PORTHOLE_RAW_DIR>/<date>/<run>/ on the server, as it is
-    on the SSD, oldest first, each followed by its date folder's CSV.
+    on the SSD, oldest first, and the date folders' CSVs whenever they change.
 
     Started with the analysis of the first new frame, so only once the collector records with
-    PTP ready; a run without frames (closed before that) is not sent. rsync resumes a run cut
-    short and leaves out the files the server already has; runs sent completely are listed in
-    RAW_DONE and not looked at again. rsync is held while live detections wait to be sent or the
-    recorder's queue is under pressure, and it runs at the analysis' low CPU and disk priority.
-    It inherits RAW_LOCK, so an rsync left over from an analysis that died finishes first.
+    PTP ready; a run in which nothing was recorded (closed before that) is not sent. rsync resumes
+    a run cut short and leaves out the files the server already has; runs sent completely are
+    listed in RAW_DONE and not looked at again. A run that fails on its own is tried again later
+    (RAW_RETRY_MAX_SEC) while the others go on. rsync is held while live detections wait to be
+    sent or the recorder's queue is under pressure, runs at the analysis' low CPU and disk
+    priority, and is killed with this process (setpriv --pdeathsig), held or not.
     """
 
     def __init__(self, root, detections):
         self.root, self.detections = Path(root), detections
         self.stop_event = threading.Event()
+        self.unreachable = False
         self.thread = threading.Thread(target=self.run, name="raw-upload", daemon=True)
         try:
             self.options = raw_upload_options()
@@ -3506,13 +3519,16 @@ class RawUploader:
         self.thread.start()
 
     def finished_runs(self, done):
-        """(key, path) of the finished recordings not sent yet, oldest first."""
+        """(key, path) of the finished recordings not sent yet, oldest first, once settled."""
         for run in discover(self.root):
             key = run.relative_to(self.root).as_posix()
             if key in done:
                 continue
+            meta = run / "meta/run_meta.jsonl"
             try:
-                with (run / "meta/run_meta.jsonl").open("rb") as stream:
+                if time.time() - meta.stat().st_mtime < RAW_SETTLE_SEC:
+                    continue
+                with meta.open("rb") as stream:
                     finished = any(json.loads(line).get("event") == "run_finished"
                                    for line in stream if line.endswith(b"\n") and line.strip())
             except (OSError, ValueError):
@@ -3520,39 +3536,108 @@ class RawUploader:
             if finished:
                 yield key, run
 
-    def rsync(self, source, lock):
-        """rsync one path (<root>/./<date>/...) to the server folder, held while it should wait;
-        (exit status, GB sent), or (None, None) when stopping."""
+    @staticmethod
+    def recorded(run):
+        """Whether the collector saved camera frames or LiDAR files in the run."""
+        return any((run / name).is_file() and (run / name).stat().st_size
+                   for name in ("frames/frames.jsonl", "lidar/pcaps.jsonl"))
+
+    def rsync(self, source):
+        """rsync one path (<root>/./<date>/...) to the server folder, held while it should wait:
+        (exit status, GB sent, last error line), or (None, None, "") when stopping."""
         ssh = shlex.join(["ssh", "-i", str(self.options.key), "-o", "BatchMode=yes",
                           "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10",
                           "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"])
-        command = ["rsync", "-rt", "--relative", "--partial-dir=.rsync-partial", "--timeout=120",
-                   f"--bwlimit={self.options.bw_kib}", "--stats", "-e", ssh, source,
+        command = ["setpriv", "--pdeathsig", "KILL",
+                   "rsync", "-rt", "--omit-dir-times", "--relative", "--partial-dir=.rsync-partial",
+                   "--timeout=600", f"--bwlimit={self.options.bw_kib}", "--stats", "-e", ssh, source,
                    f"{self.options.user}@{self.options.host}:{self.options.destination}/"]
-        proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True,
-                                pass_fds=(lock.fileno(),))
-        held = False
-        try:
-            while proc.poll() is None:
-                if self.stop_event.is_set():
-                    return None, None
-                hold = (self.detections is not None and self.detections.waiting()) or collector_busy(held)
-                if hold != held:
-                    proc.send_signal(signal.SIGSTOP if hold else signal.SIGCONT)
-                    held = hold
-                self.stop_event.wait(0.5)
-            sent = re.search(r"Total bytes sent: ([\d,]+)", proc.stdout.read())
-        finally:
-            if proc.poll() is None:
-                proc.send_signal(signal.SIGCONT)
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-            proc.stdout.close()
-        return proc.returncode, None if sent is None else int(sent.group(1).replace(",", "")) / 1e9
+        with tempfile.TemporaryFile("w+") as output:
+            proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output,
+                                    stderr=subprocess.STDOUT, text=True)
+            held = False
+            try:
+                while proc.poll() is None:
+                    if self.stop_event.is_set():
+                        return None, None, ""
+                    hold = (self.detections is not None and self.detections.waiting()) or collector_busy(held)
+                    if hold != held:
+                        proc.send_signal(signal.SIGSTOP if hold else signal.SIGCONT)
+                        held = hold
+                    self.stop_event.wait(0.5)
+            finally:
+                if proc.poll() is None:
+                    proc.send_signal(signal.SIGCONT)
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+            output.seek(0)
+            text = output.read()
+        sent = re.search(r"Total bytes sent: ([\d,]+)", text)
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        error = "" if proc.returncode == 0 else next(
+            (line for line in reversed(lines) if line.startswith(("rsync", "ssh"))), lines[-1] if lines else "")
+        return proc.returncode, None if sent is None else int(sent.group(1).replace(",", "")) / 1e9, error
+
+    def reach(self, status, error):
+        """Note whether the server answered (status of an rsync); False when it cannot be reached."""
+        if status in RAW_UNREACHABLE:
+            if not self.unreachable:
+                print(f"[RAW] server not reachable (rsync exit {status}: {error}); "
+                      f"trying again every {RAW_POLL_SEC} s", flush=True)
+            self.unreachable = True
+            return False
+        if self.unreachable:
+            print("[RAW] server reachable again", flush=True)
+        self.unreachable = False
+        return True
+
+    def send_runs(self, done, failures, retry_at):
+        """Send the finished runs not sent yet; False when the server cannot be reached."""
+        for key, run in self.finished_runs(done):
+            if self.stop_event.is_set():
+                return False
+            if time.monotonic() < retry_at.get(key, 0):
+                continue
+            if self.recorded(run):
+                started = time.monotonic()
+                status, gb, error = self.rsync(f"{self.root}/./{key}")
+                if status is None or not self.reach(status, error):
+                    return False
+                if status:
+                    failures[key] = failures.get(key, 0) + 1
+                    wait = min(RAW_POLL_SEC * 2 ** (failures[key] - 1), RAW_RETRY_MAX_SEC)
+                    retry_at[key] = time.monotonic() + wait
+                    print(f"[RAW] {key} not sent completely (rsync exit {status}: {error}); "
+                          f"trying it again in {wait:.0f} s", flush=True)
+                    continue
+                print(f"[RAW] sent {key} in {time.monotonic() - started:.0f} s"
+                      + ("" if gb is None else f" ({gb:.2f} GB)"), flush=True)
+            with RAW_DONE.open("a") as stream:
+                stream.write(key + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            done.add(key)
+        return True
+
+    def send_csvs(self, done, sent):
+        """The date folders' CSVs of the sent runs, again whenever one changes (the analysis can
+        list detections after their run was sent)."""
+        for date in sorted({key.split("/")[0] for key in done}):
+            try:
+                stat = (self.root / date / DETECTIONS_CSV).stat()
+            except FileNotFoundError:
+                continue
+            if sent.get(date) == (stat.st_size, stat.st_mtime_ns):
+                continue
+            status, _, error = self.rsync(f"{self.root}/./{date}/{DETECTIONS_CSV}")
+            if status is None or not self.reach(status, error):
+                return
+            if status == 0:
+                sent[date] = (stat.st_size, stat.st_mtime_ns)
 
     def run(self):
         import fcntl
@@ -3564,33 +3649,17 @@ class RawUploader:
         except OSError:
             done = set()
         RAW_DONE.parent.mkdir(exist_ok=True)
+        failures, retry_at, sent_csv = {}, {}, {}
         with RAW_LOCK.open("a") as lock:
             while not self.stop_event.is_set():
                 try:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:  # an rsync of an analysis that died is still running
+                except BlockingIOError:  # another sender (e.g. one started by hand) is running
                     self.stop_event.wait(RAW_POLL_SEC)
                     continue
                 try:
-                    for key, run in self.finished_runs(done):
-                        if (run / "frames/frames.jsonl").stat().st_size:  # else nothing was recorded
-                            started = time.monotonic()
-                            status, gb = self.rsync(f"{self.root}/./{key}", lock)
-                            if status is None:
-                                return
-                            if status:
-                                print(f"[RAW] {key} not sent completely (rsync exit {status}); "
-                                      f"trying again in {RAW_POLL_SEC} s", flush=True)
-                                break
-                            if (run.parent / DETECTIONS_CSV).is_file():
-                                self.rsync(f"{self.root}/./{run.parent.name}/{DETECTIONS_CSV}", lock)
-                            print(f"[RAW] sent {key} in {time.monotonic() - started:.0f} s"
-                                  + ("" if gb is None else f" ({gb:.2f} GB)"), flush=True)
-                        with RAW_DONE.open("a") as stream:
-                            stream.write(key + "\n")
-                            stream.flush()
-                            os.fsync(stream.fileno())
-                        done.add(key)
+                    if self.send_runs(done, failures, retry_at):
+                        self.send_csvs(done, sent_csv)
                 except Exception as exc:  # e.g. a run deleted meanwhile: look again later
                     print(f"[RAW] {type(exc).__name__}: {exc}; trying again in {RAW_POLL_SEC} s", flush=True)
                 finally:
