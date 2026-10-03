@@ -362,6 +362,8 @@ class PtpGuard:
                     "lidar_packet_payload": "unchanged native PTP/TAI; subtract advertised currentUtcOffset exactly once",
                     "gps_timestamp": "host receive UTC; GPS fix fields retain receiver data",
                     "ptp_required": True,
+                    "ptp_admission": "startup check only; afterwards the per-second check is logged "
+                                     "(ptp_status.jsonl 'check') and does not stop recording",
                     "grandmaster_identity": MASTER,
                     "max_ptp_offset_ns": 100000,
                     "max_status_age_sec": 8,
@@ -398,13 +400,20 @@ class PtpGuard:
             return dict(self.sensors), self.announce, self.announce_at
 
     def qualification(self):
-        state = self.current_qualification()
+        """Whether data may be saved, (ok, reason). Until the startup check has passed (both
+        sensors on this master within 100 us, status fresh, 5 s in a row), only when it passes;
+        from then on always. PTP keeps the clocks by itself, and the per-second check
+        (current_qualification) is only logged: a status reply that came back incomplete stopped
+        recording for a second twice on 2026-10-03 while both clocks were within a few ns.
+        Grossly wrong sensor times are still refused where data comes in (camera RTCP against
+        the host clock, LiDAR against PHC0)."""
         if self.startup_ready:  # only ever turns True, so no lock needed
-            return state
+            return True, ""
+        state = self.current_qualification()
         now = time.monotonic_ns()
         with self.lock:
             if self.startup_ready:
-                return state
+                return True, ""
             if not state[0]:
                 self.qualified_since_ns = 0
                 return state
@@ -509,12 +518,17 @@ class PtpGuard:
                 with self.lock:
                     self.sensors = sensors
                     self.master_clock = master
-                state = self.qualification()
-                if state != reported:
-                    label = "READY" if state[0] else "WAITING"
-                    reason = "" if state[0] else " reason=" + state[1]
-                    print("[PTP " + time.strftime("%H:%M:%S") + "] " + label + reason, flush=True)
-                    reported = state
+                state = self.qualification()  # whether data is saved
+                check = self.current_qualification()  # this second's check; after startup only logged
+                if not state[0]:
+                    text = "WAITING reason=" + state[1]
+                elif check[0]:
+                    text = "READY"
+                else:
+                    text = "CHECK reason=" + check[1] + " (recording continues)"
+                if text != reported:
+                    print("[PTP " + time.strftime("%H:%M:%S") + "] " + text, flush=True)
+                    reported = text
                 self.log(
                     "ptp_status.jsonl",
                     dict(
@@ -522,6 +536,7 @@ class PtpGuard:
                         sensors=sensors,
                         master_clock=master,
                         qualification=state,
+                        check=check,
                         rejected=dict(self.rejected),
                     ),
                 )
