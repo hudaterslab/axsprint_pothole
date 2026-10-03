@@ -280,18 +280,31 @@ def read_process_rss_mib() -> float | None:
     return None
 
 
-def read_cpu_temperature_c() -> float | None:
-    temperatures = []
-    for path in Path("/sys/class/thermal").glob("thermal_zone*/temp"):
+def read_temperatures_c() -> dict:
+    """{"cpu": C, "wifi": C} from the kernel thermal zones, None where there is no sensor. The CPU is
+    the package sensor (x86_pkg_temp); another zone stands in for it only when there is none. The
+    Wi-Fi card (iwlwifi) is kept apart: it runs hotter than the CPU, most of all while uploading."""
+    cpu = wifi = None
+    other = []
+    for zone in Path("/sys/class/thermal").glob("thermal_zone*"):
         try:
-            value = float(path.read_text(encoding="ascii").strip())
+            kind = (zone / "type").read_text(encoding="ascii").strip()
+            value = float((zone / "temp").read_text(encoding="ascii").strip())
         except (OSError, ValueError):
             continue
         if value > 1000.0:
             value /= 1000.0
-        if -20.0 <= value <= 150.0:
-            temperatures.append(value)
-    return max(temperatures) if temperatures else None
+        if not -20.0 <= value <= 150.0:
+            continue
+        if kind == "x86_pkg_temp":
+            cpu = value
+        elif kind.startswith("iwlwifi"):
+            wifi = value if wifi is None else max(wifi, value)
+        else:
+            other.append(value)
+    if cpu is None and other:
+        cpu = max(other)
+    return {"cpu": cpu, "wifi": wifi}
 
 
 class SystemMetricsSampler:
@@ -313,11 +326,13 @@ class SystemMetricsSampler:
                 load_average = list(os.getloadavg())
             except (OSError, AttributeError):
                 load_average = None
+            temperatures = read_temperatures_c()
             sample = {
                 "sampled_timestamp": time.time(),
                 "process_rss_mib": read_process_rss_mib(),
                 "load_average": load_average,
-                "cpu_temperature_c": read_cpu_temperature_c(),
+                "cpu_temperature_c": temperatures["cpu"],
+                "wifi_temperature_c": temperatures["wifi"],
             }
             with self.lock:
                 self.values = sample
@@ -2230,6 +2245,7 @@ def _run_collector(stop: threading.Event):
         )
         os_metrics = system_metrics.snapshot()
         cpu_temperature_c = os_metrics.get("cpu_temperature_c")
+        wifi_temperature_c = os_metrics.get("wifi_temperature_c")
         process_rss_mib = os_metrics.get("process_rss_mib")
 
         record = {
@@ -2277,13 +2293,15 @@ def _run_collector(stop: threading.Event):
             "process_rss_mib": process_rss_mib,
             "load_average": os_metrics.get("load_average"),
             "cpu_temperature_c": cpu_temperature_c,
+            "wifi_temperature_c": wifi_temperature_c,
         }
         append_jsonl(recorder.health_jsonl, record)
 
         storage_rate_text = (
             "-" if observed_gib_per_hour is None else f"{observed_gib_per_hour:.2f}GiB/h"
         )
-        temp_text = "-" if cpu_temperature_c is None else f"{cpu_temperature_c:.1f}C"
+        cpu_temp_text = "-" if cpu_temperature_c is None else f"{cpu_temperature_c:.1f}C"
+        wifi_temp_text = "-" if wifi_temperature_c is None else f"{wifi_temperature_c:.1f}C"
         rss_text = "-" if process_rss_mib is None else f"{process_rss_mib:.0f}MiB"
         print(
             f"[HEALTH {time.strftime('%H:%M:%S')}] "
@@ -2294,7 +2312,7 @@ def _run_collector(stop: threading.Event):
             f"rxDrop={lidar_now['kernel_drop_count']} "
             f"gpsFix={gps_now['valid_fix_count']} "
             f"disk={disk_free_gib:.1f}GiB "
-            f"rate={storage_rate_text} temp={temp_text} rss={rss_text}",
+            f"rate={storage_rate_text} cpuTemp={cpu_temp_text} wifiTemp={wifi_temp_text} rss={rss_text}",
             flush=True,
         )
         if cpu_temperature_c is not None and cpu_temperature_c >= HEALTH_WARN_CPU_TEMP_C:
