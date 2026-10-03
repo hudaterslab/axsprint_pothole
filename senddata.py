@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Send the detections listed in the date folders' porthole_detections.csv to the server.
 
-For use back at the office after driving without internet, when main_live.py could only
+For use back at the office after driving without internet, when the analysis could only
 list the detections in the CSV. Close the analysis terminal first (this needs the NPU),
 then run:  python3 senddata.py
 
 Every date folder's CSV is read and frames the server already has are skipped, so it can
 be run again at any time. Each remaining frame's JPG/JSON/PCAP are rebuilt the way
-main_live.py builds them: the WARMUP_FRAMES frames before it are analysed again, so the
+live_pothole.py builds them: the WARMUP_FRAMES frames before it are analysed again, so the
 tracker reports the same new objects as on the road, and the files are sent like a live
 upload and deleted from /tmp afterwards.
 """
@@ -22,8 +22,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-import main_live as ml
-import live_pothole  # noqa: F401 - potholes judged as the terminal judges them (pothole_check.py)
+import live_pothole as ml
 
 WARMUP_FRAMES = 15  # frames analysed before each listed frame, so tracking matches the road
 
@@ -31,14 +30,14 @@ ml.UPLOAD_STAGING = Path("/tmp/porthole_senddata")
 
 
 class Quiet:
-    """main_live's CSV writer for the frames that are only analysed for tracking."""
+    """The analysis' CSV writer for the frames that are only analysed for tracking."""
 
     def add(self, key, timestamp, image_path, detections):
         pass
 
 
 class Listed(Quiet):
-    """main_live's CSV writer for the listed frames: remembers what each one reported."""
+    """The analysis' CSV writer for the listed frames: remembers what each one reported."""
 
     def __init__(self):
         self.kinds = {}
@@ -50,7 +49,7 @@ class Listed(Quiet):
 
 
 class Bundles:
-    """main_live's uploader for the listed frames: keeps their files until they are sent."""
+    """The analysis' uploader for the listed frames: keeps their files until they are sent."""
 
     def __init__(self):
         self.ready = {}
@@ -63,7 +62,7 @@ class Bundles:
 
 
 class Replay(ml.LiveProcessor):
-    """main_live's processor; only the listed frames (targets) are written up."""
+    """The analysis' processor; only the listed frames (targets) are written up."""
 
     def __init__(self):
         super().__init__(Listed(), Bundles())
@@ -158,11 +157,11 @@ def upload(options, key, bundles):
 
 
 def main():
-    lock = open("/tmp/porthole_main_live.lock", "a")
+    lock = open("/tmp/porthole_live_pothole.lock", "a")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        sys.exit("분석 프로그램(main_live.py)이 실행 중이에요. NPU를 같이 쓸 수 없으니 분석 창을 닫고 다시 실행하세요.")
+        sys.exit("분석 프로그램(live_pothole.py)이 실행 중이에요. NPU를 같이 쓸 수 없으니 분석 창을 닫고 다시 실행하세요.")
     try:
         options = ml.upload_options()
     except ValueError as exc:
@@ -171,7 +170,7 @@ def main():
     if not tables:
         print("보낼 검출 기록(CSV)이 없어요.")
         return 0
-    # The recorder may be running; it comes first, as for main_live.py.
+    # The recorder may be running; it comes first, as for the analysis.
     os.nice(10)
     if shutil.which("ionice"):
         subprocess.run(["ionice", "-c", "3", "-p", str(os.getpid())], check=False)

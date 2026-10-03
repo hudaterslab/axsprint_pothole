@@ -4,36 +4,38 @@
 
 ```text
 live_detection/
-  main_live.py      실시간 포트홀 탐지 (카메라 탐지 + 라이다 깊이 측정)
-  live_pothole.py  자동 실행되는 실시간 탐지: main_live.py 그대로에 포트홀만 pothole_check.py 규칙으로 확인
-  pothole_check.py  새 포트홀 라이다 규칙(라이다 줄마다 양옆 도로로 직선)과 그 주행 평가 도구
-  camera_calib_best_effort.json   카메라 렌즈 보정값과 카메라 위치·방향 (라이다 바로 아래 9 cm, main_live.py가 읽음)
-  XT32_Angle_Correction_File.csv      라이다 채널 각도 (main_live.py가 읽음). 이 단말기 라이다(SN XT4BCC56E14BCC23)의
+  live_pothole.py   실시간 포트홀 탐지 (자동 실행): 카메라 모델로 크랙·포트홀을 찾고, 포트홀은 라이다로 확인,
+                    검출은 서버로 전송, 끝난 녹화(원천데이터)도 서버로 전송
+  pothole_check.py  포트홀 라이다 규칙의 주행 평가 도구 (규칙 자체는 live_pothole.py에 있음)
+  camera_calib_best_effort.json   카메라 렌즈 보정값과 카메라 위치·방향 (라이다 바로 아래 9 cm, live_pothole.py가 읽음)
+  XT32_Angle_Correction_File.csv      라이다 채널 각도 (live_pothole.py가 읽음). 이 단말기 라이다(SN XT4BCC56E14BCC23)의
                                       공장 보정값으로, 센서에서 읽은 값입니다(PTC 명령 0x05). 라이다마다 값이 달라서
                                       다른 단말기는 그 라이다에서 읽은 값으로 바꿔야 합니다.
-  best_seg.dxnn     main_live.py 모델 (저장소에 넣지 않음, ./download_models.sh로 받음)
+  best_seg.dxnn     live_pothole.py 모델 (저장소에 넣지 않음, ./download_models.sh로 받음)
   download_models.sh   모델 다운로드 (Hugging Face HudatersU/road_maintanance, sha256 확인)
-  .env.example      main_live.py 설정 예시 (.env로 복사해 채움, .env는 저장소 제외)
+  .env.example      live_pothole.py 설정 예시 (.env로 복사해 채움, .env는 저장소 제외)
   collect_data.py   카메라·라이다·GPS 수집 실행 파일
   ptp_service.py    공통 PTP 기준 시계 실행 파일
-  launch_component_terminal.sh   수집 터미널 열기
-  run_component_foreground.sh    수집 실행·로그·정상 종료 제어
-  run_main_live.sh               main_live.py 실행, 오류로 끝나면 자동 재시작 (분석 터미널이 사용)
-  checklidarcamera.py            녹화 프레임에 라이다 점을 겹쳐 저장: 모델 영역과 pothole_check.py 판정, 옆 도로 대비 높이 색
+  launch_component_terminal.sh   수집·분석 터미널 열기
+  run_component_foreground.sh    수집·분석 실행·로그·정상 종료 제어
+  run_live_pothole.sh            live_pothole.py 실행, 오류로 끝나면 자동 재시작 (분석 터미널이 사용)
+  senddata.py                    인터넷 없이 주행한 날의 CSV 검출을 사무실에서 서버로 보내기 (아래)
+  checklidarcamera.py            녹화 프레임에 라이다 점을 겹쳐 저장: 모델 영역과 포트홀 판정, 옆 도로 대비 높이 색
                                  (코드 상단 FOLDER, START_FRAME, END_FRAME 설정, NPU를 쓰므로 분석이 꺼져 있을 때)
   attach_component_terminal.sh   원격 데스크톱에서 수집 터미널 연결
   resolve_recording_storage.sh   외장 SSD와 저장 경로 확인
+  auto_update.py   GitHub 코드와 Hugging Face 모델 자동 업데이트 (아래 "코드와 모델 업데이트")
   config.yaml      카메라, GPS, 저장 위치 등 수집 설정
   install.sh       새 단말기 설치 (아래 "새 단말기 설치")
-  install_detection.sh   main_live.py 부팅 시 자동 실행 (아래 "실시간 탐지 자동 실행")
+  install_detection.sh   live_pothole.py 부팅 시 자동 실행 (아래 "실시간 탐지 자동 실행")
   deploy/          install.sh가 설치하는 시스템 파일 원본
+  server/visualize.py   업로드 서버에서 실행하는 검출 시각화 (아래 "서버 시각화")
   app/
     collector.py   수집 루프·GPS·JPEG 저장·재연결·10분 폴더 전환
     camera.py      하드웨어 카메라 디코딩·GPU JPEG 인코딩·PTP 프레임 큐 (별도 worker 포함)
     lidar.py       XT32 패킷 해석·진단·PCAP 저장
     ptp.py         PTP 상태 검사·센서 제어·RTP/RTCP 시각 변환
-  var/             실행 중 생성되는 PTP 설정·상태·로그
-  runs/            /mnt/ssd/porthole_runs 바로가기
+  var/             실행 중 생성되는 PTP 설정·상태·로그, 서버로 다 보낸 녹화 목록(raw_uploaded.txt)
   README.md
 ```
 
@@ -51,8 +53,9 @@ PTP 서비스와 실행 도우미가 디렉터리 소유자를 `hudaters`로 확
 
 ## 사용
 
-단말기 부팅 시 PTP 기준 시계 서비스가 시작하고, 기존 LXQt 자동 로그인 후
-기존 수집 터미널이 열립니다. 수집 로그를 그 터미널에서 볼 수 있습니다.
+단말기 부팅 시 PTP 기준 시계 서비스가 시작하고, LXQt 자동 로그인 후
+수집 터미널과 분석 터미널(`live_pothole.py`, 아래 "실시간 탐지 자동 실행")이 열립니다.
+각각의 로그를 그 터미널에서 볼 수 있습니다.
 PTP 기준 시계도 기존 수집기처럼 최초 NTP 동기화를 최대 60초 기다립니다.
 NTP가 꺼져 있거나 시간 안에 응답하지 않으면 단말기 RTC 시각으로 시작합니다.
 기준 시계 준비 시에만 남은 NTP 시각 차이를 먼저 보정하고,
@@ -61,8 +64,8 @@ NTP가 꺼져 있거나 시간 안에 응답하지 않으면 단말기 RTC 시�
 `/etc/chrony/chrony.conf`이며 시간 보정 속도를 5ppm으로 제한합니다.
 두 LAN 포트의 하드웨어 시계는 같은 단말기 시각을 따르며, `phc2sys`의
 보정 속도도 제한합니다. 포트 간 시계 차이는 하드웨어 동시 측정으로 검사합니다.
-터미널에서 Ctrl+C를 누르거나 창을 닫으면 수집 파일을 마감하고 수집만 종료합니다.
-PTP 기준 시계는 계속 동작합니다. 분석 프로세스 자동 실행은 꺼져 있습니다.
+수집 터미널에서 Ctrl+C를 누르거나 창을 닫으면 수집 파일을 마감하고 수집만 종료합니다.
+PTP 기준 시계는 계속 동작합니다. 분석 터미널도 부팅할 때마다 자동으로 열리며, 닫으면 분석만 종료합니다.
 
 수집 터미널을 다시 열려면 다음을 실행합니다.
 
@@ -75,9 +78,7 @@ PTP 기준 시계는 계속 동작합니다. 분석 프로세스 자동 실행�
 자동 실행 항목은 이 폴더의 `launch_component_terminal.sh collector`를 실행합니다.
 터미널 실행, 수집 실행·종료 제어, 원격 터미널 연결, SSD 확인 스크립트를 모두
 이 폴더로 옮겼습니다. 현재 수집 실행에는 `porthole` 폴더의 코드가 필요하지 않습니다.
-이 폴더의 스크립트는 `collector`(수집)와 `analysis`(`main_live.py`) 두 가지만 실행합니다.
-이전 `porthole` 폴더의 같은 이름 스크립트 4개는 예전 `ptp_pothole` 폴더를 가리키는 링크이며
-이 폴더와 관계없습니다.
+이 폴더의 스크립트는 `collector`(수집)와 `analysis`(`live_pothole.py`) 두 가지만 실행합니다.
 고정 실행 도우미 `/usr/local/sbin/ptp-pothole-collector-foreground`가
 일반 사용자 수집기에 PTP 패킷 확인에 필요한 네트워크 권한을 제공합니다.
 이 도우미와 systemd·sudoers·LXQt 자동 시작 등록은 운영체제의 표준 위치에 유지합니다.
@@ -92,7 +93,7 @@ PCAP와 목록 파일은 `lidar/00000000.pcap`, `lidar/pcaps.jsonl`처럼 `lidar
 10분마다 새 run으로 전환합니다. 카메라 30fps, 라이다 20Hz 설정을 유지합니다.
 전원이 갑자기 꺼져도 그때까지 디스크에 확정한 데이터는 남습니다. 사진은 디스크에 확정한 뒤 `frames.jsonl`에 올리고,
 라이다는 10초 파일 단위로, GPS는 2초마다 확정합니다. 꺼진 폴더에는 마감 기록(`run_finished`)이 없으므로
-다음에 수집기가 켜질 때 `status: interrupted` 마감 기록을 붙입니다. main_live는 마감 기록이 있어야
+다음에 수집기가 켜질 때 `status: interrupted` 마감 기록을 붙입니다. 분석(`live_pothole.py`)은 마감 기록이 있어야
 그 폴더를 끝난 것으로 보고 다음 폴더로 넘어가기 때문입니다.
 카메라 JPEG은 카메라 worker 안에서 GPU(VA-API `vaapijpegenc`, 품질 `jpeg_quality`)로 만들고,
 수집기는 그 JPEG을 그대로 저장합니다. CPU로 인코딩할 때보다 수집기 CPU가 절반 정도로 줄어듭니다.
@@ -113,7 +114,7 @@ LiDAR 패킷 내부 tail은 원본 PTP/TAI이며 기록된 UTC offset(현재 37�
 이미 UTC인 PCAP header에는 다시 빼지 않습니다. 기존 offset 추정값을 추가 적용하지 마세요.
 PTP는 시계를 맞추며, 카메라 노출 시작과 LiDAR 회전 위상 자체를 일치시키지는 않습니다.
 또 카메라는 사진을 찍고 약 한 프레임(33 ms) 뒤의 시각을 `timestamp_ns`로 붙입니다. 시계 차이가 아니라
-카메라 안의 처리 시간이라 PTP로는 없어지지 않으며, `main_live.py`의 `OFFSET_SEC`(0.033초)로 맞춥니다.
+카메라 안의 처리 시간이라 PTP로는 없어지지 않으며, `live_pothole.py`의 `OFFSET_SEC`(0.033초)로 맞춥니다.
 LiDAR PCAP 시각은 센서가 패킷에 적은 PTP 시각 그대로입니다.
 시작 직후에는 PTP 잠금과 카메라 RTCP 시각 정보가 확인될 때까지 잠시 저장을 기다립니다.
 시작 시 동기화 검사는 5초 연속 통과해야 합니다. 준비 시간의 기준은
@@ -158,7 +159,7 @@ sudo reboot
 바꾸기 전 파일은 `~/ptp_pothole_archive/install_날짜_시간/`에 백업하며, 다시 실행해도 안전합니다.
 설치 후 `.env`에 업로드 설정을 채우세요. API 서버로 보내려면 `PORTHOLE_API_URL`(필요하면 `PORTHOLE_API_TOKEN`)을,
 SSH 수신 서버로 보내려면 `PORTHOLE_UPLOAD_HOST`, `_USER`, `_DIR`, `_KEY`를 채웁니다(아래 "서버 전송").
-값이 없으면 `main_live.py`는 분석은 계속하고 업로드만 하지 않습니다.
+값이 없으면 `live_pothole.py`는 분석은 계속하고 업로드만 하지 않습니다.
 필요하면 `.env`에 다음 선택 항목도 추가할 수 있습니다: `PORTHOLE_UPLOAD_BW_KIB`(업로드 속도 제한 KiB/s, 기본 24576),
 `DAMAGE_EXPORT_VEHICLE_TYPE`(결과에 기록할 차량 종류, 기본 현대 팰리세이드).
 센서를 연결하지 않은 채 실행했다면 연결한 뒤 다시 실행하세요.
@@ -167,10 +168,9 @@ SSH 수신 서버로 보내려면 `PORTHOLE_UPLOAD_HOST`, `_USER`, `_DIR`, `_KEY
 
 ## 실시간 탐지 자동 실행
 
-`install.sh`는 수집기만 자동 실행으로 등록합니다. 실시간 탐지도 부팅 시 자동으로
-돌리려면 `install.sh` 다음에 `install_detection.sh`를 따로 실행합니다(sudo 불필요).
-분석 터미널은 `run_main_live.sh`로 `live_pothole.py`를 실행합니다. `main_live.py`의 포트홀 규칙으로
-돌아가려면 `run_main_live.sh`의 `PROGRAM`을 `main_live.py`로 바꿉니다(`main_live.py`는 그대로 있습니다).
+운영 단말기는 분석 터미널도 항상 자동 실행합니다. `install.sh`는 수집기만 자동 실행으로 등록하므로,
+새 단말기는 `install.sh` 다음에 `install_detection.sh`를 실행합니다(sudo 불필요).
+분석 터미널은 `run_live_pothole.sh`로 `live_pothole.py`를 실행합니다.
 
 ```bash
 cd ~/Desktop/live_detection
@@ -186,40 +186,29 @@ sudo reboot
   `./download_models.sh`를 실행하면 됩니다. Hugging Face의 모델을 바꾸면 스크립트의 sha256도 바꿔야 합니다.
 - 자동 실행: `~/.config/autostart/porthole-analysis-terminal.desktop`을 등록해 자동 로그인 후
   수집 터미널과 별도로 탐지 터미널이 열립니다. 창을 닫거나 Ctrl+C를 누르면 탐지만 종료합니다.
-- 자동 재시작: `main_live.py`가 오류로 끝나면 10초 뒤 다시 시작합니다(계속 실패하면 최대 60초 간격).
+- 자동 재시작: `live_pothole.py`가 오류로 끝나면 10초 뒤 다시 시작합니다(계속 실패하면 최대 60초 간격).
   NPU 장치가 리셋되면 DEEPX 런타임이 프로그램을 직접 종료하고, DEEPX 서비스가 다시 뜨는 동안에는
   시작할 수 없기 때문입니다. 다시 시작하면 그 시점부터 녹화되는 프레임만 분석합니다.
 - 끄기: `./install_detection.sh --disable`
 
 DEEPX 런타임은 이 스크립트가 설치하지 않습니다. NPU 카드와 DEEPX 런타임(dx-runtime)을 먼저 설치하세요.
-`main_live.py`는 옵션 없이 실행합니다. GPS 속도가 있으면 주행 중 라이다 점의 어긋남을 보정하고,
+`live_pothole.py`는 옵션 없이 실행합니다. GPS 속도가 있으면 주행 중 라이다 점의 어긋남을 보정하고,
 GPS 속도가 없으면(실내 등) 보정 없이 깊이를 측정합니다. 정지·저속에서는 보정 없이도 오차가 작습니다.
 라이다는 사진의 `timestamp_ns`에서 `OFFSET_SEC`(0.033초)를 뺀, 실제로 찍은 순간에 맞춥니다.
 2026-10-02 주행에서 도로 도색이 라이다 반사도와 사진에서 겹치는 시각을 찾아 잰 값으로, 속도(3~10 m/s)와
 상관없이 같았습니다. 보정 전에는 9 m/s에서 라이다 점이 사진보다 약 30 cm 뒤쪽(사진 위쪽)에 찍혔습니다.
 모델 검출은 신뢰도 0.4 이상만 씁니다(`CONFIDENCE_THRESHOLD`).
-크랙은 모델 결과만으로 보고합니다. 포트홀은 라이다로 한 번 더 확인합니다.
-자동 실행되는 `live_pothole.py`는 `pothole_check.py` 규칙을 씁니다: 포트홀 영역을 지나는 라이다 줄마다
+크랙은 모델 결과만으로 보고합니다. 포트홀은 라이다로 한 번 더 확인합니다: 포트홀 영역을 지나는 라이다 줄마다
 같은 줄에서 영역 양옆 2~15 cm의 도로 점으로 직선(그 줄의 도로)을 긋고(5 mm 넘게 꺼진 점은 빼고 다시),
 도로 점이 모자라거나 흩어지거나 기준선이 흔들리는 줄은 빼고, 깊이 1.4 cm 이상인 점이 연속 3개 이상인 줄이
-2개 이상이면 포트홀입니다. 2026-10-02 주행에서 진짜 포트홀(7622~7624)은 확인되고, 도색은 모두 걸러졌습니다.
-아래는 `main_live.py`만 따로 돌릴 때의 규칙입니다. 모델 영역 안 라이다 점 중
-주변 도로(영역에서 10~30 cm 둘레)보다 1 cm 이상 깊은 점이 3개 이상이고, 점들의 중앙값이 주변 도로보다
-5 mm 넘게 솟아 있지 않아야 포트홀입니다. 라이다 점 하나는 노이즈(약 3 mm)로 5~9 mm 낮게 찍힐 수 있어서,
-평평한 도색이 가장 깊은 점 하나만으로 통과하지 않게 한 것입니다(2026-10-02 주행 기준).
-반사도 15 이상인 점과, 같은 라이다 줄에서 그 앞뒤 5점(도색 구역)은 2 cm 이상 깊어야 깊은 점으로 셉니다.
-도색 구역 밖의 아스팔트는 1 cm부터 셉니다. 도색 자체는 바로 옆 아스팔트와 높이가 같거나 조금 높습니다
-(라이다 뷰어로 확인, 2026-10-02 주행의 도색 41,574곳에서 중앙값 0.5 mm 높음). 그날 도색 위가 1 cm 넘게
-깊게 나온 사례는 도색 때문이 아니었습니다. 주변 도로 평면(10~30 cm 둘레) 기준의 오차, 당시 틀린 렌즈 값으로
-생긴 사진과 라이다의 어긋남(2026-10-03에 보정), 그리고 닳은 횡단보도 줄무늬 아래 도로가 40~60 cm 폭으로
-1 cm쯤 완만하게 꺼진 곳(프레임 17293, 12277) 때문이었습니다. 도색 구역 규칙은 이런 경우를 막는 안전장치로
-남겨 두었습니다.
-도로 평면 검사의 기준 방향(`RoadPlaneSettings.expected_normal`)은 2026-10-02 주행에서 이 차에 단 센서로
-잰 도로 방향입니다. 센서 장착 각도를 바꾸면 다시 재야 합니다.
+2개 이상이면 포트홀입니다(`live_pothole.py`의 `POTHOLE_DEPTH_M` 설명). 2026-10-02 주행에서 진짜 포트홀(7622~7624)은
+확인되고, 도색은 모두 걸러졌습니다. `pothole_check.py`로 녹화된 하루 주행에 이 규칙을 다시 돌려 볼 수 있습니다.
+높이는 이 차에 단 센서로 잰 도로 방향(`RoadPlaneSettings.expected_normal`, 2026-10-02 주행)으로 잽니다.
+같은 방향이 크랙 크기를 재는 도로 평면 검사의 기준이기도 합니다. 센서 장착 각도를 바꾸면 다시 재야 합니다.
 라이다 스캔 해석은 numpy 배열 계산으로 한 번에 처리하고, PCAP은 파일별 색인으로 필요한 패킷만 읽습니다.
 추적은 프레임 순서대로 합니다.
 
-`main_live.py`는 시작한 시점 이후에 녹화된 프레임만 분석합니다. 단말기가 갑자기 꺼져서 분석하지 못한
+`live_pothole.py`는 시작한 시점 이후에 녹화된 프레임만 분석합니다. 단말기가 갑자기 꺼져서 분석하지 못한
 프레임이 남아 있어도, 다시 켜면 그 프레임은 건너뛰고 새로 들어오는 프레임부터 분석합니다.
 단말기에는 분석 결과를 저장하지 않고, 녹화 날짜 폴더마다 검출된 이미지 목록
 `/mnt/ssd/porthole_runs/<날짜>/porthole_detections.csv`만 남깁니다(검출이 없는 날은 만들지 않음).
@@ -232,7 +221,7 @@ GPS 속도가 없으면(실내 등) 보정 없이 깊이를 측정합니다. 정
 
 ## 서버 전송
 
-`main_live.py`는 추적 객체를 처음 확인한 프레임마다 같은 이름의
+`live_pothole.py`는 추적 객체를 처음 확인한 프레임마다 같은 이름의
 JPG·JSON·PCAP을 메모리(`/tmp/porthole_upload`)에 만들어 서버로 보내고, 보낸 뒤 바로 지웁니다.
 이름은 `frame_<날짜>_<시각>_<밀리초>`로, CSV의 `time`과 같은 촬영 시각(KST)입니다
 (예: `frame_20261002_101345_123`). 프레임 번호는 JSON의 `record_id`에 있습니다.
@@ -248,9 +237,9 @@ JSON은 「크랙 포트홀 서버 전송 명세서」(2026-09-28) 형식입니�
 쓴 값입니다. 서버의 시각화도 같은 값으로 똑같이 보정할 수 있습니다. GPS 속도가 없으면 null입니다.
 JSON은 열어 보기 쉽게 줄바꿈과 2칸 들여쓰기로 저장합니다.
 단말기 이름은 `.env`의 `PORTHOLE_TERMINAL_ID`이며, 비어 있으면 호스트 이름을 씁니다.
-단말기마다 다른 이름을 써야 서버가 다른 단말기의 결과를 중복으로 버리지 않습니다(첫 단말기는 `hudaters`).
+단말기마다 다른 이름을 써야 서버가 다른 단말기의 결과를 중복으로 버리지 않습니다(첫 단말기는 `axsprint-lidar-01`).
 
-`.env`에 `PORTHOLE_API_URL`이 있으면 프레임마다 HTTP POST 한 번으로 보내고 SSH 설정은 쓰지 않습니다.
+`.env`에 `PORTHOLE_API_URL`이 있으면 프레임마다 HTTP POST 한 번으로 보냅니다(SSH 설정은 원천데이터에만 씀).
 
 - 요청: `multipart/form-data`, 파일 항목 이름 `jpg`·`json`·`pcap`
 - 헤더: `X-Record-Id`(JSON의 `record_id`), `PORTHOLE_API_TOKEN`이 있으면 `Authorization: Bearer <토큰>`
@@ -260,7 +249,23 @@ JSON은 열어 보기 쉽게 줄바꿈과 2칸 들여쓰기로 저장합니다.
 
 `PORTHOLE_API_URL`이 비어 있으면 기존 SSH 수신 서버(`PORTHOLE_UPLOAD_*`)로 보냅니다.
 API 서버가 정해지면 위 요청 형식(항목 이름, 헤더, 응답 코드)이 서버와 맞는지 확인하세요.
-`.env`를 바꾼 뒤에는 `main_live.py`를 다시 시작해야 적용됩니다.
+`.env`를 바꾼 뒤에는 분석 터미널(`live_pothole.py`)을 다시 시작해야 적용됩니다.
+
+### 원천데이터 전송
+
+수집기가 녹화한 run(10분 폴더)이 끝나면 그 폴더를 SSD에 저장된 그대로 서버의
+`<PORTHOLE_RAW_DIR>/<날짜>/<run>/`(`frames`, `lidar`, `gps`, `meta`)으로 보내고, 이어서 그 날짜 폴더의
+`porthole_detections.csv`도 보냅니다. 서버는 검출 전송과 같은 SSH 설정(`PORTHOLE_UPLOAD_HOST`, `_USER`, `_KEY`)을 쓰고,
+`PORTHOLE_RAW_DIR`이 비어 있으면 보내지 않습니다(첫 단말기: 171 서버 `.../porthole/runs`).
+
+- 분석이 수집기의 첫 새 프레임을 받은 뒤(PTP 준비가 끝나 녹화가 시작된 뒤)부터 보냅니다. 오래된 run부터
+  보내며, 프레임이 하나도 없는 run(PTP 준비 전에 닫힌 폴더)은 보내지 않습니다.
+- `rsync`로 보내므로 전원이나 인터넷이 끊겨 중간에 멈춘 run은 다음에 이어서 보내고, 서버에 이미 있는 파일은
+  다시 보내지 않습니다. 다 보낸 run은 `var/raw_uploaded.txt`에 적어 다시 보지 않습니다.
+- 검출(JPG·JSON·PCAP)을 보내는 중이거나 수집기의 저장 대기열이 밀리면 잠시 멈췄다가 이어서 보냅니다.
+  분석과 같이 낮은 CPU·디스크 우선순위로 돌고, 속도는 `PORTHOLE_UPLOAD_BW_KIB`(기본 24 MiB/s)까지입니다.
+- 주행 중 녹화는 시간당 약 36 GB입니다. 인터넷 속도가 그보다 느리면 밀린 run은 인터넷이 될 때 차례로 보냅니다.
+- 단말기의 녹화는 보낸 뒤에도 지우지 않습니다.
 
 ## 인터넷 없이 주행한 뒤 서버로 보내기
 
@@ -273,10 +278,10 @@ python3 senddata.py
 ```
 
 - 모든 날짜 폴더의 CSV를 읽고, 서버에 이미 있는 프레임은 건너뜁니다. 여러 번 실행해도 됩니다.
-- 각 프레임을 `main_live.py`와 같은 방법으로 다시 만듭니다. 앞 15장부터 다시 분석해 추적까지 맞추므로
+- 각 프레임을 `live_pothole.py`와 같은 방법으로 다시 만듭니다. 앞 15장부터 다시 분석해 추적까지 맞추므로
   주행 때와 같은 객체를, 실시간 전송과 같은 JPG·JSON·PCAP으로 같은 서버 위치에 보냅니다.
   만든 파일은 `/tmp`에서 바로 지웁니다.
-- NPU를 쓰므로 분석 프로그램(`main_live.py`)이 켜져 있으면 실행되지 않습니다. 수집기는 켜져 있어도 됩니다.
+- NPU를 쓰므로 분석 프로그램(`live_pothole.py`)이 켜져 있으면 실행되지 않습니다. 수집기는 켜져 있어도 됩니다.
 - 녹화 폴더를 지운 날의 검출은 보낼 수 없습니다.
 
 ## 서버 시각화 (server/visualize.py)
@@ -289,12 +294,15 @@ python3 senddata.py
 보정 계산이나 `OFFSET_SEC`를 바꾼 뒤 이미 그린 이미지를 새로 그리려면, 예전 이미지 폴더를 다른 이름으로
 옮겨 두고 다시 실행하거나 `OVERWRITE = True`로 한 번 실행합니다.
 
-라이다 해석, 카메라 보정값, 도로 평면과 그 검사, 주행 중 보정은 `main_live.py`와 같습니다.
+라이다 해석, 카메라 보정값, 도로 평면과 그 검사, 주행 중 보정은 `live_pothole.py`와 같습니다.
 JSON의 `gps.speed_mps`와 단말기와 같은 카메라 시각 보정(`OFFSET_SEC`)으로 라이다 점을 똑같이 옮기고,
 평면 검사에 걸리면 라이다 없이 그립니다. 그래서 `OFFSET_SEC`를 넣기 전(2026-10-02 이전)에 분석된 프레임도
 지금 그리면 실제 촬영 순간에 맞춰 그려집니다.
-`main_live.py`의 평면·보정 계산, `OFFSET_SEC`, `camera_calib_best_effort.json`을 바꾸면 이 파일도 같이 고친 뒤
-서버의 `code_server/visualize.py`에 복사해 주세요.
+포트홀 라벨의 둘째 줄은 단말기의 포트홀 판정과 같은 계산입니다: 깊은 줄 수(1.4 cm 이상 연속 3점)와 도로를 잴 수
+있었던 줄 수, 가장 깊은 점의 깊이. 단말기는 깊은 줄이 2개 이상일 때 포트홀로 보냅니다. 서버는 JSON의 다각형으로
+영역을 다시 만들기 때문에 영역 가장자리 점 몇 개가 달라 줄 수가 단말기와 조금 다를 수 있습니다.
+`live_pothole.py`의 평면·보정 계산, 포트홀 판정 규칙, `OFFSET_SEC`, `camera_calib_best_effort.json`을 바꾸면
+이 파일도 같이 고친 뒤 서버의 `code_server/visualize.py`에 복사해 주세요.
 
 ## 시험 자료 및 변경 전 파일
 

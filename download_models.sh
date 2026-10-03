@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Download the model main_live.py runs (best_seg.dxnn) from Hugging Face into
+Download the model live_pothole.py runs (best_seg.dxnn) from Hugging Face into
 this folder and verify its sha256. Models are not in git (.gitignore).
 
   ./download_models.sh           # download what is missing

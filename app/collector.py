@@ -1038,7 +1038,7 @@ def close_interrupted_runs(save_dir: Path):
     """Give a closing record to run folders that an earlier collector left open.
 
     A power cut or crash stops the collector before it writes run_finished, and
-    main_live only moves past a folder that has one; two such folders stall it.
+    the analysis only moves past a folder that has one; two such folders stall it.
     This runs under the collector lock, so nothing still writes to them. A
     record torn by the power cut is cut off first: followed by the new record it
     would become an unparseable line.
@@ -1496,7 +1496,7 @@ CAMERA_COUNTERS = (
 
 
 def build_camera_frame_record(job: dict, saved_timestamp: float) -> dict:
-    """One frames.jsonl row. main_live reads these keys, so keep them stable.
+    """One frames.jsonl row. The analysis (live_pothole.py) reads these keys, so keep them stable.
 
     Three different clocks, kept apart on purpose:
       capture_timestamp - when the camera sampled the scene (PTP via RTCP)
@@ -1538,7 +1538,7 @@ class CameraFrameWriter:
     """Encode on an ordered worker, then durably write JPEGs on another worker.
 
     The queue absorbs short storage stalls. Files are renamed atomically
-    before their JSONL record is appended, so main_live never observes a
+    before their JSONL record is appended, so the analysis never observes a
     manifest entry for a partial JPEG.
     """
 

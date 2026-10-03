@@ -332,7 +332,7 @@ install_collector_host() {
     "collector terminal autostart"
 }
 
-# main_live.py reads the upload server from .env next to it (see .env.example).
+# live_pothole.py reads the upload server from .env next to it (see .env.example).
 ensure_env_file() {
   local env=$APP_DIR/.env
   if [[ -e "$env" ]]; then
@@ -343,7 +343,7 @@ ensure_env_file() {
     CHANGED+=(".env from .env.example")
   fi
   if ! grep -qE '^(PORTHOLE_API_URL|PORTHOLE_UPLOAD_HOST)=[^[:space:]]' "$env" 2>/dev/null; then
-    warn "fill in the upload settings in $env (PORTHOLE_API_URL, or PORTHOLE_UPLOAD_HOST, _USER, _DIR, _KEY); main_live.py does not upload until then"
+    warn "fill in the upload settings in $env (PORTHOLE_API_URL, or PORTHOLE_UPLOAD_HOST, _USER, _DIR, _KEY); live_pothole.py does not upload until then"
   fi
 }
 

@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """Draw the LiDAR points of recorded frames onto their camera images, coloured by height above
-the road as pothole_check.py measures it, with the model's areas and pothole_check's verdicts.
+the road as the pothole check of live_pothole.py measures it, with the model's areas and its verdicts.
 
 Set FOLDER (a run folder, a run name, or a date such as "20261002" for every run of that day),
 START_FRAME and END_FRAME below, then run:  python3 checklidarcamera.py
-The model runs on the NPU, so main_live.py must be stopped. Each frame is saved as
+The model runs on the NPU, so the analysis terminal must be closed. Each frame is saved as
 OUTPUT_DIR/<run>/<frame 8 digits>.jpg; the model potholes of a run and their verdicts are listed
 in OUTPUT_DIR/<run>/potholes.csv.
 
-Everything comes from pothole_check.py and the main_live.py helpers it uses: the LiDAR scan
+Everything comes from live_pothole.py (PotholeScan, line_depths) and pothole_check.py: the LiDAR scan
 matched to the image time and moved to it along the road, heights along the car's road normal,
 and per LiDAR line a straight road through the same line's road points 2-15 cm on both sides.
 - Points in a model area (pothole: red outline, crack: cyan): the road beside the whole area,
   exactly as the pothole check measures it. Each pothole is labelled confirmed / measured, not a
-  pothole / not judged, and its deep points (DEPTH_M or more on deep lines) are ringed yellow.
+  pothole / not judged, and its deep points (POTHOLE_DEPTH_M or more on deep lines) are ringed yellow.
   The road points that check used (2-15 cm beside the area on each measured line) are ringed
   white and coloured against that same road; on their own they would be grey, as one of their
   sides is the area, which never counts as road.
@@ -21,7 +21,7 @@ and per LiDAR line a straight road through the same line's road points 2-15 cm o
   it). This shows ridges, edges and dips a few cm wide; inside a wider depression the model did
   not mark, the road of each point follows the floor (only a model area's road measures that).
 Colour: blue at -HEIGHT_RANGE_CM or lower, green at 0 (the road beside), red at +HEIGHT_RANGE_CM;
-small grey dots where the road beside is missing, uneven or unsteady (pothole_check's checks).
+small grey dots where the road beside is missing, uneven or unsteady (the pothole check's checks).
 """
 
 import csv
@@ -71,7 +71,7 @@ def draw_legend(image):
     for text, x in ((f"-{HEIGHT_RANGE_CM:g} cm", x0), ("0", x0 + width // 2 - 6),
                     (f"+{HEIGHT_RANGE_CM:g} cm", x0 + width - 70)):
         cv2.putText(image, text, (x, y0 + height + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(image, "height above the road beside it (pothole_check); grey: no usable road", (x0, y0 + height + 52),
+    cv2.putText(image, "height above the road beside it (pothole check); grey: no usable road", (x0, y0 + height + 52),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.putText(image, "white ring: road points a model area's check used", (x0, y0 + height + 78),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
@@ -113,7 +113,7 @@ def draw(run, frame, output):
     clock = time.strftime("%H:%M:%S", time.localtime(ml.frame_time(row)))
     found = []
     if not scan.ok:
-        summary = "no LiDAR scan within 55 ms of the image (main_live skips it)"
+        summary = "no LiDAR scan within 55 ms of the image (the analysis skips it)"
         for k, item in enumerate(frame["detections"]):
             if item["class_id"] == 1:
                 found.append(dict(frame=index, time=clock, detection=k, confidence=round(item["confidence"], 2),
@@ -129,18 +129,18 @@ def draw(run, frame, output):
                 if line["measured"]:  # the road points it used, against that road
                     depth[line["left_index"] + line["right_index"]] = line["road_depth"]
                     beside += line["left_index"] + line["right_index"]
-                if d.class_id == 1 and line["measured"] and line["run"] >= pc.MIN_RUN:
-                    deep += [i for i, v in zip(line["area_index"], line["depth"]) if v >= pc.DEPTH_M]
+                if d.class_id == 1 and line["measured"] and line["run"] >= ml.POTHOLE_MIN_RUN:
+                    deep += [i for i, v in zip(line["area_index"], line["depth"]) if v >= ml.POTHOLE_DEPTH_M]
             contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(image, contours, -1, (0, 0, 255) if d.class_id == 1 else (255, 255, 0), 2)
             if d.class_id != 1:
                 continue
             used = [line for line in lines if line["measured"]]
-            deep_lines = sum(line["run"] >= pc.MIN_RUN for line in used)
+            deep_lines = sum(line["run"] >= ml.POTHOLE_MIN_RUN for line in used)
             deepest = max((line["max_depth_m"] for line in used), default=None)
-            if pc.is_pothole(lines):
+            if ml.is_pothole(lines):
                 verdict = "pothole confirmed"
-            elif len(used) >= pc.MIN_LINES:
+            elif len(used) >= ml.POTHOLE_MIN_LINES:
                 verdict = "measured, not a pothole"
             else:
                 verdict = "not judged: no LiDAR points" if not inside.any() else f"not judged: {len(used)} usable line(s)"
@@ -176,11 +176,11 @@ def draw(run, frame, output):
 
 
 def main():
-    lock = open("/tmp/porthole_main_live.lock", "a")
+    lock = open("/tmp/porthole_live_pothole.lock", "a")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        sys.exit("main_live.py or senddata.py is running; the model needs the NPU")
+        sys.exit("live_pothole.py or senddata.py is running; the model needs the NPU")
     pool = multiprocessing.Pool(WORKERS, initializer=init_worker)  # before the NPU is opened
     detector = ml.DXNNDetector(ml.MODEL_PATH, ml.CONFIDENCE_THRESHOLD)
     try:

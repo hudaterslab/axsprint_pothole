@@ -3,8 +3,8 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Start live pothole detection (live_pothole.py: main_live.py with pothole_check.py's
-LiDAR rule for potholes) automatically at login, in its own
+Start live pothole detection (live_pothole.py: camera model, every pothole checked
+with the LiDAR) automatically at login, in its own
 foreground terminal like the collector. Run it after install.sh:
 
   cd ~/Desktop/live_detection
@@ -12,13 +12,13 @@ foreground terminal like the collector. Run it after install.sh:
   ./install_detection.sh             # check requirements, get models, enable autostart
   sudo reboot                        # automatic login opens the detection terminal
 
-No sudo is needed. Closing the detection terminal stops only main_live.py; the
+No sudo is needed. Closing the detection terminal stops only live_pothole.py; the
 collector and the PTP master keep running. Re-running is safe; a replaced
 autostart entry is first copied to ~/ptp_pothole_archive/install_detection_<time>/.
 
 Options:
   --dry-run   report what would change without changing anything
-  --disable   stop starting main_live.py at login (the entry is kept, Hidden=true)
+  --disable   stop starting live_pothole.py at login (the entry is kept, Hidden=true)
 EOF
 }
 
@@ -27,7 +27,7 @@ APP_HOME=/home/$APP_USER
 APP_DIR=$APP_HOME/Desktop/live_detection
 AUTOSTART=$APP_HOME/.config/autostart/porthole-analysis-terminal.desktop
 
-# main_live.py reads these next to itself (camera: lens and camera pose; LiDAR: channel angles).
+# live_pothole.py reads these next to itself (camera: lens and camera pose; LiDAR: channel angles).
 CALIBRATION=(camera_calib_best_effort.json XT32_Angle_Correction_File.csv)
 UPLOAD_SETTINGS=(PORTHOLE_UPLOAD_HOST PORTHOLE_UPLOAD_USER PORTHOLE_UPLOAD_DIR PORTHOLE_UPLOAD_KEY)
 
@@ -97,16 +97,16 @@ preflight() {
     fi
   fi
   local file
-  for file in main_live.py pothole_check.py live_pothole.py run_main_live.sh download_models.sh launch_component_terminal.sh \
+  for file in live_pothole.py run_live_pothole.sh download_models.sh launch_component_terminal.sh \
     run_component_foreground.sh deploy/porthole-analysis-terminal.desktop; do
     [[ -e "$SRC_DIR/$file" ]] || die "missing $SRC_DIR/$file"
   done
   if [[ ! -e "$APP_HOME/.config/autostart/porthole-collector-terminal.desktop" ]]; then
-    warn "the collector is not installed yet; run sudo ./install.sh first (main_live.py analyses its recordings)"
+    warn "the collector is not installed yet; run sudo ./install.sh first (live_pothole.py analyses its recordings)"
   fi
 }
 
-# DEEPX NPU runtime and Python packages that main_live.py imports.
+# DEEPX NPU runtime and Python packages that live_pothole.py imports.
 check_runtime() {
   local module
   for module in numpy cv2; do
@@ -161,7 +161,7 @@ check_calibration() {
 
 # Uploads go to PORTHOLE_API_URL when it is set; otherwise over SSH, which needs
 # the .env values, the SSH key and the server's host key. Without them
-# main_live.py still analyses but does not upload.
+# live_pothole.py still analyses but does not upload.
 check_upload() {
   local name missing=() host user key api
   if [[ ! -e "$APP_DIR/.env" ]]; then
@@ -177,7 +177,7 @@ check_upload() {
     [[ -n "$(env_value "$name")" ]] || missing+=("$name")
   done
   if (( ${#missing[@]} )); then
-    warn "set PORTHOLE_API_URL, or ${missing[*]}, in $APP_DIR/.env; main_live.py does not upload until then"
+    warn "set PORTHOLE_API_URL, or ${missing[*]}, in $APP_DIR/.env; live_pothole.py does not upload until then"
     return 0
   fi
   host=$(env_value PORTHOLE_UPLOAD_HOST)
@@ -248,7 +248,7 @@ summary() {
     printf '  - %s\n' "${WARNINGS[@]}"
   fi
   if (( DISABLE )); then
-    say "main_live.py no longer starts at login; a running detection terminal keeps running until closed"
+    say "live_pothole.py no longer starts at login; a running detection terminal keeps running until closed"
   else
     say "next: sudo reboot; automatic login opens the collector and the detection terminals"
     say "start now from the desktop instead: $APP_DIR/launch_component_terminal.sh analysis"
