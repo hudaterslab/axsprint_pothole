@@ -5,6 +5,8 @@
 ```text
 live_detection/
   main_live.py      실시간 포트홀 탐지 (카메라 탐지 + 라이다 깊이 측정)
+  check_pothole.py  자동 실행되는 실시간 탐지: main_live.py 그대로에 포트홀만 pothole_check.py 규칙으로 확인
+  pothole_check.py  새 포트홀 라이다 규칙(라이다 줄마다 양옆 도로로 직선)과 그 주행 평가 도구
   camera_calib_best_effort.json   카메라 렌즈 보정값과 카메라 위치·방향 (라이다 바로 아래 9 cm, main_live.py가 읽음)
   XT32_Angle_Correction_File.csv      라이다 채널 각도 (main_live.py가 읽음). 이 단말기 라이다(SN XT4BCC56E14BCC23)의
                                       공장 보정값으로, 센서에서 읽은 값입니다(PTC 명령 0x05). 라이다마다 값이 달라서
@@ -17,7 +19,8 @@ live_detection/
   launch_component_terminal.sh   수집 터미널 열기
   run_component_foreground.sh    수집 실행·로그·정상 종료 제어
   run_main_live.sh               main_live.py 실행, 오류로 끝나면 자동 재시작 (분석 터미널이 사용)
-  checklidarcamera.py            녹화 구간 프레임에 라이다 점을 겹쳐 저장 (코드 상단 FOLDER, START_FRAME, END_FRAME 설정)
+  checklidarcamera.py            녹화 프레임에 라이다 점을 겹쳐 저장: 모델 영역과 pothole_check.py 판정, 옆 도로 대비 높이 색
+                                 (코드 상단 FOLDER, START_FRAME, END_FRAME 설정, NPU를 쓰므로 분석이 꺼져 있을 때)
   attach_component_terminal.sh   원격 데스크톱에서 수집 터미널 연결
   resolve_recording_storage.sh   외장 SSD와 저장 경로 확인
   config.yaml      카메라, GPS, 저장 위치 등 수집 설정
@@ -164,8 +167,10 @@ SSH 수신 서버로 보내려면 `PORTHOLE_UPLOAD_HOST`, `_USER`, `_DIR`, `_KEY
 
 ## 실시간 탐지 자동 실행
 
-`install.sh`는 수집기만 자동 실행으로 등록합니다. `main_live.py`도 부팅 시 자동으로
+`install.sh`는 수집기만 자동 실행으로 등록합니다. 실시간 탐지도 부팅 시 자동으로
 돌리려면 `install.sh` 다음에 `install_detection.sh`를 따로 실행합니다(sudo 불필요).
+분석 터미널은 `run_main_live.sh`로 `check_pothole.py`를 실행합니다. `main_live.py`의 포트홀 규칙으로
+돌아가려면 `run_main_live.sh`의 `PROGRAM`을 `main_live.py`로 바꿉니다(`main_live.py`는 그대로 있습니다).
 
 ```bash
 cd ~/Desktop/live_detection
@@ -193,7 +198,12 @@ GPS 속도가 없으면(실내 등) 보정 없이 깊이를 측정합니다. 정
 2026-10-02 주행에서 도로 도색이 라이다 반사도와 사진에서 겹치는 시각을 찾아 잰 값으로, 속도(3~10 m/s)와
 상관없이 같았습니다. 보정 전에는 9 m/s에서 라이다 점이 사진보다 약 30 cm 뒤쪽(사진 위쪽)에 찍혔습니다.
 모델 검출은 신뢰도 0.4 이상만 씁니다(`CONFIDENCE_THRESHOLD`).
-크랙은 모델 결과만으로 보고합니다. 포트홀은 라이다로 한 번 더 확인합니다. 모델 영역 안 라이다 점 중
+크랙은 모델 결과만으로 보고합니다. 포트홀은 라이다로 한 번 더 확인합니다.
+자동 실행되는 `check_pothole.py`는 `pothole_check.py` 규칙을 씁니다: 포트홀 영역을 지나는 라이다 줄마다
+같은 줄에서 영역 양옆 2~15 cm의 도로 점으로 직선(그 줄의 도로)을 긋고(5 mm 넘게 꺼진 점은 빼고 다시),
+도로 점이 모자라거나 흩어지거나 기준선이 흔들리는 줄은 빼고, 깊이 1.4 cm 이상인 점이 연속 3개 이상인 줄이
+2개 이상이면 포트홀입니다. 2026-10-02 주행에서 진짜 포트홀(7622~7624)은 확인되고, 도색은 모두 걸러졌습니다.
+아래는 `main_live.py`만 따로 돌릴 때의 규칙입니다. 모델 영역 안 라이다 점 중
 주변 도로(영역에서 10~30 cm 둘레)보다 1 cm 이상 깊은 점이 3개 이상이고, 점들의 중앙값이 주변 도로보다
 5 mm 넘게 솟아 있지 않아야 포트홀입니다. 라이다 점 하나는 노이즈(약 3 mm)로 5~9 mm 낮게 찍힐 수 있어서,
 평평한 도색이 가장 깊은 점 하나만으로 통과하지 않게 한 것입니다(2026-10-02 주행 기준).

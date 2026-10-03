@@ -3,7 +3,8 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Start live pothole detection (main_live.py) automatically at login, in its own
+Start live pothole detection (check_pothole.py: main_live.py with pothole_check.py's
+LiDAR rule for potholes) automatically at login, in its own
 foreground terminal like the collector. Run it after install.sh:
 
   cd ~/Desktop/live_detection
@@ -96,7 +97,7 @@ preflight() {
     fi
   fi
   local file
-  for file in main_live.py run_main_live.sh download_models.sh launch_component_terminal.sh \
+  for file in main_live.py pothole_check.py check_pothole.py run_main_live.sh download_models.sh launch_component_terminal.sh \
     run_component_foreground.sh deploy/porthole-analysis-terminal.desktop; do
     [[ -e "$SRC_DIR/$file" ]] || die "missing $SRC_DIR/$file"
   done
