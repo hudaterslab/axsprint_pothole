@@ -155,7 +155,7 @@ logging_level 6
                 # times would be refused for being that far from the host clock.
                 steps_off, message = disable_clock_steps()
                 print(("PTP host clock: no clock steps from now on: " if steps_off else
-                       "PTP host clock: could not turn chrony's clock steps off (retried every 60 s): ")
+                       "PTP host clock: could not turn chrony's clock steps off (retried every 5 s): ")
                       + message, flush=True)
             TIMEBASE_MARK.write_text(f"{time.time_ns()}\n")
         for interface, phc in [("enp1s0", "ptp0"), ("enp2s0", "ptp1")]:
