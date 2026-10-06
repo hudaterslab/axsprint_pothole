@@ -20,6 +20,7 @@ the moment the image was taken (capture time minus OFFSET_SEC) as live_pothole.p
 moved them. When the road plane fails live_pothole.py's checks, the frame is drawn
 without LiDAR and the reason is printed. Each pothole's label shows the terminal's
 pothole check (line_depths): how many LiDAR lines across it are deep, and its deepest point.
+The top right shows the frame's GPS from the JSON (latitude, longitude, speed).
 """
 
 from __future__ import annotations
@@ -544,6 +545,31 @@ def draw_height_legend(canvas, range_cm, note=""):
         painter.text((x, y0 + row), label, font=font, fill=(255, 255, 255, 255))
 
 
+def draw_gps_panel(canvas, gps):
+    """The frame's GPS from the JSON, top right: latitude, longitude and speed."""
+    from PIL import ImageDraw
+
+    width, height = canvas.size
+    margin = max(8, round(height / 60))
+    font = font_for(max(12, round(height / 65)))
+    painter = ImageDraw.Draw(canvas)
+    gps = gps or {}
+    latitude, longitude, speed = gps.get("latitude_deg"), gps.get("longitude_deg"), gps.get("speed_mps")
+    lines = [f"GPS {latitude:.6f}, {longitude:.6f}" if latitude is not None and longitude is not None
+             else "GPS: no fix"]
+    if speed is not None:
+        lines.append(f"speed {speed:.1f} m/s ({speed * 3.6:.0f} km/h)")
+    if hasattr(painter, "textbbox"):
+        text_width = max(painter.textbbox((0, 0), line, font=font)[2] for line in lines)
+    else:  # Pillow 7.x
+        text_width = max(painter.textsize(line, font=font)[0] for line in lines)
+    row = max(19, round(height / 40))
+    left = width - margin - text_width - 20
+    painter.rectangle((left, margin, width - margin, margin + row * len(lines) + 12), fill=(12, 24, 34, 235))
+    for i, line in enumerate(lines):
+        painter.text((left + 10, margin + 6 + i * row), line, font=font, fill=(255, 255, 255, 255))
+
+
 _CALIBRATION = None
 
 
@@ -641,6 +667,7 @@ def render(json_path, output_path):
                          fill=(255, 255, 255, 255))
     if lidar_missing is None:
         draw_height_legend(canvas, HEIGHT_RANGE_CM, motion)
+    draw_gps_panel(canvas, doc.get("gps"))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_name(output_path.name + ".tmp")
