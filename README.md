@@ -175,6 +175,7 @@ sudo reboot
 설치 후 `.env`에 업로드 설정을 채우세요. API 서버로 보내려면 `PORTHOLE_API_URL`(필요하면 `PORTHOLE_API_TOKEN`)을,
 SSH 수신 서버로 보내려면 `PORTHOLE_UPLOAD_HOST`, `_USER`, `_DIR`, `_KEY`를 채웁니다(아래 "서버 전송").
 값이 없으면 `live_pothole.py`는 분석은 계속하고 업로드만 하지 않습니다.
+원천데이터(녹화 폴더 전체)는 `PORTHOLE_RAW_UPLOAD=true`일 때만 보냅니다(기본 `false`, 아래 "원천데이터 전송").
 필요하면 `.env`에 다음 선택 항목도 추가할 수 있습니다: `PORTHOLE_UPLOAD_BW_KIB`(업로드 속도 제한 KiB/s, 기본 24576),
 `DAMAGE_EXPORT_VEHICLE_TYPE`(결과에 기록할 차량 종류, 기본 현대 팰리세이드).
 센서를 연결하지 않은 채 실행했다면 연결한 뒤 다시 실행하세요.
@@ -272,7 +273,12 @@ API 서버가 정해지면 위 요청 형식(항목 이름, 헤더, 응답 코�
 
 ### 원천데이터 전송
 
-수집기가 녹화한 run(10분 폴더)이 끝나면 그 폴더를 SSD에 저장된 그대로 서버의
+`.env`의 `PORTHOLE_RAW_UPLOAD`가 `true`일 때만 보냅니다. 없거나 `false`(기본)이면 녹화는 단말기에만 남고,
+분석 창에 `[RAW] recordings are not sent: PORTHOLE_RAW_UPLOAD=false (true in .env sends them)`가 한 번 나옵니다.
+검출(JPG·JSON·PCAP) 전송은 이 설정과 상관없습니다. 바꾼 뒤에는 분석 터미널을 다시 시작해야 적용되고,
+`true`로 켜면 그동안 보내지 않은 녹화도 오래된 것부터 모두 보냅니다(`var/raw_uploaded.txt`에 없는 run).
+
+`true`이면 수집기가 녹화한 run(10분 폴더)이 끝날 때 그 폴더를 SSD에 저장된 그대로 서버의
 `<PORTHOLE_RAW_DIR>/<날짜>/<run>/`(`frames`, `lidar`, `gps`, `meta`)으로 보내고, 날짜 폴더의
 `porthole_detections.csv`도 바뀔 때마다 보냅니다. 서버는 검출 전송과 같은 SSH 설정(`PORTHOLE_UPLOAD_HOST`, `_USER`, `_KEY`)을
 쓰고, `PORTHOLE_RAW_DIR`이 비어 있으면 보내지 않습니다.

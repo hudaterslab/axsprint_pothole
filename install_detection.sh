@@ -193,6 +193,18 @@ check_upload() {
   fi
 }
 
+# The recordings themselves go to the server only with PORTHOLE_RAW_UPLOAD=true (default false).
+check_raw_upload() {
+  [[ -e "$APP_DIR/.env" ]] || return 0
+  if [[ "$(env_value PORTHOLE_RAW_UPLOAD | tr '[:upper:]' '[:lower:]')" != true ]]; then
+    say "raw upload: off (PORTHOLE_RAW_UPLOAD=true in .env sends the recordings)"
+  elif [[ -n "$(env_value PORTHOLE_RAW_DIR)" ]]; then
+    say "raw upload: on, recordings go to $(env_value PORTHOLE_RAW_DIR)"
+  else
+    warn "PORTHOLE_RAW_UPLOAD=true but PORTHOLE_RAW_DIR is empty in $APP_DIR/.env; recordings are not sent"
+  fi
+}
+
 enable_autostart() {
   local src=$SRC_DIR/deploy/porthole-analysis-terminal.desktop
   if [[ -e "$AUTOSTART" ]] && cmp -s -- "$src" "$AUTOSTART"; then
@@ -276,6 +288,7 @@ main() {
     check_models
     check_calibration
     check_upload
+    check_raw_upload
     enable_autostart
   fi
   summary

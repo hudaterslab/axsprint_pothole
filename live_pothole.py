@@ -7,7 +7,7 @@ Only frames recorded after the start are analysed, in order; older ones are skip
 Detected images are listed in a CSV in each date folder (DETECTIONS_CSV), and their
 JPG/JSON/PCAP go to the server when it is reachable; nothing else is kept on the terminal.
 The finished recordings themselves go to the server's raw-data folder as they are
-(RawUploader).
+(RawUploader), only when .env has PORTHOLE_RAW_UPLOAD=true.
 No other project Python file is imported or executed.
 Model/calibration files and installed NumPy/OpenCV/DEEPX runtime are data/runtime
 dependencies. PTP synchronizes clocks; GPS speed, when available, compensates
@@ -3511,7 +3511,8 @@ class UploadWorker:
         self.drop_waiting()
 
 
-# The finished recordings themselves also go to the server, as they are on the SSD (RawUploader).
+# The finished recordings themselves also go to the server, as they are on the SSD (RawUploader),
+# when .env has PORTHOLE_RAW_UPLOAD=true; unset or false (the default), they stay on the terminal.
 RAW_DONE = PROJECT / "var" / "raw_uploaded.txt"  # runs sent completely, one "<date>/<run>" a line
 
 RAW_LOCK = Path("/tmp/porthole_raw_upload.lock")
@@ -3531,7 +3532,11 @@ RAW_UNREACHABLE = frozenset((5, 10, 12, 30, 35, 255))
 
 def raw_upload_options():
     """Where the recordings go: PORTHOLE_RAW_DIR on the server of the SSH upload settings
-    (PORTHOLE_UPLOAD_HOST, _USER, _KEY, also when PORTHOLE_API_URL sends the detections)."""
+    (PORTHOLE_UPLOAD_HOST, _USER, _KEY, also when PORTHOLE_API_URL sends the detections).
+    Only with PORTHOLE_RAW_UPLOAD=true; unset or false, nothing is sent."""
+    switch = os.getenv("PORTHOLE_RAW_UPLOAD", "").strip()
+    if switch.lower() != "true":
+        raise ValueError(f"PORTHOLE_RAW_UPLOAD={switch or 'false'} (true in .env sends them)")
     names = ("PORTHOLE_RAW_DIR", "PORTHOLE_UPLOAD_HOST", "PORTHOLE_UPLOAD_USER", "PORTHOLE_UPLOAD_KEY")
     missing = [name for name in names if not os.getenv(name, "").strip()]
     if missing:
