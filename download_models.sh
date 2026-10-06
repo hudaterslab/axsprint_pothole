@@ -17,7 +17,7 @@ EOF
 MODEL_BASE_URL=${MODEL_BASE_URL:-https://huggingface.co/HudatersU/road_maintanance/resolve/main}
 # sha256 of the published model; update it together with the file on Hugging Face.
 declare -A MODELS=(
-  [best_seg.dxnn]=602bb83a7cf612d4abc450a6cdfc85eda53d1278e8bddb012a0aeeb17fa59096
+  [best_seg.dxnn]=2022ccec9c119d24fe4ea5c0352a64ee1f8afd711937bf4b0dbb552ea4ab1369
 )
 
 DIR=$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")
