@@ -207,8 +207,47 @@ EOF
     fi
   done
 
-  wait_for_storage || return 1
   wait_for_ntp_sync "$terminal_owner_pid" || return 0
+
+  # The analysis restarts itself (run_live_pothole.sh). The collector is started again here after
+  # an error exit, so that a one-off fault (the SSD dropping out for a moment, a sensor socket error,
+  # a crash) does not end the recording until the next boot: after 10 s, doubling up to 60 s while
+  # it keeps failing; the storage is checked again before each start. A clean exit is not restarted.
+  local delay=10 started
+  while :; do
+    started=$SECONDS
+    run_component "$terminal_owner_pid" && return 0
+    [[ "$COMPONENT" == "collector" ]] || return 1
+    if (( SECONDS - started >= 600 )); then
+      delay=10
+    fi
+    echo "[$COMPONENT_LABEL] Starting again in ${delay}s."
+    pause_while_terminal_open "$terminal_owner_pid" "$delay" || return 0
+    delay=$(( delay * 2 > 60 ? 60 : delay * 2 ))
+  done
+}
+
+# Sleep seconds while the terminal stays open; when it closes, stop as the main loop does (false).
+pause_while_terminal_open() {
+  local terminal_owner_pid="$1"
+  local until=$((SECONDS + $2))
+  while (( SECONDS < until )); do
+    if ! process_alive "$terminal_owner_pid"; then
+      component_cleanup "terminal_window_closed"
+      return 1
+    fi
+    # In the background, so that a stop signal is handled at once; without the terminal lock (fd 9).
+    sleep 1 9>&- &
+    wait $!
+  done
+}
+
+# Start the component once and watch it: 0 when it stopped cleanly or the terminal closed,
+# 1 when it could not start or exited with an error.
+run_component() {
+  local terminal_owner_pid="$1"
+
+  wait_for_storage || return 1
 
   echo "[$COMPONENT_LABEL] Starting..."
   if [[ "$COMPONENT" == "collector" ]]; then
@@ -269,6 +308,7 @@ EOF
   done
 
   component_cleanup "terminal_window_closed"
+  return 0
 }
 
 terminal_signal() {

@@ -3915,7 +3915,14 @@ def discover(root):
                 continue
             run = path.parent.parent.resolve()
             if first.endswith(b"\n") and first.strip():
-                known = (inode, json.loads(first).get("timestamp_source") == "camera_ptp_rtcp_utc", run)
+                try:
+                    ptp = json.loads(first).get("timestamp_source") == "camera_ptp_rtcp_utc"
+                except (ValueError, AttributeError):
+                    # A damaged first row (a power cut or a storage fault) would otherwise stop
+                    # every start here: that run is left out, the others are analysed.
+                    print(f"[ANALYSIS] first row of {path} is unreadable; that run is skipped", flush=True)
+                    ptp = False
+                known = (inode, ptp, run)
                 _DISCOVERED[path] = known
             else:
                 known = (inode, True, run)  # no first row yet: taken, and read again next time

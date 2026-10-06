@@ -1,6 +1,7 @@
 """CU22 hardware decoding, RTCP timestamps and a bounded frame queue.
 
-The GStreamer worker runs this module with --worker and PYTHONNOUSERSITE=1.
+The GStreamer worker runs this module with --worker and PYTHONNOUSERSITE=1, from a
+copy of it and ptp.py taken when the collector starts (WORKER_SCRIPT).
 Given a JPEG quality, the worker also encodes each frame to JPEG on the GPU
 (vaapijpegenc) and the collector stores those bytes unchanged. Without one, or
 without the encoder, raw NV12 frames go to the collector, which converts and
@@ -8,19 +9,36 @@ encodes them with OpenCV (loaded only there).
 """
 
 from __future__ import annotations
+import atexit
 import collections
 import fcntl
 import json
 import os
 import select
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
 from pathlib import Path
 from ptp import GUARD, NS, RtpClock, sender_reports
+
+
+def _worker_copy():
+    """This file and ptp.py as they were when the collector started: auto_update.py may replace
+    app/*.py while the collector records, and the worker that a camera reconnect starts must run
+    this collector's code, not the new one."""
+    folder = Path(tempfile.mkdtemp(prefix="porthole_camera_worker_"))
+    atexit.register(shutil.rmtree, folder, True)
+    for name in ("camera.py", "ptp.py"):
+        shutil.copyfile(Path(__file__).with_name(name), folder / name)
+    return folder / "camera.py"
+
+
+WORKER_SCRIPT = None if __name__ == "__main__" else _worker_copy()
 
 
 class CameraStream:
@@ -215,7 +233,7 @@ class GstContainer:
         # System gi and VA drivers run without user OpenCV/FFmpeg libraries.
         env["PYTHONNOUSERSITE"] = "1"
         self.process = subprocess.Popen(
-            ["/usr/bin/python3", "-u", str(Path(__file__).resolve()), "--worker"],
+            ["/usr/bin/python3", "-u", str(WORKER_SCRIPT), "--worker"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             bufsize=0,
