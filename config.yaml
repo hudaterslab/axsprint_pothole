@@ -35,9 +35,11 @@ lidar_fov_filter_enabled: true
 # (111.8..244.2 deg); only the image corners (104.3..251.1 deg) go further, beyond the LiDAR's reach.
 camera_forward_offset_deg: -180.0
 lidar_h_margin_deg: 75.0
-gps_device: auto
-gps_preferred_device: /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
-gps_baudrate: 115200
+# Previous USB GNSS settings (disabled).
+# gps_device: auto
+# gps_preferred_device: /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
+# gps_baudrate: 115200
+gps_device: tcp://192.168.5.1:30719
 gps_connection_timeout_sec: 3.0
 gps_reconnect_initial_sec: 1.0
 gps_reconnect_max_sec: 30.0

@@ -20,6 +20,7 @@ from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -83,7 +84,7 @@ LIDAR_H_MARGIN_DEG = float(config.get("lidar_h_margin_deg", 55.0))
 LIDAR_PCAP_SECONDS = float(config.get("lidar_pcap_seconds", 10.0))
 LIDAR_PCAP_QUEUE_SIZE = int(config.get("lidar_pcap_queue_size", 8))
 
-GPS_DEVICE = str(config.get("gps_device", "/dev/ttyUSB0")).strip()
+GPS_DEVICE = str(config.get("gps_device", "tcp://192.168.5.1:30719")).strip()
 GPS_PREFERRED_DEVICE = str(config.get("gps_preferred_device", "")).strip()
 GPS_BAUDRATE = int(config.get("gps_baudrate", 115200))
 GPS_CONNECTION_TIMEOUT_SEC = float(config.get("gps_connection_timeout_sec", 3.0))
@@ -91,6 +92,7 @@ GPS_RECONNECT_INITIAL_SEC = float(config.get("gps_reconnect_initial_sec", 1.0))
 GPS_RECONNECT_MAX_SEC = float(config.get("gps_reconnect_max_sec", 30.0))
 # A power cut loses at most about this much of the GPS log.
 GPS_SYNC_SEC = 2.0
+GPS_TCP_IDLE_TIMEOUT_SEC = 10.0
 
 # Folders rotate on calendar-aligned boundaries of this many minutes.
 RUN_ROTATION_MINUTES = float(config.get("run_rotation_minutes", 60.0))
@@ -556,7 +558,7 @@ def discover_gps_serial_devices(
 
 
 class GpsNmeaRecorder:
-    """Read USB NMEA asynchronously so GPS latency cannot block camera/LiDAR."""
+    """Read TCP NMEA asynchronously so GPS latency cannot block camera/LiDAR."""
 
     def __init__(
         self,
@@ -575,6 +577,7 @@ class GpsNmeaRecorder:
         self.thread = None
         self.lock = threading.Lock()
         self.fd = None
+        self.tcp_socket = None
         self.sentence_count = 0
         self.checksum_error_count = 0
         self.parse_error_count = 0
@@ -629,45 +632,65 @@ class GpsNmeaRecorder:
         termios.tcflush(fd, termios.TCIFLUSH)
 
     def _open(self):
-        candidates = discover_gps_serial_devices(
-            self.device,
-            self.preferred_device,
-        )
-        with self.lock:
-            self.candidate_devices = list(candidates)
-        if not candidates:
-            raise FileNotFoundError(f"no GPS serial device matches {self.device!r}")
-        if len(candidates) != 1:
-            raise RuntimeError(
-                "ambiguous GPS serial devices; connect exactly one or set "
-                f"gps_device explicitly: {candidates}"
-            )
-        active_device = candidates[0]
-        fd = os.open(
-            active_device,
-            os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK,
+        address = urlsplit(self.device)
+        if address.scheme != "tcp" or not address.hostname or address.port is None:
+            raise ValueError("GPS device must be tcp://host:port")
+        connection = socket.create_connection(
+            (address.hostname, address.port), timeout=GPS_CONNECTION_TIMEOUT_SEC,
         )
         try:
-            self._configure_serial(fd)
-        except Exception as exc:
-            os.close(fd)
-            if isinstance(exc, (OSError, ValueError)):
-                raise
-            # termios.error is no OSError; as one, the reader retries with back-off instead of
-            # ending for the rest of the drive (the device can vanish while it re-enumerates).
-            raise OSError(f"cannot configure {active_device}: {exc}") from exc
-        self.fd = fd
+            connection.setblocking(False)
+        except OSError:
+            connection.close()
+            raise
+        self.tcp_socket = connection
+        self.fd = connection.fileno()
         with self.lock:
-            self.active_device = active_device
-        print(f"[GPS] serial opened: {active_device}", flush=True)
+            self.active_device = self.device
+        print(f"[GPS] TCP opened: {self.device}", flush=True)
+
+    # Previous USB receiver retained as comments; GNSS now comes from TCP.
+    # def _open(self):
+    #     candidates = discover_gps_serial_devices(
+    #         self.device,
+    #         self.preferred_device,
+    #     )
+    #     with self.lock:
+    #         self.candidate_devices = list(candidates)
+    #     if not candidates:
+    #         raise FileNotFoundError(f"no GPS serial device matches {self.device!r}")
+    #     if len(candidates) != 1:
+    #         raise RuntimeError(
+    #             "ambiguous GPS serial devices; connect exactly one or set "
+    #             f"gps_device explicitly: {candidates}"
+    #         )
+    #     active_device = candidates[0]
+    #     fd = os.open(
+    #         active_device,
+    #         os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK,
+    #     )
+    #     try:
+    #         self._configure_serial(fd)
+    #     except Exception as exc:
+    #         os.close(fd)
+    #         if isinstance(exc, (OSError, ValueError)):
+    #             raise
+    #         # termios.error is no OSError; as one, the reader retries with back-off instead of
+    #         # ending for the rest of the drive (the device can vanish while it re-enumerates).
+    #         raise OSError(f"cannot configure {active_device}: {exc}") from exc
+    #     self.fd = fd
+    #     with self.lock:
+    #         self.active_device = active_device
+    #     print(f"[GPS] serial opened: {active_device}", flush=True)
 
     def _close(self):
-        fd, self.fd = self.fd, None
+        self.fd = None
+        connection, self.tcp_socket = self.tcp_socket, None
         with self.lock:
             self.active_device = None
-        if fd is not None:
+        if connection is not None:
             try:
-                os.close(fd)
+                connection.close()
             except OSError:
                 pass
 
@@ -742,6 +765,7 @@ class GpsNmeaRecorder:
         text = raw.decode("ascii", errors="replace").strip()
         if not text:
             return handle
+        print(f"[GPS RX] {text}", flush=True)
         record = parse_nmea_sentence(text, received_timestamp)
         record["monotonic_ns"] = time.monotonic_ns()
         with self.lock:
@@ -776,6 +800,7 @@ class GpsNmeaRecorder:
                     try:
                         self._open()
                         reconnect_attempt = 0
+                        last_received = time.monotonic()
                         with self.lock:
                             self.receiver_open_count += 1
                     except (OSError, ValueError, RuntimeError) as exc:
@@ -788,21 +813,26 @@ class GpsNmeaRecorder:
                             self.transport_errors.append(f"{type(exc).__name__}: {exc}")
                             if len(self.transport_errors) > 20:
                                 self.transport_errors = self.transport_errors[-20:]
+                        print(f"[GPS WARN] open failed (retry {reconnect_attempt}, {delay:.0f}s): {exc}", flush=True)
                         self.stop_event.wait(delay)
                         continue
 
                 try:
-                    readable, _, _ = select.select([self.fd], [], [], 0.2)
+                    readable, _, _ = select.select([self.tcp_socket], [], [], 0.2)
                     if not readable:
+                        if time.monotonic() - last_received >= GPS_TCP_IDLE_TIMEOUT_SEC:
+                            raise TimeoutError("GPS TCP source stopped sending data")
                         # NMEA arrives in one burst per fix. Syncing in the quiet
                         # gap after a burst never delays a sentence's receive time.
                         if time.monotonic() >= next_sync:
                             handle = self._sync(handle)
                             next_sync = time.monotonic() + GPS_SYNC_SEC
                         continue
-                    chunk = os.read(self.fd, 4096)
+                    # Previous USB read: chunk = os.read(self.fd, 4096)
+                    chunk = self.tcp_socket.recv(4096)
                     if not chunk:
-                        raise OSError("GPS serial device returned EOF")
+                        raise OSError("GPS TCP source returned EOF")
+                    last_received = time.monotonic()
                     buffer.extend(chunk)
                     while b"\n" in buffer:
                         raw, _, remainder = buffer.partition(b"\n")
@@ -812,7 +842,10 @@ class GpsNmeaRecorder:
                         buffer.clear()
                         with self.lock:
                             self.parse_error_count += 1
+                except BlockingIOError:
+                    continue
                 except (OSError, ValueError) as exc:
+                    print(f"[GPS WARN] TCP read error, reconnecting: {exc}", flush=True)
                     with self.lock:
                         self.transport_errors.append(f"{type(exc).__name__}: {exc}")
                         if len(self.transport_errors) > 20:
@@ -820,6 +853,7 @@ class GpsNmeaRecorder:
                     self._close()
                     buffer.clear()
                     handle = self._sync(handle)
+                    self.stop_event.wait(GPS_RECONNECT_INITIAL_SEC)
         finally:
             self._close()
             if handle is not None:
@@ -833,11 +867,11 @@ class GpsNmeaRecorder:
                     handle.close()
 
     def is_connected(self) -> bool:
-        """Serial device presence, independent of NMEA traffic or satellite fix."""
+        """TCP connection presence, independent of NMEA traffic or satellite fix."""
         with self.lock:
             device = self.active_device
             opened = self.fd is not None
-        return bool(opened and device and os.path.exists(device))
+        return bool(opened and device)
 
     def stats(self) -> dict:
         with self.lock:
@@ -849,7 +883,8 @@ class GpsNmeaRecorder:
                 "preferred_device": self.preferred_device,
                 "active_device": self.active_device,
                 "candidate_devices": list(self.candidate_devices),
-                "baudrate": self.baudrate,
+                "transport": "tcp",
+                "baudrate": None,
                 "sentence_count": self.sentence_count,
                 "checksum_error_count": self.checksum_error_count,
                 "parse_error_count": self.parse_error_count,
