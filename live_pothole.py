@@ -1693,7 +1693,9 @@ class DamageArtifactExporter:
             motion_compensation=motion_compensation,
             pcap_copy_policy="selected_source_file_bytes_unchanged",
         )
-        gps = lidar__gps_values_for_camera(self.gps_streams, timestamp)
+        # GPS at the exposure moment, the time the LiDAR is aligned to.
+        gps = lidar__gps_values_for_camera(
+            self.gps_streams, timestamp if target_lidar_timestamp is None else target_lidar_timestamp)
         for detection, obj in zip(detections, fused):
             pothole = int(detection.class_id) == 1
             if pothole and (not obj.get("validation", {}).get("accepted")):
@@ -1742,23 +1744,14 @@ class DamageArtifactExporter:
 
 
 def matched_gps_position(streams, timestamp):
-    """Position of the nearest valid NMEA fix; latitude/longitude are None without one."""
-    gga, _ = lidar__nearest_gps_record(streams.get("GGA"), timestamp)
-    rmc, _ = lidar__nearest_gps_record(streams.get("RMC"), timestamp)
-    def position_valid(record):
-        return (record is not None and
-                record.get("valid") is not False and record.get("checksum_valid") is not False and
-                _finite_float(record.get("latitude_deg")) is not None and
-                _finite_float(record.get("longitude_deg")) is not None and
-                abs(float(record["latitude_deg"])) <= 90 and
-                abs(float(record["longitude_deg"])) <= 180)
-    valid_rmc = position_valid(rmc) and str(rmc.get("gps_status", rmc.get("status", ""))).upper() == "A"
-    valid_gga = position_valid(gga) and (_finite_float(gga.get("fix_quality")) or 0) > 0
-    position = rmc if valid_rmc else gga if valid_gga else None
-    return dict(
-        latitude_deg=None if position is None else position["latitude_deg"],
-        longitude_deg=None if position is None else position["longitude_deg"],
-    )
+    """Position at timestamp between the valid NMEA fixes around it (RMC, else GGA);
+    latitude/longitude are None without one."""
+    for kind, valid in (("RMC", gps_rmc_valid), ("GGA", gps_gga_valid)):
+        position = gps_interpolated(streams.get(kind), timestamp, valid,
+                                    ("latitude_deg", "longitude_deg"))
+        if position is not None:
+            return position
+    return dict(latitude_deg=None, longitude_deg=None)
 
 
 def terminal_id():
@@ -2568,27 +2561,71 @@ def lidar__nearest_gps_record(
     return (records[best_pos], error)
 
 
+def gps_has_position(record):
+    return (record.get("valid") is not False and
+            _finite_float(record.get("latitude_deg")) is not None and
+            _finite_float(record.get("longitude_deg")) is not None and
+            abs(float(record["latitude_deg"])) <= 90 and abs(float(record["longitude_deg"])) <= 180)
+
+
+def gps_rmc_valid(record):
+    return gps_has_position(record) and str(record.get("gps_status", record.get("status", ""))).upper() == "A"
+
+
+def gps_gga_valid(record):
+    return gps_has_position(record) and (_finite_float(record.get("fix_quality")) or 0) > 0
+
+
+def gps_interpolated(stream, target, valid, keys):
+    """Values of keys at target from the valid fixes of a stream ordered by fix time:
+    interpolated between the fixes on both sides when they are at most
+    lidar__GPS_MAX_TIME_ERROR_SEC apart, else those of the nearer fix within that time of
+    target (a run's first and last moments). None without one."""
+    if stream is None:
+        return None
+    times, records = stream
+    k = int(np.searchsorted(times, target))
+    before = next((records[i] for i in range(k - 1, -1, -1) if valid(records[i])), None)
+    after = next((records[i] for i in range(k, len(records)) if valid(records[i])), None)
+    if (before is not None and after is not None and
+            after["fix_time"] - before["fix_time"] <= lidar__GPS_MAX_TIME_ERROR_SEC):
+        span = after["fix_time"] - before["fix_time"]
+        weight = 0.0 if span <= 0 else (target - before["fix_time"]) / span
+        values = {}
+        for key in keys:
+            a, b = _finite_float(before.get(key)), _finite_float(after.get(key))
+            values[key] = None if a is None or b is None else a + (b - a) * weight
+        return values
+    near = [r for r in (before, after)
+            if r is not None and abs(r["fix_time"] - target) <= lidar__GPS_MAX_TIME_ERROR_SEC]
+    if not near:
+        return None
+    nearest = min(near, key=lambda r: abs(r["fix_time"] - target))
+    return {key: _finite_float(nearest.get(key)) for key in keys}
+
+
 def lidar__gps_values_for_camera(
     gps_streams: dict[str, tuple[np.ndarray, list[dict]]], camera_timestamp: float
 ) -> dict:
+    """GPS of one picture at its time: position, altitude and speed interpolated between the
+    fixes around it, quality, satellites, HDOP and course from the nearest sentence."""
     gga, gga_error = lidar__nearest_gps_record(gps_streams.get("GGA"), camera_timestamp)
     rmc, rmc_error = lidar__nearest_gps_record(gps_streams.get("RMC"), camera_timestamp)
-    position = rmc if rmc is not None else gga
+    moving = gps_interpolated(gps_streams.get("RMC"), camera_timestamp, gps_rmc_valid,
+                              ("latitude_deg", "longitude_deg", "speed_mps"))
+    fixed = gps_interpolated(gps_streams.get("GGA"), camera_timestamp, gps_gga_valid,
+                             ("latitude_deg", "longitude_deg", "altitude_m"))
+    position = moving if moving is not None else fixed
     errors = [
         error for (record, error) in ((gga, gga_error), (rmc, rmc_error)) if record is not None
     ]
-    speed_kmh = None
-    if rmc is not None:
-        if rmc.get("speed_mps") is not None:
-            speed_kmh = float(rmc["speed_mps"]) * 3.6
-        elif rmc.get("speed_kmh") is not None:
-            speed_kmh = float(rmc["speed_kmh"])
+    speed_mps = None if moving is None else moving["speed_mps"]
     return {
-        "latitude_deg": None if position is None else position.get("latitude_deg"),
-        "longitude_deg": None if position is None else position.get("longitude_deg"),
-        "speed_kmh": speed_kmh,
+        "latitude_deg": None if position is None else position["latitude_deg"],
+        "longitude_deg": None if position is None else position["longitude_deg"],
+        "speed_kmh": None if speed_mps is None else speed_mps * 3.6,
         "course_deg": None if rmc is None else rmc.get("course_deg"),
-        "altitude_m": None if gga is None else gga.get("altitude_m"),
+        "altitude_m": None if fixed is None else fixed["altitude_m"],
         "fix_quality": None if gga is None else gga.get("fix_quality"),
         "satellites": None if gga is None else gga.get("satellites"),
         "hdop": None if gga is None else gga.get("hdop"),
@@ -2880,7 +2917,7 @@ class RecordingAlignment:
             if not record.get("valid") or not record.get("checksum_valid"):
                 continue
             try:
-                row = (float(record["timestamp"]), float(record["speed_mps"]))
+                row = (float(record["fix_time"]), float(record["speed_mps"]))
             except (KeyError, TypeError, ValueError):
                 continue
             if math.isfinite(row[0]) and math.isfinite(row[1]) and row[1] >= 0:
@@ -2961,11 +2998,30 @@ def frame_time(row):
     return value
 
 
+# NMEA measured longer ago than this when it arrived is not used: the RTK router sends the
+# sentences it buffered (over a minute of them) in one burst when a connection opens.
+GPS_MAX_AGE_SEC = 2.0
+
+
+def gps_fix_time(row):
+    """Epoch second at which the receiver measured an NMEA row: its UTC time of day on the
+    UTC day of arrival (or the day before or after, around midnight). None without one."""
+    text = str(row.get("gps_utc_time") or "")
+    arrival = float(row["timestamp"])
+    if len(text) < 6 or not math.isfinite(arrival):
+        return None
+    fix = math.floor(arrival / 86400.0) * 86400.0 + (
+        int(text[0:2]) * 3600 + int(text[2:4]) * 60 + float(text[4:]))
+    return min((fix - 86400.0, fix, fix + 86400.0), key=lambda value: abs(value - arrival))
+
+
 class GpsTail:
-    """Read newly committed NMEA rows once, retaining only GGA/RMC with a valid checksum.
+    """Read newly committed NMEA rows once, retaining GGA/RMC with a valid checksum, ordered by
+    the receiver's fix time (row["fix_time"]) instead of the arrival time.
 
     A damaged line has no fields; kept, it would hide the good fix next to it from the
-    nearest-row lookups.
+    nearest-row lookups. A row that arrived more than GPS_MAX_AGE_SEC after its fix (or
+    before it, so with a wrong receiver clock) is not kept.
     """
 
     def __init__(self, run):
@@ -2997,18 +3053,22 @@ class GpsTail:
                 try:
                     row = json.loads(line)
                     kind = str(row.get("sentence_type", "")).upper()
-                    if (kind in self.grouped and row.get("checksum_valid") is not False
-                            and math.isfinite(float(row["timestamp"]))):
-                        self.grouped[kind].append(row)
-                        changed = True
+                    if kind not in self.grouped or row.get("checksum_valid") is False:
+                        continue
+                    fix = gps_fix_time(row)
+                    if fix is None or not -1.0 <= float(row["timestamp"]) - fix <= GPS_MAX_AGE_SEC:
+                        continue
+                    row["fix_time"] = fix
+                    self.grouped[kind].append(row)
+                    changed = True
                 except (ValueError, TypeError, KeyError):
                     continue
         if not changed:
             return None
         streams = {}
         for kind, rows in self.grouped.items():
-            rows.sort(key=lambda row: float(row["timestamp"]))
-            streams[kind] = (np.asarray([float(row["timestamp"]) for row in rows]), rows)
+            rows.sort(key=lambda row: row["fix_time"])
+            streams[kind] = (np.asarray([row["fix_time"] for row in rows]), rows)
         return streams
 
 
@@ -3289,7 +3349,7 @@ class LiveProcessor:
                     pcap_files=pcap_files, status=status if pcap_files else "pcap_unavailable",
                     pcap_copy_policy="selected_scan_raw_records_unchanged",
                 )
-            gps = matched_gps_position(self.exporter.gps_streams, timestamp)
+            gps = matched_gps_position(self.exporter.gps_streams, target)  # exposure moment
             speed = self.alignment.speed_at(target)  # the speed motion compensation used
             gps["speed_mps"] = None if speed is None else round(speed, 3)
             pair = save_detection_frame(
