@@ -508,6 +508,32 @@ def parse_nmea_sentence(raw_line: str, received_timestamp: float) -> dict:
     return base
 
 
+GPS_FIX_NAMES = {0: "no fix", 1: "GPS", 2: "DGPS", 4: "RTK fixed", 5: "RTK float", 6: "estimated"}
+
+
+def gps_summary_text(gps_now: dict, now: float) -> str:
+    """The newest GGA/RMC as the one GPS line printed under each [HEALTH] line."""
+    gga, rmc = gps_now.get("latest_gga"), gps_now.get("latest_rmc")
+    if gga is None:
+        return "no GGA received yet"
+
+    def text(value, pattern):
+        return "-" if value is None else pattern % value
+
+    quality = gga.get("fix_quality")
+    fields = gga["raw"].split("*")[0].split(",")
+    correction_age = fields[13] if len(fields) > 13 and fields[13] else "-"
+    speed_mps = None if rmc is None else rmc.get("speed_mps")
+    return (
+        f"fix={text(quality, '%d')}({GPS_FIX_NAMES.get(quality, '?')}) "
+        f"sats={text(gga.get('satellites'), '%d')} hdop={text(gga.get('hdop'), '%.2f')} "
+        f"lat={text(gga.get('latitude_deg'), '%.7f')} lon={text(gga.get('longitude_deg'), '%.7f')} "
+        f"alt={text(gga.get('altitude_m'), '%.1fm')} "
+        f"speed={text(None if speed_mps is None else speed_mps * 3.6, '%.1fkm/h')} "
+        f"corrAge={correction_age} age={now - gga['timestamp']:.1f}s"
+    )
+
+
 def discover_gps_serial_devices(
     device_setting: str = "auto",
     preferred_device: str = "",
@@ -586,6 +612,7 @@ class GpsNmeaRecorder:
         self.last_sentence_timestamp = None
         self.last_valid_fix_timestamp = None
         self.latest_valid_fix = None
+        self.latest_sentences = {}
         self.transport_errors = []
         self.storage_errors = []
         self.storage_disabled = False
@@ -765,12 +792,13 @@ class GpsNmeaRecorder:
         text = raw.decode("ascii", errors="replace").strip()
         if not text:
             return handle
-        print(f"[GPS RX] {text}", flush=True)
         record = parse_nmea_sentence(text, received_timestamp)
         record["monotonic_ns"] = time.monotonic_ns()
         with self.lock:
             self.sentence_count += 1
             self.last_sentence_timestamp = received_timestamp
+            if record.get("sentence_type") in ("GGA", "RMC"):
+                self.latest_sentences[record["sentence_type"]] = record
             if not record.get("checksum_valid"):
                 self.checksum_error_count += 1
             if record.get("parse_error"):
@@ -876,6 +904,7 @@ class GpsNmeaRecorder:
     def stats(self) -> dict:
         with self.lock:
             latest_fix = None if self.latest_valid_fix is None else dict(self.latest_valid_fix)
+            gga, rmc = self.latest_sentences.get("GGA"), self.latest_sentences.get("RMC")
             return {
                 "enabled": True,
                 "device": self.active_device or self.device,
@@ -892,6 +921,8 @@ class GpsNmeaRecorder:
                 "last_sentence_timestamp": self.last_sentence_timestamp,
                 "last_valid_fix_timestamp": self.last_valid_fix_timestamp,
                 "latest_valid_fix": latest_fix,
+                "latest_gga": None if gga is None else dict(gga),
+                "latest_rmc": None if rmc is None else dict(rmc),
                 "receiver_open_count": self.receiver_open_count,
                 "receiver_restart_count": max(0, self.receiver_open_count - 1),
                 "transport_errors": list(self.transport_errors),
@@ -2322,6 +2353,7 @@ def _run_collector(stop: threading.Event):
             f"rate={storage_rate_text} cpuTemp={cpu_temp_text} wifiTemp={wifi_temp_text} rss={rss_text}",
             flush=True,
         )
+        print(f"[GPS {time.strftime('%H:%M:%S')}] {gps_summary_text(gps_now, now)}", flush=True)
         if cpu_temperature_c is not None and cpu_temperature_c >= HEALTH_WARN_CPU_TEMP_C:
             print(
                 f"[HEALTH WARN] CPU temperature {cpu_temperature_c:.1f}C "
