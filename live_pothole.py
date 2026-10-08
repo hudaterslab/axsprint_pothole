@@ -2962,7 +2962,11 @@ def frame_time(row):
 
 
 class GpsTail:
-    """Read newly committed NMEA rows once, retaining only GGA/RMC."""
+    """Read newly committed NMEA rows once, retaining only GGA/RMC with a valid checksum.
+
+    A damaged line has no fields; kept, it would hide the good fix next to it from the
+    nearest-row lookups.
+    """
 
     def __init__(self, run):
         self.path = run / "gps/gps.jsonl"
@@ -2993,7 +2997,8 @@ class GpsTail:
                 try:
                     row = json.loads(line)
                     kind = str(row.get("sentence_type", "")).upper()
-                    if kind in self.grouped and math.isfinite(float(row["timestamp"])):
+                    if (kind in self.grouped and row.get("checksum_valid") is not False
+                            and math.isfinite(float(row["timestamp"]))):
                         self.grouped[kind].append(row)
                         changed = True
                 except (ValueError, TypeError, KeyError):
