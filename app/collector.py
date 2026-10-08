@@ -84,7 +84,7 @@ LIDAR_H_MARGIN_DEG = float(config.get("lidar_h_margin_deg", 55.0))
 LIDAR_PCAP_SECONDS = float(config.get("lidar_pcap_seconds", 10.0))
 LIDAR_PCAP_QUEUE_SIZE = int(config.get("lidar_pcap_queue_size", 8))
 
-GPS_DEVICE = str(config.get("gps_device", "tcp://192.168.5.1:30719")).strip()
+GPS_DEVICE = str(config.get("gps_device", "tcp://192.168.5.1:30718")).strip()
 GPS_PREFERRED_DEVICE = str(config.get("gps_preferred_device", "")).strip()
 GPS_BAUDRATE = int(config.get("gps_baudrate", 115200))
 GPS_CONNECTION_TIMEOUT_SEC = float(config.get("gps_connection_timeout_sec", 3.0))

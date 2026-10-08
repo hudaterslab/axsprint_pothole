@@ -39,7 +39,7 @@ lidar_h_margin_deg: 75.0
 # gps_device: auto
 # gps_preferred_device: /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
 # gps_baudrate: 115200
-gps_device: tcp://192.168.5.1:30719
+gps_device: tcp://192.168.5.1:30718
 gps_connection_timeout_sec: 3.0
 gps_reconnect_initial_sec: 1.0
 gps_reconnect_max_sec: 30.0
