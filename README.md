@@ -143,6 +143,31 @@ LiDAR PCAP 시각은 센서가 패킷에 적은 PTP 시각 그대로입니다.
 `[CONNECTION] LIDAR`는 실제 UDP 수신 여부이고 `[PTP] READY/WAITING`은
 시계 검증 상태입니다. 시작할 때 PTP 오차 0.1ms 기준을 넘으면 저장을 시작하지 않습니다.
 
+### GPS
+
+GPS는 RTK 공유기(AKT RTK-ROUTER, GNSS 모듈 Quectel LC29H)에서 받습니다. RTK 보정은 쓰지 않고 일반 GPS
+정확도(측위 품질 1)로 씁니다(2026-10-08 결정). 예전 USB GPS(CH340)는 쓰지 않으며, 그 코드는
+`app/collector.py`에 주석으로만 남아 있습니다.
+
+- 연결: 단말기 Wi-Fi는 공유기의 `RTK_ROUTER_2.4G`에만 붙습니다(저장된 Wi-Fi는 이것 하나). 공유기 5 GHz는
+  공유기가 몇 초씩 신호(비콘)를 멈춰 20초마다 끊기므로 쓰지 않습니다. 인터넷(LTE)과 원격 접속도 이 공유기로 나갑니다.
+- 받는 곳: `config.yaml`의 `gps_device: tcp://192.168.5.1:30718`, 공유기 설정의 Transfer `nmea`(TCP 서버, 포트 30718)입니다.
+- 공유기 NMEA 설정: GGA·RMC·GST, 5 Hz(설정 > GNSS > Messages > NMEA). 주기는 모든 문장에 같이 적용되고,
+  바꾸면 GNSS 모듈이 다시 시작해 약 1분 동안 위치가 없습니다.
+- 수집기는 받은 문장을 모두 `gps/gps.jsonl`에 한 줄씩 저장합니다(도착 시각 `timestamp`, 측정 시각 `gps_utc_time`,
+  원문 `raw`, 위치·품질 등). 측정에서 단말기 도착까지 약 0.2초 걸립니다. 체크섬이 깨진 문장은
+  `checksum_valid: false`로 남고 값은 비어 있습니다(5 Hz에서 공유기 안 통로가 가끔 문장을 자릅니다).
+- 10초 동안 받은 것이 없으면 다시 연결합니다(실패하면 1초부터 최대 30초 간격, 수집 창에 `[GPS WARN]`).
+  단말기를 갑자기 껐다 켠 뒤에는 첫 연결에서 데이터가 오지 않아 10초 뒤 한 번 다시 붙은 적이 있습니다(2026-10-08).
+- 수집 창에는 1분마다 `[HEALTH]` 줄 아래에 최신 GPS 한 줄이 나옵니다.
+  `[GPS 15:23:00] fix=1(GPS) sats=19 hdop=1.38 lat=37.4754151 lon=126.8820668 alt=52.8m speed=0.0km/h corrAge=- age=0.2s`
+  `fix`는 측위 품질(0 없음, 1 GPS, 2 DGPS, 5 RTK float, 4 RTK fixed), `corrAge`는 보정 경과 초(RTK일 때만),
+  `age`는 마지막 GGA를 받은 뒤 지난 초입니다.
+- 분석기는 수신기의 측정 시각 기준으로 GPS를 사진에 맞춥니다. 사진의 노출 순간(`timestamp_ns`에서 `OFFSET_SEC`를 뺀
+  시각, 라이다와 같은 기준)의 위치·고도·속도를 앞뒤 정상 측정값 사이로 보간합니다(두 값이 1.5초 안일 때, 아니면
+  1.5초 안의 가까운 값). 깨진 문장, 측정보다 2초 넘게 늦게 도착한 문장(공유기가 연결 순간 쌓아 둔 지난 문장을
+  한꺼번에 보냄), 측정 시각이 도착보다 1초 넘게 앞선 문장(수신기 시계 오류)은 쓰지 않습니다.
+
 ## 새 단말기 설치
 
 Ubuntu 22.04 Lubuntu(LXQt), 사용자 `hudaters`, 라이다 포트 `enp1s0`(`/dev/ptp0`)와
@@ -161,7 +186,7 @@ sudo reboot
 
 - 패키지: linuxptp·chrony·GStreamer/VAAPI 등 apt 패키지와 numpy·opencv-python·simplejpeg(pip).
   simplejpeg는 분석기가 사진을 읽을 때 씁니다(OpenCV와 같은 픽셀, CPU 약 3분의 1 절약). 없으면 OpenCV로 읽습니다.
-- 사용자 그룹: `dialout`(GPS), `video`·`render`(하드웨어 디코딩)
+- 사용자 그룹: `dialout`(예전 USB GPS용, 지금 GPS는 네트워크라 쓰지 않음), `video`·`render`(하드웨어 디코딩)
 - PTP: `/dev/ptp0`·`/dev/ptp1` 읽기 권한(udev), 보정 속도를 제한한 chrony,
   `systemd-timesyncd` 중지, `ptp-pothole-master.service` 설치·시작
   (ptp4l 설정과 phc2sys 실행은 `ptp_service.py`가 합니다)
@@ -230,8 +255,8 @@ GPS 속도가 없으면(실내 등) 보정 없이 깊이를 측정합니다. 정
 라이다 스캔 해석은 numpy 배열 계산으로 한 번에 처리하고, PCAP은 파일별 색인으로 필요한 패킷만 읽습니다.
 각 프레임은 그 시각을 덮는 라이다 파일을 촬영 후 최대 60초까지 기다립니다. 라이다가 끊겨 그 안에 파일이 없으면
 라이다 없이 분석합니다(크랙은 CSV에 남지만 PCAP이 없어 서버로는 보내지 않고, 포트홀은 확인하지 못함). 깨진 사진이나 읽을 수 없는 라이다 파일은
-그 프레임만 빈 사진·라이다 없음으로 넘어갑니다. GPS 속도는 앞뒤 1.5초 안의 값을 보간하고, run 경계처럼 한쪽만 있으면
-1.5초 안의 가까운 값을 씁니다.
+그 프레임만 빈 사진·라이다 없음으로 넘어갑니다. GPS 위치와 속도는 수신기 측정 시각 기준으로 앞뒤 1.5초 안의 값을
+보간하고, run 경계처럼 한쪽만 있으면 1.5초 안의 가까운 값을 씁니다(위 GPS 참고).
 추적은 프레임 순서대로 합니다. 사진 사이가 1초 넘게 끊기면(카메라나 PTP 끊김) 추적을 새로 시작합니다.
 
 `live_pothole.py`는 시작한 시점 이후에 녹화된 프레임만 분석합니다. 단말기가 갑자기 꺼져서 분석하지 못한
@@ -259,6 +284,7 @@ CSV에 남은 검출은 사무실에서 `senddata.py`로 보냅니다(아래).
 JSON은 「크랙 포트홀 서버 전송 명세서」(2026-09-28) 형식입니다. `record_id`(`단말기/run 폴더/프레임 번호`),
 `categories`, `images`, `annotations`(bbox·segmentation·크기·깊이), `gps`, `lidar.pcap_files`만 담고,
 측정값이 없으면 0 대신 null입니다. 크랙은 깊이를 재지 않으므로 `depth.median_cm`이 null입니다.
+`gps.latitude_deg`·`longitude_deg`는 사진의 노출 순간 위치로, 앞뒤 GPS 측정값 사이를 보간한 값입니다(위 GPS 참고).
 `gps.speed_mps`(2026-10-02 추가)는 그 순간 차 속도(m/s)로, 단말기가 주행 중 라이다 점을 사진에 맞출 때
 쓴 값입니다. 서버의 시각화도 같은 값으로 똑같이 보정할 수 있습니다. GPS 속도가 없으면 null입니다.
 JSON은 열어 보기 쉽게 줄바꿈과 2칸 들여쓰기로 저장합니다.
